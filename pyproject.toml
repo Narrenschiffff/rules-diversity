@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rules-diversity"
+version = "0.1.0"
+description = "Rule-set search for maximal pattern diversity on torus grids (exact+approx, GA, bounds)."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Mr.Narrenschiff" }]
+license = { text = "MIT" }
+dependencies = [
+  "numpy>=1.23",
+  "torch>=2.1",
+  "matplotlib>=3.7",
+  "networkx>=3.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rules", "rules.*"]
+
+[project.scripts]
+rules-run-ga = "scripts.run_ga:main"
+rules-stage1-demo = "scripts.run_stage1_demo:main"
