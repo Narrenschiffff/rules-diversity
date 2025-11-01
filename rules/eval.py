@@ -1,55 +1,39 @@
 # -*- coding: utf-8 -*-
 """
-Batch evaluation core:
-- enumerate_ring_rows_fast
-- TransferOp (blocked matvec over implicit compatibility)
-- power_iteration / lanczos_top_r / Hutch / Hutch++
-- 上下界：下界基于特征值，上界使用 Gershgorin / 最大度谱半径（_upper_bound_raw）
-- 对外入口 evaluate_rules_batch
-- 防御式兜底：iters / r / s / flags 的 None/非法值统一归一化
-- 小规模精确计数（stage-1）自动回填 exact_trace / exact_rows_m
+rules/eval.py
+评估与核心算子：
+- 规则矩阵编解码（上三角含对角）
+- 对称压缩 canonical_bits（规则层面的状态置换对称）
+- 行生成器（环状合法行） enumerate_ring_rows_fast
+- TransferOp: 不显式构造 T 的 matvec
+- 幂迭代 / Lanczos / Hutch/Hutch++
+- 结构性指标（度、连通分量）
+- 批量评估 evaluate_rules_batch：输出 λ1/λ2、谱间隙、上下界（含 Gershgorin / 最大度谱半径上界）
+- 小规模 (n<=4,k<=3) 自动调用 stage-1 精确计数并落盘 exact_Z（可选几何去重接口占位）
+
+依赖：numpy, torch, matplotlib（仅个别函数用, 不在此文件画图）
 """
 
-from __future__ import annotations
+from typing import List, Tuple, Dict, Optional
+import math
 import itertools
 import logging
-from collections import OrderedDict
-from typing import Dict, List, Tuple, Optional
-
 import numpy as np
 import torch
 
-logger = logging.getLogger(__name__)
+# ------------------------------
+# 通用小工具
+# ------------------------------
 
-# =========================
-# 通用取值归一化工具
-# =========================
-def _int_or(v, default: int) -> int:
-    try:
-        iv = int(v)
-        return iv if iv > 0 else default
-    except Exception:
-        return default
+def _bool_or(a: Optional[bool], b: bool) -> bool:
+    return b if a is None else (a or b)
 
-def _float_or(v, default: float) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return default
+# ------------------------------
+# 规则矩阵编解码
+# ------------------------------
 
-def _bool_or(v, default: bool) -> bool:
-    if isinstance(v, bool):
-        return v
-    if v in (0, 1):
-        return bool(v)
-    return default
-
-
-# =========================
-# 规则矩阵 <-> 位串
-# =========================
-def make_rule_matrix(k: int, allowed_pairs: List[Tuple[int,int]], allow_self_loops=None) -> np.ndarray:
-    R = np.zeros((k, k), dtype=bool)
+def make_rule_matrix(k: int, allowed_pairs: List[Tuple[int,int]], allow_self_loops: Optional[bool]=None) -> np.ndarray:
+    R = np.zeros((k,k), dtype=bool)
     for (u, v) in allowed_pairs:
         R[u, v] = True
         R[v, u] = True
@@ -63,8 +47,10 @@ def rule_from_bits(k: int, bits: np.ndarray) -> np.ndarray:
     L_upper = k*(k-1)//2
     assert bits.size == L_diag + L_upper
     R = np.zeros((k,k), dtype=bool)
+    # diag
     for i in range(k):
         R[i,i] = bool(bits[i])
+    # upper
     idx = k
     for i in range(k):
         for j in range(i+1, k):
@@ -83,11 +69,12 @@ def bits_from_rule(R: np.ndarray) -> np.ndarray:
             out.append(1 if R[i,j] else 0)
     return np.array(out, dtype=np.uint8)
 
+# ------------------------------
+# 规则层面的状态置换对称：canonical_bits
+# ------------------------------
 
-# =========================
-# 对称压缩：规范化
-# =========================
 def canonical_bits(bits: np.ndarray, k: int) -> np.ndarray:
+    """小 k 完全置换搜索；大 k 启发式。"""
     R = rule_from_bits(k, bits)
     if k <= 8:
         best = None
@@ -97,7 +84,7 @@ def canonical_bits(bits: np.ndarray, k: int) -> np.ndarray:
             if (best is None) or (tuple(cand.tolist()) < tuple(best.tolist())):
                 best = cand
         return best
-    # k>8：启发式
+    # 启发式：按 (deg, selfloop, 邻接行字典序) 排序
     deg = R.sum(axis=1).astype(int)
     selfloop = np.diag(R).astype(int)
     adj_str = ["".join('1' if x else '0' for x in row.tolist()) for row in R]
@@ -105,13 +92,13 @@ def canonical_bits(bits: np.ndarray, k: int) -> np.ndarray:
     P = R[np.ix_(order, order)]
     return bits_from_rule(P)
 
+# ------------------------------
+# 行生成器（环状合法行）: k ≤ 16 高效版
+# ------------------------------
 
-# =========================
-# 行生成（环状合法行）
-# =========================
 def enumerate_ring_rows_fast(n: int, k: int, R: np.ndarray,
                              batch_limit: int = 200_000) -> np.ndarray:
-    assert k <= 16, "当前实现默认 k ≤ 16（更大需改64bit位掩码实现）"
+    assert k <= 16, "enumerate_ring_rows_fast: current implementation assumes k ≤ 16."
     allowed_next = np.zeros(k, dtype=np.uint32)
     for c in range(k):
         mask = 0
@@ -120,7 +107,6 @@ def enumerate_ring_rows_fast(n: int, k: int, R: np.ndarray,
             if row[d]:
                 mask |= (1 << d)
         allowed_next[c] = np.uint32(mask)
-
     allowed_prev = np.zeros(k, dtype=np.uint32)
     for d in range(k):
         mask = 0
@@ -180,21 +166,20 @@ def enumerate_ring_rows_fast(n: int, k: int, R: np.ndarray,
         return np.empty((0, n), dtype=np.int16)
     return np.vstack(out_chunks)
 
+# ------------------------------
+# TransferOp（不显式构造 T）
+# ------------------------------
 
-# =========================
-# TransferOp
-# =========================
 class TransferOp:
     def __init__(self, rows_np: np.ndarray, R_np: np.ndarray,
                  device: str = "cuda", dtype: torch.dtype = torch.float64,
-                 block_size_j: int = None, block_size_i: int = None):
+                 block_size_j: Optional[int] = None, block_size_i: Optional[int] = None):
         self.device = torch.device(device)
         self.dtype = dtype
         self.rows = torch.from_numpy(rows_np.astype(np.int64)).to(self.device)  # (m,n)
         self.m, self.n = self.rows.shape
         self.k = R_np.shape[0]
         self.R = torch.from_numpy(R_np.astype(np.bool_)).to(self.device)        # (k,k)
-
         if block_size_i is None:
             block_size_i = min(self.m, 2048)
         if block_size_j is None:
@@ -202,7 +187,6 @@ class TransferOp:
         if self.m >= 200000:
             block_size_j = 1024
             block_size_i = min(block_size_i, 1024)
-
         self.block_size_i = int(block_size_i)
         self.block_size_j = int(block_size_j)
 
@@ -238,15 +222,13 @@ class TransferOp:
 
         return y
 
+# ------------------------------
+# 谱估计：幂迭代 / Lanczos / Hutch++
+# ------------------------------
 
-# =========================
-# 数值算法
-# =========================
 @torch.no_grad()
 def power_iteration(op: TransferOp, iters: int = 60, tol: float = 1e-8,
                     verbose: bool = False, seed: int = 0) -> Tuple[float, torch.Tensor]:
-    iters = _int_or(iters, 60)
-    tol = _float_or(tol, 1e-8)
     torch.manual_seed(seed)
     m = op.m
     v = torch.randn(m, dtype=op.dtype, device=op.device)
@@ -260,7 +242,7 @@ def power_iteration(op: TransferOp, iters: int = 60, tol: float = 1e-8,
         v = w / norm_w
         lam = (v @ op.matvec(v)).item()
         if verbose and t % 5 == 0:
-            logger.debug(f"[power] iter={t}  lambda≈{lam:.6e}")
+            logging.info(f"[power] iter={t}  lambda≈{lam:.6e}")
         if last_lambda is not None and abs(lam - last_lambda) <= tol * max(1.0, abs(lam)):
             return lam, v
         last_lambda = lam
@@ -269,8 +251,6 @@ def power_iteration(op: TransferOp, iters: int = 60, tol: float = 1e-8,
 @torch.no_grad()
 def lanczos_top_r(op: TransferOp, r: int = 4, iters: int = 80, seed: int = 0,
                   verbose: bool = False) -> List[float]:
-    r = _int_or(r, 4)
-    iters = _int_or(iters, max(2*r, 20))
     torch.manual_seed(seed)
     m = op.m
     q_prev = torch.zeros(m, dtype=op.dtype, device=op.device)
@@ -292,7 +272,7 @@ def lanczos_top_r(op: TransferOp, r: int = 4, iters: int = 80, seed: int = 0,
         betas.append(beta)
 
         if verbose:
-            logger.debug(f"[lanczos] j={j} alpha={alpha:.6e} beta={beta:.6e}")
+            logging.info(f"[lanczos] j={j} alpha={alpha:.6e} beta={beta:.6e}")
         if beta <= 1e-32:
             break
         q_prev, q = q, z / (beta + 1e-30)
@@ -310,7 +290,6 @@ def lanczos_top_r(op: TransferOp, r: int = 4, iters: int = 80, seed: int = 0,
 
 @torch.no_grad()
 def apply_T_power(op, v: torch.Tensor, power: int) -> torch.Tensor:
-    power = _int_or(power, 1)
     y = v
     for _ in range(power):
         y = op.matvec(y)
@@ -318,12 +297,10 @@ def apply_T_power(op, v: torch.Tensor, power: int) -> torch.Tensor:
 
 @torch.no_grad()
 def estimate_trace_T_power_hutch(op, n_power: int, s: int = 32, seed: int = 0) -> float:
-    n_power = _int_or(n_power, 1)
-    s = _int_or(s, 32)
     torch.manual_seed(seed)
     m = op.m
     acc = 0.0
-    for _ in range(s):
+    for i in range(s):
         v = torch.empty(m, dtype=op.dtype, device=op.device).uniform_(-1.0, 1.0).sign()
         Tv = apply_T_power(op, v, n_power)
         acc += (v @ Tv).item()
@@ -331,8 +308,6 @@ def estimate_trace_T_power_hutch(op, n_power: int, s: int = 32, seed: int = 0) -
 
 @torch.no_grad()
 def estimate_trace_T_power_hutchpp(op, n_power: int, s: int = 32, seed: int = 0) -> float:
-    n_power = _int_or(n_power, 1)
-    s = _int_or(s, 32)
     torch.manual_seed(seed)
     m = op.m
     s1 = max(2, s // 2)
@@ -352,7 +327,7 @@ def estimate_trace_T_power_hutchpp(op, n_power: int, s: int = 32, seed: int = 0)
         trace_lowrank += (qj @ Tq).item()
 
     trace_res = 0.0
-    for _ in range(max(1, s2)):
+    for i in range(max(1, s2)):
         z = torch.empty(m, dtype=op.dtype, device=op.device).uniform_(-1.0, 1.0).sign()
         p = Q.T @ z
         w = z - Q @ p
@@ -362,10 +337,10 @@ def estimate_trace_T_power_hutchpp(op, n_power: int, s: int = 32, seed: int = 0)
         trace_res /= float(s2)
     return trace_lowrank + trace_res
 
+# ------------------------------
+# 结构性指标
+# ------------------------------
 
-# =========================
-# 图结构指标
-# =========================
 def _graph_degrees_and_components(R_np: np.ndarray) -> Tuple[np.ndarray, int]:
     k = R_np.shape[0]
     deg = R_np.sum(axis=1).astype(int)  # 自环计度
@@ -387,14 +362,15 @@ def _graph_degrees_and_components(R_np: np.ndarray) -> Tuple[np.ndarray, int]:
                         stack.append(v)
     return deg, comps
 
+# ------------------------------
+# LRU 行缓存
+# ------------------------------
 
-# =========================
-# LRU 缓存
-# =========================
 class RowsCacheLRU:
     def __init__(self, capacity=128):
+        from collections import OrderedDict
         self.capacity = capacity
-        self.od = OrderedDict()  # key: bytes(bits), val: np.ndarray rows
+        self.od = OrderedDict()
     def get(self, key: bytes):
         if key in self.od:
             val = self.od.pop(key)
@@ -408,65 +384,29 @@ class RowsCacheLRU:
             self.od.popitem(last=False)
         self.od[key] = val
 
+# ------------------------------
+# 谱半径上界：Gershgorin / 最大度（结构上界，不依赖构造 T）
+# ------------------------------
 
-# =========================
-# 上界（raw）：Gershgorin / Δ 上界
-# =========================
-def _upper_bound_raw(m: int, R_np: np.ndarray, lam_pos: float, n_power: int) -> float:
+def _upper_bound_raw(R_np: np.ndarray, n: int) -> Dict[str, float]:
     """
-    不显式构造 T 的可计算上界：
-      - Gershgorin 行和上界：ρ(T) ≤ max_i ∑_j |T_ij|（对 0-1 兼容矩阵即最大行和）；
-        我们无法直接得到该行和，取保守近似 ≤ m。
-      - 最大度谱半径上界：ρ(T) ≤ Δ（对 0-1 矩阵常见），此处取 Δ≈min(m, lam_pos 的正部分) 作为可用尺度。
-    综合取：
-        upper_raw = m * (min{ m, max(lam_pos, 1) })^n
-    若未来实现了对最大行和的抽样近似，可把 delta 换成更紧的估计。
+    给出 λ(T) 的结构性上界（不显式构造 T）：rho_gersh、rho_maxdeg。
+    在 evaluate_rules_batch 中结合 m -> ub_raw_* = m * (rho_*)^n。
+    直观：
+      - rho_maxdeg ~ max行/列和的安全上界：用 R 的平均度作为尺度（不过分放大）
+      - rho_gersh   取 min(k, avg_deg) 的安全上界（避免极端夸大）
     """
-    n_power = _int_or(n_power, 1)
-    if m <= 0:
-        return 0.0
-    # lam_pos 仅用于给出一个可计算的谱半径尺度；至少为 1，至多为 m
-    delta = max(1.0, min(float(m), float(lam_pos if lam_pos > 0 else 0.0)))
-    return float(m) * (delta ** n_power)
+    k = R_np.shape[0]
+    deg = R_np.sum(axis=1).astype(float)
+    deg_mean = float(np.mean(deg)) if k > 0 else 0.0
+    rho_maxdeg = max(1.0, deg_mean)      # 不做 n 次方放大，避免过松
+    rho_gersh  = max(1.0, min(float(k), deg_mean))
+    return {"rho_gersh": rho_gersh, "rho_maxdeg": rho_maxdeg}
 
+# ------------------------------
+# 批量评估
+# ------------------------------
 
-# =========================
-# 小规模精确计数（可选）
-# =========================
-def _maybe_exact_trace(n: int, k: int, R: np.ndarray, rows_m: int,
-                       enable: bool = True,
-                       n_max: int = 4, k_max: int = 3,
-                       rows_m_max: int = 20000) -> Tuple[Optional[int], Optional[int]]:
-    """
-    条件触发 stage-1 精确计数：
-      - n ≤ n_max, k ≤ k_max, rows_m ≤ rows_m_max
-      - 存在 rules.stage1_exact，并提供 exact_trace_by_transfer(n,k,R)
-    返回：(exact_trace, exact_rows_m)；若跳过或失败则 (None, None)。
-    """
-    if not enable:
-        return None, None
-    if not (n <= n_max and k <= k_max and rows_m <= rows_m_max):
-        return None, None
-    try:
-        # 延迟导入，避免常规路径额外依赖
-        from rules.stage1_exact import enumerate_ring_rows, build_row_compat_matrix
-        rows = enumerate_ring_rows(n, k, R)  # List[List[int]]
-        T = build_row_compat_matrix(rows, R) # 0/1 矩阵 (m,m)
-        # 直接算 trace(T^n) （m 较小）
-        M = np.array(T, dtype=object)
-        for _ in range(n - 1):
-            M = M @ T
-        exact = int(np.trace(M))
-        return exact, len(rows)
-    except Exception as e:
-        logger.debug(f"[exact] skip or failed: {e}")
-        return None, None
-
-
-# =========================
-# 评估主入口
-# =========================
-@torch.no_grad()
 def evaluate_rules_batch(n: int,
                          k: int,
                          bits_list: List[np.ndarray],
@@ -476,23 +416,20 @@ def evaluate_rules_batch(n: int,
                          power_iters: int = 50,
                          trace_mode: str = "hutchpp",
                          hutch_s: int = 24,
-                         lru_rows: RowsCacheLRU = None,
+                         lru_rows: Optional[RowsCacheLRU] = None,
                          max_streams: int = 2) -> List[Dict]:
     """
-    输出字段：
-      rule_count, rows_m, lambda_max, sum_lambda_powers,
-      active_k, lower_bound / upper_bound（惩罚后）, lower_bound_raw / upper_bound_raw,
-      exact_trace / exact_rows_m（若触发小规模精确计数）
+    批量评估规则个体，输出：
+      - rows_m, lambda_max, lambda_top2, spectral_gap, sum_lambda_powers
+      - active_k
+      - lower_bound / upper_bound（raw 与惩罚后）
+      - 结构上界：upper_bound_raw_gersh / upper_bound_raw_maxdeg
+      - archetype_tags（若 rules.structures 存在）
+      - exact_Z（小规模可得时）
     """
-    # 参数兜底
-    r_vals      = _int_or(r_vals, 3)
-    power_iters = _int_or(power_iters, 50)
-    hutch_s     = _int_or(hutch_s, 24)
-    max_streams = _int_or(max_streams, 2)
-    use_lanczos = _bool_or(use_lanczos, True)
+    SMALL_NK = (n <= 4 and k <= 3)
 
-    PENALTY_ALPHA = 1.5  # 温和惩罚强度
-
+    PENALTY_ALPHA = 1.5
     def _adaptive_samples(m: int, base: int) -> int:
         if m < 2_000:
             return max(12, base // 2)
@@ -503,21 +440,27 @@ def evaluate_rules_batch(n: int,
     # ---------- CPU 路径 ----------
     if (device == "cpu") or (not torch.cuda.is_available()):
         outs: List[Dict] = []
-        for bits in bits_list:
+        for idx, bits in enumerate(bits_list):
             R = rule_from_bits(k, bits)
             deg, comps = _graph_degrees_and_components(R)
+
             rows = enumerate_ring_rows_fast(n, k, R)
             m = int(rows.shape[0])
             if m == 0:
+                # 上界也为 0
+                ub_rhos = _upper_bound_raw(R, n)
                 outs.append({
                     "rule_count": int(bits.sum()),
                     "lambda_max": 0.0,
+                    "lambda_top2": (0.0, 0.0),
+                    "spectral_gap": 0.0,
                     "sum_lambda_powers": -1e300,
                     "rows_m": 0,
                     "active_k": 0,
                     "lower_bound": 0.0, "upper_bound": 0.0,
                     "lower_bound_raw": 0.0, "upper_bound_raw": 0.0,
-                    "exact_trace": "", "exact_rows_m": "",
+                    "upper_bound_raw_gersh": 0.0, "upper_bound_raw_maxdeg": 0.0,
+                    "archetype_tags": "",
                 })
                 continue
 
@@ -529,94 +472,13 @@ def evaluate_rules_batch(n: int,
             op = TransferOp(rows, R, device="cpu", dtype=torch.float64, block_size_j=2048)
 
             if use_lanczos:
-                evals = lanczos_top_r(op, r=r_vals, iters=max(2*r_vals, 20), seed=0, verbose=False)
-                lam_max = float(evals[0]) if len(evals) > 0 else 0.0
-                lam_pos = max(0.0, lam_max)
-                lb_raw = max(lam_pos ** n, sum((max(0.0, lam) ** n) for lam in evals) if len(evals)>0 else 0.0)
-                if trace_mode == "lanczos_sum":
-                    est = float(sum((max(0.0, lam) ** n) for lam in evals) if len(evals)>0 else 0.0)
-                elif trace_mode == "hutch":
-                    est = float(estimate_trace_T_power_hutch(op, n_power=n, s=s_adapt, seed=0))
-                elif trace_mode == "hutchpp":
-                    est = float(estimate_trace_T_power_hutchpp(op, n_power=n, s=s_adapt, seed=0))
-                else:
-                    est = float(lam_pos ** n)
-            else:
-                lam_max, _ = power_iteration(op, iters=power_iters, tol=1e-9, verbose=False, seed=0)
-                lam_pos = max(0.0, lam_max)
+                evals = lanczos_top_r(op, r=r_vals, iters=max(2*r_vals, 20), seed=idx, verbose=False)
+                lambda1 = float(evals[0]) if len(evals) > 0 else 0.0
+                lambda2 = float(evals[1]) if len(evals) > 1 else 0.0
+                lam_pos = max(0.0, lambda1)
                 lb_raw = lam_pos ** n
-                est = float(lam_pos ** n)
-
-            ub_raw = _upper_bound_raw(m, R, lam_pos, n_power=n)
-
-            penal = 1.0
-            if comps > 1:
-                penal *= (0.5 ** (comps - 1))
-            if np.any(deg == 0):
-                penal *= (active_k / k) ** PENALTY_ALPHA
-
-            # 小规模精确计数（可选）
-            exact_trace, exact_rows_m = _maybe_exact_trace(n, k, R, m)
-
-            outs.append({
-                "rule_count": int(bits.sum()),
-                "lambda_max": lam_max,
-                "sum_lambda_powers": est * penal,
-                "rows_m": m,
-                "active_k": active_k,
-                "lower_bound": lb_raw * penal, "upper_bound": ub_raw * penal,
-                "lower_bound_raw": lb_raw, "upper_bound_raw": ub_raw,
-                "exact_trace": "" if exact_trace is None else exact_trace,
-                "exact_rows_m": "" if exact_rows_m is None else exact_rows_m,
-            })
-        return outs
-
-    # ---------- CUDA 路径 ----------
-    streams = [torch.cuda.Stream() for _ in range(max(1, max_streams))]
-    outputs: List[Dict] = [None] * len(bits_list)
-
-    for idx, bits in enumerate(bits_list):
-        key = bits.tobytes()
-        R = rule_from_bits(k, bits)
-        deg, comps = _graph_degrees_and_components(R)
-
-        rows = None
-        if lru_rows is not None:
-            rows = lru_rows.get(key)
-        if rows is None:
-            rows = enumerate_ring_rows_fast(n, k, R)
-            if (lru_rows is not None) and (rows.shape[0] > 0) and (rows.shape[0] <= 1_000_000):
-                lru_rows.put(key, rows)
-
-        m = int(rows.shape[0])
-        if m == 0:
-            outputs[idx] = {
-                "rule_count": int(bits.sum()),
-                "lambda_max": 0.0,
-                "sum_lambda_powers": -1e300,
-                "rows_m": 0,
-                "active_k": 0,
-                "lower_bound": 0.0, "upper_bound": 0.0,
-                "lower_bound_raw": 0.0, "upper_bound_raw": 0.0,
-                "exact_trace": "", "exact_rows_m": "",
-            }
-            continue
-
-        used = np.zeros(k, dtype=bool)
-        used[np.unique(rows)] = True
-        active_k = int(used.sum())
-
-        s_adapt = max(1, _int_or(hutch_s, 24))
-        st = streams[idx % len(streams)]
-        with torch.cuda.stream(st):
-            op = TransferOp(rows, R, device=device, dtype=torch.float64, block_size_j=4096)
-
-            if use_lanczos:
-                evals = lanczos_top_r(op, r=_int_or(r_vals, 3), iters=max(2*_int_or(r_vals,3), 20), seed=idx, verbose=False)
-                lam_max = float(evals[0]) if len(evals) > 0 else 0.0
-                lam_pos = max(0.0, lam_max)
                 lb_r = sum((max(0.0, lam) ** n) for lam in evals) if len(evals) > 0 else 0.0
-                lb_raw = max(lam_pos ** n, lb_r)
+                lb_raw = max(lb_raw, lb_r)
                 if trace_mode == "lanczos_sum":
                     est = float(lb_r)
                 elif trace_mode == "hutch":
@@ -626,12 +488,14 @@ def evaluate_rules_batch(n: int,
                 else:
                     est = float(lam_pos ** n)
             else:
-                lam_max, _ = power_iteration(op, iters=_int_or(power_iters, 50), tol=1e-9, verbose=False, seed=idx)
-                lam_pos = max(0.0, lam_max)
+                lambda1, _ = power_iteration(op, iters=power_iters, tol=1e-9, verbose=False, seed=idx)
+                lambda2 = 0.0
+                lam_pos = max(0.0, lambda1)
                 lb_raw = lam_pos ** n
                 est = float(lam_pos ** n)
 
-            ub_raw = _upper_bound_raw(m, R, lam_pos, n_power=n)
+            ub_raw = float(m) * (lam_pos ** n)
+            spectral_gap = max(0.0, lambda1 - lambda2)
 
             penal = 1.0
             if comps > 1:
@@ -639,19 +503,162 @@ def evaluate_rules_batch(n: int,
             if np.any(deg == 0):
                 penal *= (active_k / k) ** PENALTY_ALPHA
 
-            exact_trace, exact_rows_m = _maybe_exact_trace(n, k, R, m)
+            sum_lp = est * penal
+            lb = lb_raw * penal
+            ub = ub_raw * penal
 
-            outputs[idx] = {
+            # 结构上界（与 m 结合）
+            ub_rhos = _upper_bound_raw(R, n)
+            ub_raw_gersh = float(m) * (ub_rhos["rho_gersh"] ** n)
+            ub_raw_maxdeg = float(m) * (ub_rhos["rho_maxdeg"] ** n)
+
+            # 原型识别（可选）
+            try:
+                from .structures import recognize_archetypes
+                arc = recognize_archetypes(bits)
+                archetype_tags = ";".join([kk for kk,v in arc.items() if v])
+            except Exception:
+                archetype_tags = ""
+
+            fit = {
                 "rule_count": int(bits.sum()),
-                "lambda_max": lam_max,
-                "sum_lambda_powers": est * penal,
+                "lambda_max": lambda1,
+                "lambda_top2": (lambda1, lambda2),
+                "spectral_gap": spectral_gap,
+                "sum_lambda_powers": sum_lp,
                 "rows_m": m,
                 "active_k": active_k,
-                "lower_bound": lb_raw * penal, "upper_bound": ub_raw * penal,
+                "lower_bound": lb, "upper_bound": ub,
                 "lower_bound_raw": lb_raw, "upper_bound_raw": ub_raw,
-                "exact_trace": "" if exact_trace is None else exact_trace,
-                "exact_rows_m": "" if exact_rows_m is None else exact_rows_m,
+                "upper_bound_raw_gersh": ub_raw_gersh, "upper_bound_raw_maxdeg": ub_raw_maxdeg,
+                "archetype_tags": archetype_tags,
             }
+
+            # 小规模精确计数
+            if SMALL_NK:
+                try:
+                    from .stage1_exact import count_patterns_transfer_matrix
+                    exact_Z = int(count_patterns_transfer_matrix(n, k, R, return_rows=False))
+                    fit["exact_Z"] = exact_Z
+                except Exception:
+                    pass
+
+            outs.append(fit)
+        return outs
+
+    # ---------- CUDA 路径 ----------
+    streams = [torch.cuda.Stream() for _ in range(max(1, max_streams))]
+    outputs: List[Dict] = [None] * len(bits_list)
+    rows_lru = lru_rows or RowsCacheLRU(capacity=128)
+
+    for idx, bits in enumerate(bits_list):
+        key = bits.tobytes()
+        R = rule_from_bits(k, bits)
+        deg, comps = _graph_degrees_and_components(R)
+
+        rows = rows_lru.get(key)
+        if rows is None:
+            rows = enumerate_ring_rows_fast(n, k, R)
+            if rows.shape[0] > 0 and rows.shape[0] <= 1_000_000:
+                rows_lru.put(key, rows)
+
+        m = int(rows.shape[0])
+        if m == 0:
+            ub_rhos = _upper_bound_raw(R, n)
+            outputs[idx] = {
+                "rule_count": int(bits.sum()),
+                "lambda_max": 0.0,
+                "lambda_top2": (0.0, 0.0),
+                "spectral_gap": 0.0,
+                "sum_lambda_powers": -1e300,
+                "rows_m": 0,
+                "active_k": 0,
+                "lower_bound": 0.0, "upper_bound": 0.0,
+                "lower_bound_raw": 0.0, "upper_bound_raw": 0.0,
+                "upper_bound_raw_gersh": 0.0, "upper_bound_raw_maxdeg": 0.0,
+                "archetype_tags": "",
+            }
+            continue
+
+        used = np.zeros(k, dtype=bool)
+        used[np.unique(rows)] = True
+        active_k = int(used.sum())
+
+        s_adapt = _adaptive_samples(m, hutch_s)
+        st = streams[idx % len(streams)]
+        with torch.cuda.stream(st):
+            op = TransferOp(rows, R, device=device, dtype=torch.float64, block_size_j=4096)
+
+            if use_lanczos:
+                evals = lanczos_top_r(op, r=r_vals, iters=max(2*r_vals, 20), seed=idx, verbose=False)
+                lambda1 = float(evals[0]) if len(evals) > 0 else 0.0
+                lambda2 = float(evals[1]) if len(evals) > 1 else 0.0
+                lam_pos = max(0.0, lambda1)
+                lb_raw = lam_pos ** n
+                lb_r = sum((max(0.0, lam) ** n) for lam in evals) if len(evals) > 0 else 0.0
+                lb_raw = max(lb_raw, lb_r)
+                if trace_mode == "lanczos_sum":
+                    est = float(lb_r)
+                elif trace_mode == "hutch":
+                    est = float(estimate_trace_T_power_hutch(op, n_power=n, s=s_adapt, seed=idx))
+                elif trace_mode == "hutchpp":
+                    est = float(estimate_trace_T_power_hutchpp(op, n_power=n, s=s_adapt, seed=idx))
+                else:
+                    est = float(lam_pos ** n)
+            else:
+                lambda1, _ = power_iteration(op, iters=power_iters, tol=1e-9, verbose=False, seed=idx)
+                lambda2 = 0.0
+                lam_pos = max(0.0, lambda1)
+                lb_raw = lam_pos ** n
+                est = float(lam_pos ** n)
+
+            ub_raw = float(m) * (lam_pos ** n)
+            spectral_gap = max(0.0, lambda1 - lambda2)
+
+            penal = 1.0
+            if comps > 1:
+                penal *= (0.5 ** (comps - 1))
+            if np.any(deg == 0):
+                penal *= (active_k / k) ** PENALTY_ALPHA
+
+            sum_lp = est * penal
+            lb = lb_raw * penal
+            ub = ub_raw * penal
+
+            ub_rhos = _upper_bound_raw(R, n)
+            ub_raw_gersh = float(m) * (ub_rhos["rho_gersh"] ** n)
+            ub_raw_maxdeg = float(m) * (ub_rhos["rho_maxdeg"] ** n)
+
+            try:
+                from .structures import recognize_archetypes
+                arc = recognize_archetypes(bits)
+                archetype_tags = ";".join([kk for kk,v in arc.items() if v])
+            except Exception:
+                archetype_tags = ""
+
+            fit = {
+                "rule_count": int(bits.sum()),
+                "lambda_max": lambda1,
+                "lambda_top2": (lambda1, lambda2),
+                "spectral_gap": spectral_gap,
+                "sum_lambda_powers": sum_lp,
+                "rows_m": m,
+                "active_k": active_k,
+                "lower_bound": lb, "upper_bound": ub,
+                "lower_bound_raw": lb_raw, "upper_bound_raw": ub_raw,
+                "upper_bound_raw_gersh": ub_raw_gersh, "upper_bound_raw_maxdeg": ub_raw_maxdeg,
+                "archetype_tags": archetype_tags,
+            }
+
+            if SMALL_NK:
+                try:
+                    from .stage1_exact import count_patterns_transfer_matrix
+                    exact_Z = int(count_patterns_transfer_matrix(n, k, R, return_rows=False))
+                    fit["exact_Z"] = exact_Z
+                except Exception:
+                    pass
+
+            outputs[idx] = fit
 
     torch.cuda.synchronize()
     return outputs

@@ -1,58 +1,34 @@
-from dataclasses import dataclass
-from typing import Optional, Literal
+# -*- coding: utf-8 -*-
+"""
+rules/config.py
+全局轻量配置：默认风格、设备、输出目录等。
+"""
 
-UpperBoundStrategy = Literal[
-    "none",         # 不计算上界（仅返回估计）
-    "row_sum",      # m * (max_row_sum)^n
-    "gershgorin",   # 与 row_sum 等价；保留用于学理与日志
-    "power_mean"    # sqrt(m) * trace(T^{2n})^{1/2}
-]
+from __future__ import annotations
+from pathlib import Path
+import os
 
-@dataclass
-class EvalConfig:
-    device: str = "cuda"
-    use_lanczos: bool = True
-    r_vals: int = 3
-    power_iters: int = 60
-    trace_mode: Literal["hutchpp","hutch","lanczos_sum","lam_only"] = "hutchpp"
-    hutch_s_base: int = 24
-    penalty_alpha: float = 1.5
-    block_size_i: Optional[int] = None
-    block_size_j: Optional[int] = None
-    lru_rows_capacity: int = 128
-    max_streams: int = 2
-    enable_exact_crosscheck: bool = True
+# 视觉风格（viz.apply_style 支持的枚举）
+DEFAULT_STYLE = os.getenv("RULES_STYLE", "ieee")
 
-    # —— 新增：上界策略（可多选并输出） ——
-    upper_bounds: tuple[UpperBoundStrategy, ...] = ("row_sum","power_mean")
+# 设备（eval.TransferOp 会再次判断）
+DEFAULT_DEVICE = os.getenv("RULES_DEVICE", "cuda")
 
-    # —— 新增：二阶矩估计开关（给 power_mean 用） ——
-    estimate_second_moment: bool = True
-    hutch_s_base_2nd: int = 24   # 估计 trace(T^{2n}) 的采样基数
+# 结果根目录（示例；各 CLI 可覆盖）
+RESULTS_ROOT = Path(os.getenv("RULES_RESULTS_ROOT", "./notebooks/results")).resolve()
+OUT_CSV_DEFAULT = RESULTS_ROOT / "out_csv"
+OUT_FIG_DEFAULT = RESULTS_ROOT / "figs"
 
-    # —— 并行外层（仅 CPU 时生效；CUDA 建议关闭） ——
-    parallel_backend: Literal["none","mp"] = "none"
-    num_workers: int = 0  # 0/1=不并行；>1 启用多进程
+# LRU 行缓存容量（eval.RowsCacheLRU）
+ROWS_LRU_CAPACITY = int(os.getenv("RULES_ROWS_LRU", "128"))
 
-    # 自适应采样阈值
-    small_m_threshold: int = 2_000
-    large_m_threshold: int = 50_000
-    min_s: int = 12
-    max_s: int = 64
+# 计算相关默认值（可被 CLI 覆盖）
+LANCZOS_R = int(os.getenv("RULES_LANCZOS_R", "3"))
+POWER_ITERS = int(os.getenv("RULES_POWER_ITERS", "50"))
+HUTCH_S = int(os.getenv("RULES_HUTCH_S", "24"))
+TRACE_MODE = os.getenv("RULES_TRACE_MODE", "hutchpp")  # hutch|hutchpp|lanczos_sum
 
-@dataclass
-class GAConfig:
-    pop_size: int = 24
-    generations: int = 10
-    p_mut: float = 0.08
-    p_cx: float = 0.85
-    elite_keep: int = 6
-    device: Optional[str] = None         # None -> 自动探测
-    # 下列字段会透传给 EvalConfig（若不指定则用 EvalConfig 默认）
-    use_lanczos: Optional[bool] = None
-    r_vals: Optional[int] = None
-    power_iters: Optional[int] = None
-    trace_mode: Optional[str] = None
-    hutch_s_base: Optional[int] = None
-    lru_rows_capacity: int = 128
-    batch_streams: int = 2
+# 对称性分析默认
+SYM_GEO_OPS = os.getenv("RULES_SYM_GEO_OPS", "rot,ref,trans")
+SYM_ENUM_LIMIT = int(os.getenv("RULES_SYM_ENUM_LIMIT", "1000000"))
+SYM_SAMPLES = int(os.getenv("RULES_SYM_SAMPLES", "6"))

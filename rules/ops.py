@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
-import itertools, numpy as np, torch
-from typing import List, Tuple, Optional
+from __future__ import annotations
+import itertools, numpy as np, torch, hashlib
+from typing import List, Tuple, Optional, Iterable
 from collections import OrderedDict
-from .logging_setup import get_logger
 
-logger = get_logger(__name__)
-
+# ---------------- rule <-> bits ----------------
 def rule_from_bits(k: int, bits: np.ndarray) -> np.ndarray:
     L_diag = k; L_upper = k*(k-1)//2
     assert bits.size == L_diag + L_upper
@@ -25,24 +24,54 @@ def bits_from_rule(R: np.ndarray) -> np.ndarray:
         for j in range(i+1, k): out.append(1 if R[i,j] else 0)
     return np.array(out, dtype=np.uint8)
 
-def canonical_bits(bits: np.ndarray, k: int) -> np.ndarray:
+def apply_perm_to_bits(bits: np.ndarray, k: int, perm: Iterable[int]) -> np.ndarray:
+    P = list(perm)
     R = rule_from_bits(k, bits)
-    if k <= 8:
-        best = None
-        for perm in itertools.permutations(range(k)):
-            P = R[np.ix_(perm, perm)]
-            cand = bits_from_rule(P)
-            if (best is None) or (tuple(cand.tolist()) < tuple(best.tolist())):
-                best = cand
-        return best
-    # heuristic for k>8
-    deg = R.sum(axis=1).astype(int)
-    selfloop = np.diag(R).astype(int)
-    adj_str = ["".join('1' if x else '0' for x in row.tolist()) for row in R]
-    order = sorted(range(k), key=lambda i: (deg[i], selfloop[i], adj_str[i]), reverse=True)
-    P = R[np.ix_(order, order)]
-    return bits_from_rule(P)
+    R2 = R[np.ix_(P, P)]
+    return bits_from_rule(R2)
 
+def rule_bits_hash(bits: np.ndarray) -> str:
+    return hashlib.sha1(bits.astype(np.uint8).tobytes()).hexdigest()
+
+# ---------------- canonicalization (state-permutation symmetry) ----------------
+def _canon_exact(bits: np.ndarray, k: int) -> Tuple[np.ndarray, Optional[Tuple[int,...]]]:
+    # full permutation search for k<=8
+    R = rule_from_bits(k, bits)
+    best = None; best_perm = None
+    for perm in itertools.permutations(range(k)):
+        P = R[np.ix_(perm, perm)]
+        cand = bits_from_rule(P)
+        if (best is None) or (tuple(cand.tolist()) < tuple(best.tolist())):
+            best, best_perm = cand, tuple(perm)
+    return best, best_perm
+
+def _canon_heuristic(bits: np.ndarray, k: int) -> Tuple[np.ndarray, Optional[Tuple[int,...]]]:
+    # degree / self-loop / row-lex ordering
+    R = rule_from_bits(k, bits)
+    deg = R.sum(axis=1).astype(int)
+    sl  = np.diag(R).astype(int)
+    row = ["".join('1' if x else '0' for x in r.tolist()) for r in R]
+    order = sorted(range(k), key=lambda i: (deg[i], sl[i], row[i]), reverse=True)
+    perm = tuple(order)
+    return apply_perm_to_bits(bits, k, perm), perm
+
+def canonical_bits(bits: np.ndarray, k: int, mode: str = "auto") -> Tuple[np.ndarray, str, Optional[Tuple[int,...]]]:
+    """
+    返回：(canon_bits, canon_hash, witness_perm)
+      - mode: "auto"|"exact"|"heuristic"
+      - 如未来安装 igraph/bliss，可在此处增加 "wl+igraph" 或 "igraph"
+    """
+    if mode == "auto":
+        mode = "exact" if k <= 8 else "heuristic"
+    if mode == "exact":
+        cb, perm = _canon_exact(bits, k)
+    elif mode == "heuristic":
+        cb, perm = _canon_heuristic(bits, k)
+    else:
+        cb, perm = _canon_heuristic(bits, k)
+    return cb, rule_bits_hash(cb), perm
+
+# ---------------- fast row enumeration / transfer op (原有内容保留) ----------------
 class RowsCacheLRU:
     def __init__(self, capacity=128):
         self.capacity = capacity; self.od = OrderedDict()
@@ -120,13 +149,9 @@ class TransferOp:
         self.rows = torch.from_numpy(rows_np.astype(np.int64)).to(self.device)
         self.m, self.n = self.rows.shape; self.k = R_np.shape[0]
         self.R = torch.from_numpy(R_np.astype(np.bool_)).to(self.device)
-
-        if block_size_i is None:
-            block_size_i = min(self.m, 2048)
-        if block_size_j is None:
-            block_size_j = 4096 if self.m >= 10000 else 2048
-        if self.m >= 200000:
-            block_size_j = 1024; block_size_i = min(block_size_i, 1024)
+        if block_size_i is None: block_size_i = min(self.m, 2048)
+        if block_size_j is None: block_size_j = 4096 if self.m >= 10000 else 2048
+        if self.m >= 200000: block_size_j = 1024; block_size_i = min(block_size_i, 1024)
         self.block_size_i = int(block_size_i); self.block_size_j = int(block_size_j)
 
     @torch.no_grad()
