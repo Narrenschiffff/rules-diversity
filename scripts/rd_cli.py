@@ -210,22 +210,26 @@ def cmd_motifs(args):
     print("[motifs] index  :", os.path.abspath(idx_path))
 
 def cmd_motifs_explain(args):
-    try:
-        from rules.motifs_explainer import explain_motif_deltas
-    except Exception:
-        logging.exception("[motifs-explain] import failed"); sys.exit(1)
-    out_csv_dir = ensure_dir(args.out_csv); out_fig_dir = ensure_dir(args.out_dir)
-    examples_csv = Path(args.examples) if args.examples else (out_csv_dir / "motifs" / "motif_knee_examples.csv")
-    if not examples_csv.exists():
-        print(f"[motifs-explain] 未找到 examples CSV: {examples_csv}"); sys.exit(1)
-    paths = explain_motif_deltas(
-        examples_csv=examples_csv,
-        out_csv_dir=str(out_csv_dir), out_fig_dir=str(out_fig_dir),
-        style=args.style, topN=args.topN,
-        tree_max_depth=args.tree_depth, tree_min_samples_leaf=args.tree_min_leaf,
-        random_state=args.seed,
-    )
-    print("[motifs-explain] 完成。关键输出："); [print(f"  - {k}: {p}") for k, p in paths.items()]
+    from rules.motifs_explainer import main as _main  # 若在包内，按实际导入修正；或直接复用 run()
+    # 直接通过命令行转发给 motifs_explainer.py
+    # 兼容：这里我们显式拼装 argv 调用
+    import sys
+    argv = [
+        "--examples", args.examples,
+        "--out-csv",  args.out_csv,
+        "--out-dir",  args.out_dir,
+        "--style",    args.style or "ieee",
+        "--topN",     str(args.topN),
+        "--tree-depth", str(args.tree_depth),
+        "--tree-min-leaf", str(args.tree_min_leaf),
+        "--seed",     str(args.seed),
+    ]
+    if args.include_growth:
+        argv.append("--include-growth")
+    # 直接调用模块 main
+    sys.argv = ["motifs_explainer.py"] + argv
+    _main()
+
 
 def cmd_archetypes(args):
     from rules.viz import apply_style
@@ -375,17 +379,18 @@ def main():
     sp.set_defaults(func=cmd_motifs)
 
     # --- motifs-explain ---
-    sp = subparsers.add_parser("motifs-explain", help="对膝点 Δ 特征做解释性分析（LogReg/Tree/Permutation/L1稳定性）")
-    sp.add_argument("--examples", default=None,
-                    help="显式指定 motif_knee_examples.csv；若缺省则用 --out-csv 下默认文件")
-    sp.add_argument("--out-csv", default="results/motifs", help="输出 CSV 目录（亦用于默认 examples 路径）")
-    sp.add_argument("--out-dir", default="out_fig", help="输出图片目录")
-    sp.add_argument("--style", default="default", choices=["default","ieee","acm","nature"])
-    sp.add_argument("--topN", type=int, default=20, help="可视化前 N 个重要特征")
+    sp = subparsers.add_parser("motifs-explain", help="解释膝点结构（Δ特征）并出图，不重复生成 viz 的 nk 增长曲线。")
+    sp.add_argument("--examples", required=True, help="motif_knee_examples.csv")
+    sp.add_argument("--out-csv",  required=True)
+    sp.add_argument("--out-dir",  required=True)
+    sp.add_argument("--style", default="ieee")
+    sp.add_argument("--topN", type=int, default=20)
     sp.add_argument("--tree-depth", type=int, default=3)
     sp.add_argument("--tree-min-leaf", type=int, default=8)
     sp.add_argument("--seed", type=int, default=0)
+    sp.add_argument("--include-growth", action="store_true", help="通常关闭；viz 已生成 nk 增长曲线。")
     sp.set_defaults(func=cmd_motifs_explain)
+
 
     # --- archetypes ---
     sp = subparsers.add_parser("archetypes", help="结构原型扫描与可视化（需 rules.structures）")
