@@ -184,30 +184,77 @@ def cmd_viz_all(args):
             import sys, logging; logging.exception("[viz-all] failed"); sys.exit(1)
 
 def cmd_motifs(args):
-    from rules.motifs import analyze_fronts_for_knees
+    from rules.motifs import analyze_fronts_for_knees, analyze_fronts_for_mur
     paths = expand_globs(args.front)
-    if not paths: print("[motifs] no front CSV matched"); sys.exit(1)
+    if not paths:
+        print("[motifs] no front CSV matched"); sys.exit(1)
+
     ensure_dir(args.out_csv); ensure_dir(args.out_dir)
+
+    # 1) 先导出膝点三表（examples/summary/global）+ 基础图件（和你现有一致）
     try:
-        ex_csv, sum_csv, glob_csv, figs = analyze_fronts_for_knees(
-            csv_paths=paths, out_csv_dir=args.out_csv, out_fig_dir=args.out_dir,
-            style=args.style, logy=args.y_log
+        ex_csv_knee, sum_csv_knee, glob_csv_knee, figs_knee = analyze_fronts_for_knees(
+            csv_paths=paths,
+            out_csv_dir=args.out_csv,
+            out_fig_dir=args.out_dir,
+            style=args.style,
+            logy=args.y_log
         )
     except Exception:
-        logging.exception("[motifs] failed"); sys.exit(1)
+        logging.exception("[motifs] knee export failed")
+        sys.exit(1)
+
+    # 2) 再导出 MUR 三表（与膝点同目录，文件名以 motif_mur_* 开头；不覆盖膝点）
+    try:
+        ex_csv_mur, sum_csv_mur, glob_csv_mur, figs_mur = analyze_fronts_for_mur(
+            csv_paths=paths,
+            out_csv_dir=args.out_csv,
+            out_fig_dir=args.out_dir,
+            style=args.style,
+            logy=args.y_log
+        )
+    except Exception:
+        # MUR 不是强制的；如果失败，给出告警但不中断膝点的流程
+        logging.exception("[motifs] MUR export failed")
+        ex_csv_mur = sum_csv_mur = glob_csv_mur = None
+        figs_mur = []
+
+    # 3) 写入索引：同时记录膝点与 MUR 的路径，方便 Cell 自动解析
     idx_path = Path(args.out_csv) / "motifs_index.txt"
     with open(idx_path, "w", encoding="utf-8") as f:
-        f.write(f"examples={os.path.abspath(ex_csv)}\n")
-        f.write(f"summary={os.path.abspath(sum_csv)}\n")
-        f.write(f"global={os.path.abspath(glob_csv)}\n")
-        for i, p in enumerate(figs or []):
+        # 膝点
+        f.write(f"examples={os.path.abspath(ex_csv_knee)}\n")
+        f.write(f"summary={os.path.abspath(sum_csv_knee)}\n")
+        f.write(f"global={os.path.abspath(glob_csv_knee)}\n")
+        for i, p in enumerate(figs_knee or []):
             f.write(f"fig{i+1}={os.path.abspath(p)}\n")
-    print("[motifs] examples:", os.path.abspath(ex_csv))
-    print("[motifs] summary :", os.path.abspath(sum_csv))
-    print("[motifs] global  :", os.path.abspath(glob_csv))
-    if figs:
-        print("[motifs] figs:"); [print("  ", os.path.abspath(p)) for p in figs]
+
+        # MUR（如存在）
+        if ex_csv_mur:
+            f.write(f"mur_examples={os.path.abspath(ex_csv_mur)}\n")
+        if sum_csv_mur:
+            f.write(f"mur_summary={os.path.abspath(sum_csv_mur)}\n")
+        if glob_csv_mur:
+            f.write(f"mur_global={os.path.abspath(glob_csv_mur)}\n")
+        for i, p in enumerate(figs_mur or []):
+            f.write(f"mur_fig{i+1}={os.path.abspath(p)}\n")
+
+    # 4) 控制台输出
+    print("[motifs] (knee) examples:", os.path.abspath(ex_csv_knee))
+    print("[motifs] (knee) summary :", os.path.abspath(sum_csv_knee))
+    print("[motifs] (knee) global  :", os.path.abspath(glob_csv_knee))
+    if figs_knee:
+        print("[motifs] (knee) figs:")
+        [print("  ", os.path.abspath(p)) for p in figs_knee]
+    if ex_csv_mur:
+        print("[motifs] (mur)  examples:", os.path.abspath(ex_csv_mur))
+        print("[motifs] (mur)  summary :", os.path.abspath(sum_csv_mur))
+        print("[motifs] (mur)  global  :", os.path.abspath(glob_csv_mur))
+        if figs_mur:
+            print("[motifs] (mur)  figs:")
+            [print("  ", os.path.abspath(p)) for p in figs_mur]
     print("[motifs] index  :", os.path.abspath(idx_path))
+
 
 def cmd_motifs_explain(args):
     from rules.motifs_explainer import main as _main  # 若在包内，按实际导入修正；或直接复用 run()
