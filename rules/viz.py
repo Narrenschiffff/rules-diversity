@@ -1,172 +1,370 @@
 # -*- coding: utf-8 -*-
-"""
-Visualization utilities:
-- Pareto scatter (front-0)
-- Growth curve with confidence bands (lower/upper)
-- Knee detection & annotation:
-  * 'second_diff' — maximize discrete second difference of log-curve
-  * 'lcurve'      — geometric knee by distance to chord (L-curve style)
-"""
-
 from __future__ import annotations
-import csv
-import math
-import os
-from typing import Dict, List, Tuple
+import os, re, csv, math, argparse
+from typing import Dict, List, Tuple, Iterable, Optional
 
 import numpy as np
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 
+# =========================
+# 样式
+# =========================
+_STYLES = {
+    "default": {"figure.dpi":120,"savefig.dpi":200,"font.size":10,"axes.titlesize":11,"axes.labelsize":10,
+                "legend.fontsize":9,"xtick.labelsize":9,"ytick.labelsize":9,"axes.spines.top":False,
+                "axes.spines.right":False,"axes.grid":True,"grid.alpha":0.25,"lines.linewidth":1.3,
+                "lines.markersize":4.8,"legend.frameon":False},
+    "ieee":    {"figure.dpi":120,"savefig.dpi":220,"font.size":9,"axes.titlesize":10,"axes.labelsize":9,
+                "legend.fontsize":8,"xtick.labelsize":8,"ytick.labelsize":8,"axes.spines.top":False,
+                "axes.spines.right":False,"axes.grid":True,"grid.alpha":0.25,"lines.linewidth":1.2,
+                "lines.markersize":4.5,"legend.frameon":False},
+}
+def apply_style(style:str="default"):
+    mpl.rcParams.update(_STYLES.get(style,_STYLES["default"]))
 
-# ------------------------------
-# Knee detection helpers
-# ------------------------------
-def _detect_knee_second_diff(xs: List[int], ys: List[float]) -> int:
-    """
-    On log y, discrete second difference peak.
-    Return index in xs/ys of knee; -1 if not found.
-    """
-    if len(xs) < 3:
-        return -1
-    x = np.array(xs, dtype=float)
-    y = np.array(ys, dtype=float)
-    ylog = np.log(np.maximum(y, 1e-300))
-    # uniform spacing not guaranteed; use central finite diff with x spacing
-    d1 = np.gradient(ylog, x)
-    d2 = np.gradient(d1, x)
-    idx = int(np.argmax(np.maximum(d2, 0.0)))
-    return idx
+# =========================
+# 工具
+# =========================
+_RX_TS = re.compile(r"(?:[_-]\d{9,})$")
+def _shorten(tag:str, max_len:int=24)->str:
+    t = _RX_TS.sub("", tag or "")
+    return t if len(t)<=max_len else (t[:max_len-3]+"...")
 
+def _jitter(xs: np.ndarray, scale: float = 0.12) -> np.ndarray:
+    if xs.size == 0: return xs
+    rng = np.random.default_rng(0)
+    return xs + rng.normal(0.0, scale, size=xs.shape)
 
-def _detect_knee_lcurve(xs: List[int], ys: List[float]) -> int:
-    """
-    L-curve style: knee is point farthest from straight line between endpoints in log-log space.
-    """
-    if len(xs) < 3:
-        return -1
-    X = np.log(np.maximum(np.array(xs, dtype=float), 1e-12))
-    Y = np.log(np.maximum(np.array(ys, dtype=float), 1e-300))
-    x1, y1 = X[0], Y[0]
-    x2, y2 = X[-1], Y[-1]
-    # distance from point to line
-    denom = math.hypot(x2 - x1, y2 - y1) + 1e-18
-    dists = np.abs((y2 - y1) * X - (x2 - x1) * Y + x2 * y1 - y2 * x1) / denom
-    idx = int(np.argmax(dists))
-    if idx == 0 or idx == len(xs) - 1:
-        # avoid endpoints; choose next best
-        order = np.argsort(dists)[::-1]
-        for j in order:
-            if 0 < j < len(xs) - 1:
-                return int(j)
-        return -1
-    return idx
-
-
-def detect_knee(xs: List[int], ys: List[float], method: str = "second_diff") -> int:
-    if method == "lcurve":
-        return _detect_knee_lcurve(xs, ys)
-    return _detect_knee_second_diff(xs, ys)
-
-
-def _annotate_knee(ax, xs: List[int], ys: List[float], idx: int, label: str):
-    if idx <= 0 or idx >= len(xs) - 1:
-        return
-    ax.scatter([xs[idx]], [ys[idx]], marker="*", s=160, zorder=5)
-    ax.annotate(
-        f"{label}\n|R|={xs[idx]}",
-        xy=(xs[idx], ys[idx]),
-        xytext=(5, 8),
-        textcoords="offset points",
-        fontsize=9,
-        ha="left", va="bottom",
-        bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7),
-        arrowprops=dict(arrowstyle="-", alpha=0.4),
-    )
-
-
-# ------------------------------
-# IO helper
-# ------------------------------
-def _load_runs(csv_path_fronts: List[str]) -> Dict[str, List[dict]]:
-    runs: Dict[str, List[dict]] = {}
-    for p in csv_path_fronts:
-        with open(p, "r", encoding="utf-8") as f:
-            rd = csv.DictReader(f)
-            for row in rd:
-                runs.setdefault(row["run_tag"], []).append(row)
+def _load_rows(csv_paths:Iterable[str])->Dict[str,List[dict]]:
+    runs={}
+    for p in csv_paths:
+        if not os.path.exists(p): 
+            continue
+        with open(p,"r",encoding="utf-8") as f:
+            rdr = list(csv.DictReader(f))
+        if not rdr: continue
+        tag = os.path.basename(p)
+        for r in rdr: r["_file"]=p
+        runs.setdefault(tag,[]).extend(rdr)
     return runs
 
+def _y_metric(row: dict) -> float:
+    v = row.get("sum_lambda_powers","")
+    if v!="":
+        try: return float(v)
+        except: pass
+    v = row.get("Z_exact","")
+    if v!="":
+        try: return float(v)
+        except: pass
+    return float("nan")
 
-# ------------------------------
-# Plots
-# ------------------------------
-def plot_pareto_from_csv(csv_path_fronts: List[str], out_dir: str = "./out_fig", y_log: bool = False):
-    os.makedirs(out_dir, exist_ok=True)
-    runs = _load_runs(csv_path_fronts)
+def _bounds(row: dict) -> Tuple[Optional[float], Optional[float]]:
+    lo=row.get("lower_bound",""); hi=row.get("upper_bound","")
+    try: lo = float(lo) if lo!="" else None
+    except: lo=None
+    try: hi = float(hi) if hi!="" else None
+    except: hi=None
+    return lo,hi
 
-    # 1) Pareto scatter (front-0 only)
-    plt.figure()
-    for tag, rows in runs.items():
+def _gap_12(row:dict)->float:
+    try: lam1 = float(row.get("lambda_max","nan"))
+    except: lam1 = float("nan")
+    lam2 = float("nan")
+    s = row.get("lambda_top2","")
+    if s and str(s).strip().startswith("("):
+        parts = str(s).strip("() ").split(",")
+        if len(parts)>1:
+            try: lam2=float(parts[1])
+            except: pass
+    return lam1 - lam2
+
+def _select_front0(rows:List[dict])->List[dict]:
+    if not rows: return rows
+    if ("is_front0" in rows[0]) and any(str(r.get("is_front0","0"))=="1" for r in rows):
+        return [r for r in rows if str(r.get("is_front0","0"))=="1"]
+    return rows
+
+# 文件名/字段解析 (n,k) + 系列
+_RX_STAGE1 = re.compile(r"stage1_(?:all|pareto)_n(\d+)_k(\d+)")
+_RX_GA     = re.compile(r"pareto_front_(?:nk_)?n(\d+)_k(\d+)(?:_|\.csv)")
+def _nk_from_fname(fname:str)->Tuple[Optional[int],Optional[int]]:
+    m = _RX_STAGE1.search(fname) or _RX_GA.search(fname)
+    if m: return int(m.group(1)), int(m.group(2))
+    return None,None
+
+def _series_by_fname(base:str)->str:
+    name = base.lower()
+    if name.startswith("stage1_pareto_") and "_raw" in name:   return "stage1_raw"
+    if name.startswith("stage1_pareto_") and "_canon" in name: return "stage1_canon"
+    if name.startswith("pareto_front_"):                        return "ga_canon"
+    return ""
+
+def _series_for_row(row:dict, base:str)->str:
+    s = _series_by_fname(base)
+    if s: return s
+    is_ga = ("sum_lambda_powers" in row) or ("lower_bound" in row) or ("upper_bound" in row)
+    if is_ga: return "ga_canon"
+    is_canon = False
+    if (row.get("rule_bits_canon","") or "").strip() != "": is_canon = True
+    if str(row.get("is_canonical_rep", row.get("is_canon","0"))).strip() == "1": is_canon = True
+    return "stage1_canon" if is_canon else "stage1_raw"
+
+def _discover_all_nk(paths: Iterable[str]) -> List[Tuple[int,int]]:
+    seen=set()
+    for p in paths:
+        if not os.path.exists(p): continue
+        try:
+            with open(p,"r",encoding="utf-8") as f:
+                rows=list(csv.DictReader(f))
+        except: rows=[]
+        if rows and ("n" in rows[0] and "k" in rows[0]):
+            for r in rows:
+                try: seen.add((int(r["n"]), int(r["k"])))
+                except: pass
+        else:
+            n,k=_nk_from_fname(os.path.basename(p))
+            if (n is not None) and (k is not None): seen.add((n,k))
+    return sorted(seen)
+
+def _collect_by_series_for_nk(csv_paths: Iterable[str], n:int, k:int)->Dict[str,List[dict]]:
+    out={"stage1_raw":[], "stage1_canon":[], "ga_canon":[]}
+    for p in csv_paths:
+        if not os.path.exists(p): continue
+        with open(p,"r",encoding="utf-8") as f:
+            rows=list(csv.DictReader(f))
+        if not rows: continue
+        # 过滤 (n,k)
+        if "n" in rows[0] and "k" in rows[0]:
+            rows=[r for r in rows if str(r.get("n","")).isdigit() and str(r.get("k","")).isdigit()
+                  and int(r["n"])==n and int(r["k"])==k]
+        else:
+            fn_n, fn_k = _nk_from_fname(os.path.basename(p))
+            if not (fn_n==n and fn_k==k): rows=[]
+        if not rows: continue
+        base=os.path.basename(p)
+        for r in rows:
+            r["_file"]=p
+            out[_series_for_row(r, base)].append(r)
+    return out
+
+# =========================
+# 膝点/单位复杂度（离散）
+# =========================
+def _knee_second(xs, ys, logy=True):
+    xs, ys = np.asarray(xs,float), np.asarray(ys,float)
+    if logy: ys = np.log(np.maximum(ys,1e-300))
+    if len(xs)<3: return None
+    d2 = ys[2:] - 2*ys[1:-1] + ys[:-2]
+    idx = int(np.argmax(d2))
+    return idx+1
+
+def _knee_l(xs, ys, logxy=True):
+    xs, ys = np.asarray(xs,float), np.asarray(ys,float)
+    if logxy:
+        xs=np.log(np.maximum(xs,1e-9)); ys=np.log(np.maximum(ys,1e-300))
+    if len(xs)<3: return None
+    x0,y0 = xs[0],ys[0]; vx,vy = xs[-1]-x0, ys[-1]-y0
+    vnorm = math.hypot(vx,vy)+1e-15
+    imax, dmax = None, -1.0
+    for i in range(len(xs)):
+        wx,wy = xs[i]-x0, ys[i]-y0
+        d = abs(vx*wy - vy*wx)/vnorm
+        if d>dmax: dmax, imax = d, i
+    return imax
+
+def _unit_best_idx(xs, ys):
+    xs = np.asarray(xs, float); ys = np.asarray(ys, float)
+    if xs.size < 2: return 0
+    dy = np.diff(np.log(np.maximum(ys, 1e-300)))  # Δlog y 
+    dx = np.diff(xs)
+    mur = dy / np.maximum(dx, 1e-9)
+    j = int(np.nanargmax(mur))
+    return j + 1  # 与差分对齐到右端点
+
+# =========================
+# 绘制三图（指定 n,k）
+# =========================
+def _bucket_best_and_band(rows: List[dict], use_logy: bool) -> Tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray]:
+    bucket: Dict[int, Dict[str, float]] = {}
+    mins: Dict[int, float] = {}
+    maxs: Dict[int, float] = {}
+    for r in rows:
+        try:
+            rc = int(r["rule_count"])
+        except:
+            continue
+        est = _y_metric(r)
+        lo, hi = _bounds(r)
+        cur = bucket.get(rc)
+        if (cur is None) or (est > cur["est"]):
+            bucket[rc] = {"est": est, "lo": lo, "hi": hi}
+        if np.isfinite(est):
+            mins[rc] = min(mins.get(rc, +np.inf), est)
+            maxs[rc] = max(maxs.get(rc, -np.inf), est)
+    if not bucket:
+        return (np.array([]),)*4
+    xs  = np.array(sorted(bucket.keys()), float)
+    est = np.array([bucket[int(x)]["est"] for x in xs], float)
+    los, his = [], []
+    for x in xs:
+        d = bucket[int(x)]
+        lo, hi = d["lo"], d["hi"]
+        if (lo is None) or (hi is None) or (not np.isfinite(lo)) or (not np.isfinite(hi)) or (hi<lo):
+            lo = mins.get(int(x), np.nan); hi = maxs.get(int(x), np.nan)
+        los.append(lo); his.append(hi)
+    los = np.array(los,float); his = np.array(his,float)
+    m = np.isfinite(est) & (est>0 if use_logy else np.isfinite(est))
+    return xs[m], est[m], los[m], his[m]
+
+def plot_three_raw_canon_for_nk(front_paths: List[str],
+                                n: int, k: int,
+                                out_dir: str = "./out_fig",
+                                y_log: bool = False,
+                                style: str = "default") -> Tuple[str,str,str]:
+    apply_style(style); os.makedirs(out_dir, exist_ok=True)
+    series = _collect_by_series_for_nk(front_paths, n, k)
+    order  = ["stage1_raw", "stage1_canon", "ga_canon"]
+    markers= {"stage1_raw":"s", "stage1_canon":"o", "ga_canon":"^"}
+    linest = {"stage1_raw":"--", "stage1_canon":"-", "ga_canon":"-."}
+    jitter = {"stage1_raw":-0.07, "stage1_canon":+0.07, "ga_canon":+0.00}
+    labels = {"stage1_raw":"stage1_raw", "stage1_canon":"stage1_canon", "ga_canon":"ga_canon"}
+
+    # (A) scatter
+    fig1, ax1 = plt.subplots(); anyp=False
+    for key in order:
+        rows = series.get(key, [])
         xs, ys = [], []
         for r in rows:
-            if r.get("is_front0", "0") == "1":
-                xs.append(int(r["rule_count"]))
-                ys.append(float(r["sum_lambda_powers"]))
-        if xs:
-            plt.scatter(xs, ys, label=tag, alpha=0.85, s=28)
-    plt.xlabel("|R| (number of rules)")
-    plt.ylabel(r"$\mathrm{trace}(T^n)$ estimate")
-    if y_log:
-        plt.yscale("log")
-    plt.title("Pareto Front (Front-0)")
-    plt.legend(frameon=False)
-    plt.tight_layout()
-    fig1 = os.path.join(out_dir, f"pareto_scatter{'_log' if y_log else ''}.png")
-    plt.savefig(fig1, dpi=160)
-
-    # 2) Growth curve + band + knees
-    plt.figure()
-    for tag, rows in runs.items():
-        bucket_best = {}  # |R| -> (est, lo, hi)
-        for r in rows:
-            if r.get("is_front0", "0") != "1":
-                continue
             try:
-                Rcnt = int(r["rule_count"])
-                est = float(r["sum_lambda_powers"])
-                lo = float(r.get("lower_bound", 0.0))
-                hi = float(r.get("upper_bound", 0.0))
-            except Exception:
-                continue
-            if (Rcnt not in bucket_best) or (est > bucket_best[Rcnt][0]):
-                bucket_best[Rcnt] = (est, lo, hi)
+                xs.append(int(r["rule_count"])); ys.append(_y_metric(r))
+            except: pass
+        xs, ys = np.asarray(xs,float), np.asarray(ys,float)
+        m = np.isfinite(ys) & (ys>0 if y_log else np.isfinite(ys))
+        xs, ys = xs[m], ys[m]
+        if xs.size==0: continue
+        ax1.scatter(xs + jitter[key], ys, label=labels[key], alpha=0.9, marker=markers[key]); anyp=True
+    if y_log: ax1.set_yscale("log")
+    ax1.set_xlabel("|R|"); ax1.set_ylabel(r"$\widehat{\mathrm{trace}}(T^n)$ / $Z_{\mathrm{exact}}$")
+    ax1.set_title(f"(n={n}, k={k}) stage1_raw vs stage1_canon vs ga_canon — Scatter")
+    if anyp: ax1.legend(loc="best")
+    fig1.tight_layout()
+    p_sc = os.path.join(out_dir, f"nk_n{n}_k{k}_scatter{'_log' if y_log else ''}.png")
+    fig1.savefig(p_sc, dpi=200); plt.close(fig1)
 
-        if bucket_best:
-            xs = sorted(bucket_best.keys())
-            ests = np.array([bucket_best[x][0] for x in xs], dtype=float)
-            los = np.array([bucket_best[x][1] for x in xs], dtype=float)
-            his = np.array([bucket_best[x][2] for x in xs], dtype=float)
+    # (B) growth + knees + unit-best + band
+    fig2, ax2 = plt.subplots(); anyp=False
+    for key in order:
+        rows = series.get(key, [])
+        xs, est, lo, hi = _bucket_best_and_band(rows, use_logy=y_log)
+        if xs.size==0: continue
+        xj = xs + jitter[key]
+        ax2.plot(xj, est, marker=markers[key], linestyle=linest[key], alpha=0.95, label=labels[key])
+        vb = np.isfinite(lo) & np.isfinite(hi) & (hi>=lo)
+        if vb.any(): ax2.fill_between(xj[vb], lo[vb], hi[vb], alpha=0.12, linewidth=0)
+        i2 = _knee_second(xs, est, logy=y_log)
+        il = _knee_l(xs, est, logxy=True)
+        iu = _unit_best_idx(xs, est)
+        if i2 is not None: ax2.scatter([xj[i2]],[est[i2]],s=70,marker="D",label=f"{labels[key]}: knee-2Δ |R|={int(xs[i2])}")
+        if il is not None: ax2.scatter([xj[il]],[est[il]],s=70,marker="s",label=f"{labels[key]}: knee-L  |R|={int(xs[il])}")
+        if (i2 is not None) and (il is not None) and abs(int(xs[i2])-int(xs[il]))<=1:
+            idx = i2 if xs[i2]<=xs[il] else il
+            ax2.scatter([xj[idx]],[est[idx]],s=110,marker="*",label=f"{labels[key]}: robust-knee |R|={int(xs[idx])}")
+        if iu is not None: ax2.scatter([xj[iu]],[est[iu]],s=110,marker="p",label=f"{labels[key]}: unit-best |R|={int(xs[iu])}")
+        anyp=True
+    if y_log: ax2.set_yscale("log")
+    ax2.set_xlabel("|R|"); ax2.set_ylabel(r"Best $\widehat{\mathrm{trace}}(T^n)$ / $Z_{\mathrm{exact}}$")
+    ax2.set_title(f"(n={n}, k={k}) Growth Curves with Knees & Bands")
+    if anyp: ax2.legend(loc="best", ncol=2)
+    fig2.tight_layout()
+    p_gr = os.path.join(out_dir, f"nk_n{n}_k{k}_growth_knees{'_log' if y_log else ''}.png")
+    fig2.savefig(p_gr, dpi=200); plt.close(fig2)
 
-            plt.plot(xs, ests, marker="o", label=tag)
-            valid = np.isfinite(los) & np.isfinite(his) & (his >= los)
-            if valid.any():
-                plt.fill_between(np.array(xs)[valid], los[valid], his[valid], alpha=0.18)
+    # (C) knees & spectral gap（含 unit-best）
+    fig3, ax3 = plt.subplots(); ax4 = ax3.twinx()
+    painted_gap=False; painted_trace=False
+    for key in order:
+        rows = series.get(key, [])
+        xs, est, _, _ = _bucket_best_and_band(rows, use_logy=y_log)
+        if xs.size==0: continue
+        # 同 |R| 选择 best-y 的 gap
+        bucket_gap = {}
+        for r in rows:
+            try:
+                rc = int(r["rule_count"]); y = _y_metric(r)
+                if not np.isfinite(y): continue
+                cur = bucket_gap.get(rc)
+                if (cur is None) or (y>cur["y"]): bucket_gap[rc] = {"y":y, "gap":_gap_12(r)}
+            except: pass
+        gxs = sorted(bucket_gap.keys()); gaps = np.array([bucket_gap[x]["gap"] for x in gxs], float)
+        gxs = np.array(gxs, float)
 
-            # knees
-            idx_knee_sd = detect_knee(xs, ests.tolist(), method="second_diff")
-            _annotate_knee(plt.gca(), xs, ests.tolist(), idx_knee_sd, f"{tag} knee (2nd-diff)")
-            idx_knee_lc = detect_knee(xs, ests.tolist(), method="lcurve")
-            _annotate_knee(plt.gca(), xs, ests.tolist(), idx_knee_lc, f"{tag} knee (L-curve)")
+        xj = xs + jitter[key]
+        ax3.plot(xj, est, marker=markers[key], linestyle=linest[key], alpha=0.95,
+                 label=(labels[key] if not painted_trace else None))
+        painted_trace=True or painted_trace
+        if y_log: ax3.set_yscale("log")
+        if np.isfinite(gaps).any():
+            ax4.plot(gxs, gaps, marker="^", linestyle=":", alpha=0.9,
+                     label=("spectral gap" if not painted_gap else None), color="tab:orange")
+            painted_gap=True or painted_gap
+        i2 = _knee_second(xs, est, logy=y_log)
+        il = _knee_l(xs, est, logxy=True)
+        iu = _unit_best_idx(xs, est)
+        if i2 is not None: ax3.scatter([xj[i2]],[est[i2]],s=70,marker="D")
+        if il is not None: ax3.scatter([xj[il]],[est[il]],s=70,marker="s")
+        if (i2 is not None) and (il is not None) and abs(int(xs[i2])-int(xs[il]))<=1:
+            idx = i2 if xs[i2]<=xs[il] else il
+            ax3.scatter([xj[idx]],[est[idx]],s=110,marker="*")
+        if iu is not None: ax3.scatter([xj[iu]],[est[iu]],s=110,marker="p")
+    ax3.set_xlabel("|R|"); ax3.set_ylabel(r"Best $\widehat{\mathrm{trace}}(T^n)$ / $Z_{\mathrm{exact}}$")
+    ax4.set_ylabel(r"$\lambda_1-\lambda_2$")
+    ax3.set_title(f"(n={n}, k={k}) Knees & Spectral Gap — stage1_raw vs stage1_canon vs ga_canon")
+    ax3.legend(loc="upper left")
+    if painted_gap: ax4.legend(loc="upper right")
+    fig3.tight_layout()
+    p_kg = os.path.join(out_dir, f"nk_n{n}_k{k}_knees_gap{'_log' if y_log else ''}.png")
+    fig3.savefig(p_kg, dpi=200); plt.close(fig3)
 
-    plt.xlabel("|R| (number of rules)")
-    plt.ylabel("Best frontier estimate per |R| (with bounds)")
-    if y_log:
-        plt.yscale("log")
-    plt.title("Growth Curve (with confidence bands & knees)")
-    plt.legend(frameon=False)
-    plt.tight_layout()
-    fig2 = os.path.join(out_dir, f"growth_curve{'_log' if y_log else ''}_with_band_knees.png")
-    plt.savefig(fig2, dpi=160)
+    return p_sc, p_gr, p_kg
 
-    print(f"[FIG] saved:\n  {fig1}\n  {fig2}")
-    return fig1, fig2
+# =========================
+# 批量驱动（兼容 rd_cli.py: viz-all）
+# =========================
+def plot_all(front_paths: List[str],
+             n: Optional[int]=None, k: Optional[int]=None,
+             out_dir: str="./out_fig",
+             y_log: bool=False,
+             style: str="default")->List[str]:
+    """
+    兼容 rd_cli.py:
+      - 若给定 n,k：仅绘制该 (n,k) 的三张图；
+      - 否则：自动发现所有(n,k)，逐个绘制三张图。
+    返回：输出图片路径列表。
+    """
+    apply_style(style); os.makedirs(out_dir, exist_ok=True)
+    outs=[]
+    if (n is not None) and (k is not None):
+        outs += list(plot_three_raw_canon_for_nk(front_paths, n, k, out_dir=out_dir, y_log=y_log, style=style))
+        return outs
+    # 自动发现
+    for n0,k0 in _discover_all_nk(front_paths):
+        outs += list(plot_three_raw_canon_for_nk(front_paths, n0, k0, out_dir=out_dir, y_log=y_log, style=style))
+    return outs
+
+# =========================
+# 可选：本文件直接运行（调试）
+# =========================
+def _cli():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--front", nargs="+", required=True)
+    ap.add_argument("--out-dir", default="./out_fig")
+    ap.add_argument("--style", default="default", choices=list(_STYLES.keys()))
+    ap.add_argument("--y-log", action="store_true")
+    ap.add_argument("--n", type=int); ap.add_argument("--k", type=int)
+    args = ap.parse_args()
+    plot_all(args.front, n=args.n, k=args.k, out_dir=args.out_dir, y_log=args.y_log, style=args.style)
+
+if __name__ == "__main__":
+    _cli()
