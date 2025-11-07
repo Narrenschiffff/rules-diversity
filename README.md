@@ -53,7 +53,7 @@
 ### 阶段一：精确枚举验证（`n\le5`, `k\le4`）
 1. `make_rule_matrix` 构造对称规则矩阵。
 2. `enumerate_ring_rows` 或 `enumerate_ring_rows_fast` 生成环列合法行。
-3. `build_row_compat_matrix` 构建转移矩阵 $T$，`exact_trace_by_transfer` 计算 $\operatorname{trace}(T^n)$。
+3. `build_row_compat_matrix` 构建转移矩阵 $T$，`exact_trace_by_transfer` 计算 $\sum{trace}(T^n)$。
 4. `scripts/run_stage1.py` 演示完整流程并打印精确图案数。
 
 ### 阶段二：谱估计与批量评估
