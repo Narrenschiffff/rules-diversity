@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from .eval import (
-    canonical_bits, bits_from_rule, rule_from_bits,
+    canonical_bits, bits_from_rule, rule_from_bits, apply_rule_symmetry,
     evaluate_rules_batch, RowsCacheLRU
 )
 from .utils_io import make_run_tag
@@ -226,7 +226,8 @@ class GAConfig:
                  trace_mode="hutchpp", hutch_s=24,
                  lru_rows_capacity=128, batch_streams=2,
                  progress_every=2, fast_eval=False,
-                 seed_from_stage1=False, max_stage1_seeds=256):
+                 seed_from_stage1=False, max_stage1_seeds=256,
+                 sym_mode: str = "perm"):
         self.pop_size = pop_size
         self.generations = generations
         self.p_mut = p_mut
@@ -244,6 +245,7 @@ class GAConfig:
         self.fast_eval = fast_eval
         self.seed_from_stage1 = seed_from_stage1
         self.max_stage1_seeds = max_stage1_seeds
+        self.sym_mode = sym_mode
 
 # ---------- CSV appenders ----------
 def _append_front_rows_csv(csv_path_front: str, tag: str, n: int, k: int,
@@ -268,6 +270,9 @@ def _append_front_rows_csv(csv_path_front: str, tag: str, n: int, k: int,
                 f"{float(fit.get('sum_lambda_powers', -1e300)):.6e}",
                 1 if i in front0_set else 0,
                 int(fit.get("active_k", 0)),
+                int(fit.get("active_k_raw", fit.get("active_k", 0))),
+                int(fit.get("k_sym", k)),
+                fit.get("sym_mode", "perm"),
                 f"{float(fit.get('lower_bound', 0.0)):.6e}",
                 f"{float(fit.get('upper_bound', 0.0)):.6e}",
                 f"{float(fit.get('lower_bound_raw', 0.0)):.6e}",
@@ -292,7 +297,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
         w.writerow(["run_tag","n","k","rule_bits","rule_count","rows_m",
                     "lambda_max","lambda_top2","spectral_gap",
                     "sum_lambda_powers","is_front0",
-                    "active_k","lower_bound","upper_bound",
+                    "active_k","active_k_raw","k_sym","sym_mode",
+                    "lower_bound","upper_bound",
                     "lower_bound_raw","upper_bound_raw",
                     "upper_bound_raw_gersh","upper_bound_raw_maxdeg",
                     "archetype_tags","exact_Z"])
@@ -300,7 +306,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
         w=csv.writer(f)
         w.writerow(["run_tag","n","k","generation","front0_size",
                     "best_sample_R","best_sample_sumlam",
-                    "pop_size","device","trace_mode"])
+                    "pop_size","device","trace_mode","sym_mode"])
 
     # normalize config
     device      = _device_or(getattr(ga_conf, "device", None))
@@ -320,11 +326,12 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
     fast_eval       = _bool_or(getattr(ga_conf, "fast_eval", False), False)
     seed_from_stage1= _bool_or(getattr(ga_conf, "seed_from_stage1", False), False)
     max_seeds       = _int_or(getattr(ga_conf, "max_stage1_seeds", 256), 256)
+    sym_mode        = getattr(ga_conf, "sym_mode", "perm") or "perm"
 
     if fast_eval or device=="cpu":
         r_vals = min(r_vals, 2); power_iters = min(power_iters, 16); hutch_s = min(hutch_s, 8)
 
-    logger.info(f"GA start | n={n}, k={k}, device={device}, pop={pop_size}, gens={generations}, fast_eval={fast_eval}, seed_from_stage1={seed_from_stage1}")
+    logger.info(f"GA start | n={n}, k={k}, device={device}, sym={sym_mode}, pop={pop_size}, gens={generations}, fast_eval={fast_eval}, seed_from_stage1={seed_from_stage1}")
 
     # init population
     pop: List[np.ndarray] = []
@@ -342,21 +349,30 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
     rows_lru = RowsCacheLRU(capacity=lru_cap)
 
     def eval_batch(bits_batch: List[np.ndarray]):
-        normed = [canonical_bits(b, k) for b in bits_batch]
-        results = [None]*len(normed)
+        normed = []
+        keys = []
+        results = [None]*len(bits_batch)
         miss_bits, miss_pos = [], []
-        for i, bb in enumerate(normed):
-            key = bb.tobytes()
-            if key in cache: results[i] = cache[key]
-            else: miss_bits.append(bb); miss_pos.append(i)
+        for i, bb in enumerate(bits_batch):
+            sym_b, _, _, _ = apply_rule_symmetry(bb, k, sym_mode)
+            normed.append(sym_b)
+            key = sym_b.tobytes()
+            keys.append(key)
+            if key in cache:
+                results[i] = cache[key]
+            else:
+                miss_bits.append(bb)
+                miss_pos.append(i)
         if miss_bits:
             outs = evaluate_rules_batch(n, k, miss_bits,
+                                        sym_mode=sym_mode,
                                         device=device, use_lanczos=use_lanczos,
                                         r_vals=r_vals, power_iters=power_iters,
                                         trace_mode=trace_mode, hutch_s=hutch_s,
                                         lru_rows=rows_lru, max_streams=max_streams)
-            for pos, bb, fit in zip(miss_pos, miss_bits, outs):
-                cache[bb.tobytes()] = fit; results[pos] = fit
+            for pos, fit in zip(miss_pos, outs):
+                key = keys[pos]
+                cache[key] = fit; results[pos] = fit
         return results, normed
 
     # generations
@@ -373,7 +389,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
         best_R = best_points[0][0] if best_points else None
         best_sum = best_points[0][1] if best_points else None
         with open(csv_gen, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([tag, n, k, gen, len(front0), best_R, best_sum, pop_size, device, trace_mode])
+            csv.writer(f).writerow([tag, n, k, gen, len(front0), best_R, best_sum, pop_size, device, trace_mode, sym_mode])
 
         # append this generation to front csv
         _append_front_rows_csv(csv_front, tag, n, k, pop_bits=pop, fits=fits, front0_idx=front0)
@@ -382,9 +398,9 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
         if progress_every and (gen % progress_every == 0):
             with open(heartbeat, "w", encoding="utf-8") as hb:
                 hb.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} GEN={gen}\n")
-            print(f"[GA] GEN {gen:02d} | front0={len(front0):3d} | best=({best_R},{best_sum:.3e}) | pop={pop_size} | dt={time.time()-t0:.2f}s", flush=True)
+            print(f"[GA] GEN {gen:02d} | sym={sym_mode} | front0={len(front0):3d} | best=({best_R},{best_sum:.3e}) | pop={pop_size} | dt={time.time()-t0:.2f}s", flush=True)
         else:
-            logger.info(f"[GEN {gen:02d}] front0={len(front0)} best=({best_R},{best_sum:.3e})")
+            logger.info(f"[GEN {gen:02d}] sym={sym_mode} front0={len(front0)} best=({best_R},{best_sum:.3e})")
 
         # selection -> offspring
         new_pop: List[np.ndarray] = []

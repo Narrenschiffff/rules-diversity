@@ -115,8 +115,13 @@ def cmd_stage1(args):
 
 def cmd_ga(args):
     from rules.ga import GAConfig, ga_search_with_batch
+    from rules.eval import evaluate_rules_batch
     n, k = int(args.n), int(args.k)
     os.makedirs(args.out_csv, exist_ok=True)
+
+    sym_modes = [s.strip() for s in str(getattr(args, "sym", "perm") or "perm").split(",") if s.strip()]
+    if not sym_modes:
+        sym_modes = ["perm"]
 
     if args.reuse:
         existed = expand_globs([os.path.join(args.out_csv, f"pareto_front_n{n}_k{k}_*.csv")])
@@ -133,10 +138,32 @@ def cmd_ga(args):
         lru_rows_capacity=args.lru_rows_capacity, batch_streams=args.batch_streams,
         progress_every=args.progress_every, fast_eval=args.fast_eval,
         seed_from_stage1=args.seed_from_stage1, max_stage1_seeds=args.max_stage1_seeds,
+        sym_mode=sym_modes[0],
     )
     pareto, csv_front, csv_gen = ga_search_with_batch(n, k, conf, out_csv_dir=args.out_csv)
     print("[GA] Front CSV:", csv_front)
     print("[GA] Gen   CSV:", csv_gen)
+
+    # 追加对照：在相同个体上测试其他对称模式
+    if len(sym_modes) > 1 and pareto:
+        bits_batch = [b for b, _ in pareto]
+        for mode in sym_modes[1:]:
+            try:
+                reports = evaluate_rules_batch(
+                    n=n, k=k, bits_list=bits_batch,
+                    sym_mode=mode,
+                    device=args.device if args.device else conf.device,
+                    use_lanczos=not args.no_lanczos,
+                    r_vals=args.r_vals, power_iters=args.power_iters,
+                    trace_mode=args.trace_mode, hutch_s=args.hutch_s,
+                    lru_rows=None, max_streams=args.batch_streams,
+                )
+                best = max((float(r.get("sum_lambda_powers", -1e300)) for r in reports), default=float("nan"))
+                mmin = min((int(r.get("rows_m", 0)) for r in reports), default=0)
+                mmax = max((int(r.get("rows_m", 0)) for r in reports), default=0)
+                print(f"[GA][sym={mode}] sum_lambda_powers_best={best:.3e}, rows_m_range=[{mmin},{mmax}], k_sym={reports[0].get('k_sym', k) if reports else k}")
+            except Exception:
+                logging.exception("[GA] symmetry compare failed for mode=%s", mode)
 
 
 def cmd_entropy(args):
@@ -384,6 +411,7 @@ def main():
     sp.add_argument("--fast-eval", action="store_true")
     sp.add_argument("--seed-from-stage1", action="store_true")
     sp.add_argument("--max-stage1-seeds", type=int, default=256)
+    sp.add_argument("--sym", default="perm", help="对称模式: none|perm|perm+swap，可逗号分隔对照输出")
     sp.set_defaults(func=cmd_ga)
 
     # --- entropy ---
