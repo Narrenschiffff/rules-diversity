@@ -203,6 +203,7 @@ def scan_archetypes(n: int, k: int, types: List[str], top_m: int = 8,
     rows_lru = RowsCacheLRU(capacity=128)
     outs = evaluate_rules_batch(
         n=n, k=k, bits_list=bits_pool,
+        sym_mode="perm",
         device="cuda" if hasattr(np, "cuda") else "cpu",
         use_lanczos=True, r_vals=3, power_iters=60,
         trace_mode="hutchpp", hutch_s=24,

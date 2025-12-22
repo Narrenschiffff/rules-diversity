@@ -92,6 +92,71 @@ def canonical_bits(bits: np.ndarray, k: int) -> np.ndarray:
     P = R[np.ix_(order, order)]
     return bits_from_rule(P)
 
+
+def _exchange_classes(R: np.ndarray) -> Tuple[np.ndarray, List[int]]:
+    """
+    基于邻接行/列完全一致的“可交换”等价类。返回：
+      - raw_to_class: 原始状态 -> 压缩后的类索引
+      - class_sizes: 每个等价类的规模
+    """
+    k = R.shape[0]
+    signatures = [tuple(int(x) for x in R[i].tolist()) for i in range(k)]
+
+    sig_to_class: Dict[Tuple[int, ...], int] = {}
+    class_members: List[List[int]] = []
+    for i, sig in enumerate(signatures):
+        if sig in sig_to_class:
+            class_members[sig_to_class[sig]].append(i)
+        else:
+            cid = len(class_members)
+            sig_to_class[sig] = cid
+            class_members.append([i])
+
+    # 为确定性输出，对等价类按 (signature, first_member) 排序
+    order = sorted(range(len(class_members)), key=lambda cid: (signatures[class_members[cid][0]], class_members[cid][0]))
+    raw_to_class = np.empty(k, dtype=int)
+    class_sizes: List[int] = []
+    for new_idx, cid in enumerate(order):
+        for m in class_members[cid]:
+            raw_to_class[m] = new_idx
+        class_sizes.append(len(class_members[cid]))
+    return raw_to_class, class_sizes
+
+
+def apply_rule_symmetry(bits: np.ndarray, k: int, mode: str) -> Tuple[np.ndarray, int, np.ndarray, List[int]]:
+    """
+    根据对称模式转换规则位串：
+      - none: 直接返回
+      - perm: canonical_bits（仅置换）
+      - perm+swap: 先 canonical_bits，再按等价行/列合并（交换对称）
+    返回 (sym_bits, sym_k, raw_to_class, class_sizes)。
+    """
+    mode = (mode or "perm").lower()
+    if mode not in ("none", "perm", "perm+swap", "perm+exchange"):
+        raise ValueError(f"unknown symmetry mode: {mode}")
+
+    if mode == "none":
+        raw_to_class = np.arange(k, dtype=int)
+        return bits.copy(), k, raw_to_class, [1 for _ in range(k)]
+
+    bits_perm = canonical_bits(bits, k)
+    if mode == "perm":
+        raw_to_class = np.arange(k, dtype=int)
+        return bits_perm, k, raw_to_class, [1 for _ in range(k)]
+
+    R = rule_from_bits(k, bits_perm)
+    raw_to_class, class_sizes = _exchange_classes(R)
+    k2 = int(max(raw_to_class) + 1) if raw_to_class.size > 0 else 0
+    reps = []
+    for c in range(k2):
+        reps.append(int(np.nonzero(raw_to_class == c)[0][0]))
+    R_comp = np.zeros((k2, k2), dtype=bool)
+    for i, ri in enumerate(reps):
+        for j, rj in enumerate(reps):
+            R_comp[i, j] = R[ri, rj]
+    sym_bits = bits_from_rule(R_comp)
+    return sym_bits, k2, raw_to_class, class_sizes
+
 # ------------------------------
 # 行生成器（环状合法行）: k ≤ 16 高效版
 # ------------------------------
@@ -410,6 +475,7 @@ def _upper_bound_raw(R_np: np.ndarray, n: int) -> Dict[str, float]:
 def evaluate_rules_batch(n: int,
                          k: int,
                          bits_list: List[np.ndarray],
+                         sym_mode: str = "perm",
                          device: str = "cuda",
                          use_lanczos: bool = True,
                          r_vals: int = 3,
@@ -421,14 +487,12 @@ def evaluate_rules_batch(n: int,
     """
     批量评估规则个体，输出：
       - rows_m, lambda_max, lambda_top2, spectral_gap, sum_lambda_powers
-      - active_k
+      - active_k（压缩后）、active_k_raw（压缩前）、k_sym/k_raw、sym_mode
       - lower_bound / upper_bound（raw 与惩罚后）
       - 结构上界：upper_bound_raw_gersh / upper_bound_raw_maxdeg
       - archetype_tags（若 rules.structures 存在）
       - exact_Z（小规模可得时）
     """
-    SMALL_NK = (n <= 4 and k <= 3)
-
     PENALTY_ALPHA = 1.5
     def _adaptive_samples(m: int, base: int) -> int:
         if m < 2_000:
@@ -441,10 +505,12 @@ def evaluate_rules_batch(n: int,
     if (device == "cpu") or (not torch.cuda.is_available()):
         outs: List[Dict] = []
         for idx, bits in enumerate(bits_list):
-            R = rule_from_bits(k, bits)
+            bits_sym, k_sym, raw_to_class, class_sizes = apply_rule_symmetry(bits, k, sym_mode)
+            SMALL_NK = (n <= 4 and k_sym <= 3)
+            R = rule_from_bits(k_sym, bits_sym)
             deg, comps = _graph_degrees_and_components(R)
 
-            rows = enumerate_ring_rows_fast(n, k, R)
+            rows = enumerate_ring_rows_fast(n, k_sym, R)
             m = int(rows.shape[0])
             if m == 0:
                 # 上界也为 0
@@ -457,6 +523,11 @@ def evaluate_rules_batch(n: int,
                     "sum_lambda_powers": -1e300,
                     "rows_m": 0,
                     "active_k": 0,
+                    "active_k_raw": 0,
+                    "active_k_sym": 0,
+                    "k_raw": k,
+                    "k_sym": k_sym,
+                    "sym_mode": sym_mode,
                     "lower_bound": 0.0, "upper_bound": 0.0,
                     "lower_bound_raw": 0.0, "upper_bound_raw": 0.0,
                     "upper_bound_raw_gersh": 0.0, "upper_bound_raw_maxdeg": 0.0,
@@ -464,9 +535,11 @@ def evaluate_rules_batch(n: int,
                 })
                 continue
 
-            used = np.zeros(k, dtype=bool)
-            used[np.unique(rows)] = True
+            used = np.zeros(k_sym, dtype=bool)
+            active_classes = np.unique(rows)
+            used[active_classes] = True
             active_k = int(used.sum())
+            active_k_raw = int(sum(class_sizes[c] for c in active_classes))
 
             s_adapt = _adaptive_samples(m, hutch_s)
             op = TransferOp(rows, R, device="cpu", dtype=torch.float64, block_size_j=2048)
@@ -528,6 +601,11 @@ def evaluate_rules_batch(n: int,
                 "sum_lambda_powers": sum_lp,
                 "rows_m": m,
                 "active_k": active_k,
+                "active_k_raw": active_k_raw,
+                "active_k_sym": active_k,
+                "k_raw": k,
+                "k_sym": k_sym,
+                "sym_mode": sym_mode,
                 "lower_bound": lb, "upper_bound": ub,
                 "lower_bound_raw": lb_raw, "upper_bound_raw": ub_raw,
                 "upper_bound_raw_gersh": ub_raw_gersh, "upper_bound_raw_maxdeg": ub_raw_maxdeg,
@@ -552,13 +630,15 @@ def evaluate_rules_batch(n: int,
     rows_lru = lru_rows or RowsCacheLRU(capacity=128)
 
     for idx, bits in enumerate(bits_list):
-        key = bits.tobytes()
-        R = rule_from_bits(k, bits)
+        bits_sym, k_sym, raw_to_class, class_sizes = apply_rule_symmetry(bits, k, sym_mode)
+        SMALL_NK = (n <= 4 and k_sym <= 3)
+        key = (sym_mode + "|").encode("utf-8") + bits_sym.tobytes()
+        R = rule_from_bits(k_sym, bits_sym)
         deg, comps = _graph_degrees_and_components(R)
 
         rows = rows_lru.get(key)
         if rows is None:
-            rows = enumerate_ring_rows_fast(n, k, R)
+            rows = enumerate_ring_rows_fast(n, k_sym, R)
             if rows.shape[0] > 0 and rows.shape[0] <= 1_000_000:
                 rows_lru.put(key, rows)
 
@@ -573,6 +653,11 @@ def evaluate_rules_batch(n: int,
                 "sum_lambda_powers": -1e300,
                 "rows_m": 0,
                 "active_k": 0,
+                "active_k_raw": 0,
+                "active_k_sym": 0,
+                "k_raw": k,
+                "k_sym": k_sym,
+                "sym_mode": sym_mode,
                 "lower_bound": 0.0, "upper_bound": 0.0,
                 "lower_bound_raw": 0.0, "upper_bound_raw": 0.0,
                 "upper_bound_raw_gersh": 0.0, "upper_bound_raw_maxdeg": 0.0,
@@ -580,9 +665,11 @@ def evaluate_rules_batch(n: int,
             }
             continue
 
-        used = np.zeros(k, dtype=bool)
-        used[np.unique(rows)] = True
+        used = np.zeros(k_sym, dtype=bool)
+        active_classes = np.unique(rows)
+        used[active_classes] = True
         active_k = int(used.sum())
+        active_k_raw = int(sum(class_sizes[c] for c in active_classes))
 
         s_adapt = _adaptive_samples(m, hutch_s)
         st = streams[idx % len(streams)]
@@ -644,6 +731,11 @@ def evaluate_rules_batch(n: int,
                 "sum_lambda_powers": sum_lp,
                 "rows_m": m,
                 "active_k": active_k,
+                "active_k_raw": active_k_raw,
+                "active_k_sym": active_k,
+                "k_raw": k,
+                "k_sym": k_sym,
+                "sym_mode": sym_mode,
                 "lower_bound": lb, "upper_bound": ub,
                 "lower_bound_raw": lb_raw, "upper_bound_raw": ub_raw,
                 "upper_bound_raw_gersh": ub_raw_gersh, "upper_bound_raw_maxdeg": ub_raw_maxdeg,
