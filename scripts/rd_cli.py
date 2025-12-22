@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from rules import config as _config
+
 # optional modules (标记可用性；真正使用时在各自 cmd_* 内延迟导入)
 try:
     from rules import structures as _structures
@@ -98,7 +100,7 @@ def cmd_stage1(args):
     from rules.stage1_exact import scan_all_rules_exact
     n, k = int(args.n), int(args.k)
     out_csv = ensure_dir(args.out_csv)
-    logging.info(f"[stage1] exhaustive scan n={n}, k={k}, canonical={not args.no_canon}, archetypes={not args.no_archetypes}")
+    logging.info(f"[stage1] exhaustive scan n={n}, k={k}, boundary={args.boundary}, canonical={not args.no_canon}, archetypes={not args.no_archetypes}")
     try:
         all_csv, pareto_csv = scan_all_rules_exact(
             n=n, k=k,
@@ -106,6 +108,7 @@ def cmd_stage1(args):
             canonical=(not args.no_canon),
             mark_archetypes=(not args.no_archetypes),
             save_rows_m=True,
+            boundary=args.boundary,
             run_tag=f"stage1_n{n}_k{k}",
         )
     except Exception:
@@ -387,6 +390,8 @@ def main():
     sp = subparsers.add_parser("stage1", help="小规模精确计数（穷举、前沿、原型标注）")
     sp.add_argument("--n", type=int, required=True)
     sp.add_argument("--k", type=int, required=True)
+    sp.add_argument("--boundary", default=_config.BOUNDARY_MODE, choices=["torus", "open"],
+                    help="网格边界条件：torus=平铺环面，open=有界不回绕")
     sp.add_argument("--out-csv", default="results/out_csv")
     sp.add_argument("--no-canon", action="store_true")
     sp.add_argument("--no-archetypes", action="store_true")
