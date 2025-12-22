@@ -38,6 +38,7 @@
 - **上/下界**：`rules.eval._upper_bound_raw` 结合 Gershgorin、最大行和与谱信息；下界来自最大特征值 $\lambda_1$ 及其 $n$ 次幂。
 
 - **对称化**：`rules.eval.canonical_bits` 对位串进行置换同构规范化，$k\le 8$ 时枚举全排列，大规模时采用度数与自环启发式。
+- **谱-结构剖析**：`evaluate_rules_batch` 在构造规则图后会额外输出度矩阵、无向/归一化拉普拉斯、邻接谱间隙、代数连通度与平均聚类系数，便于后续结构对齐与解释。
 
 ---
 
@@ -66,11 +67,12 @@
 4. `scripts/run_stage1.py` 演示完整流程并打印精确图案数。
 
 ### 阶段二：谱估计与批量评估
-- `evaluate_rules_batch` 接收规则位串列表，自动：  
-  - 规范化、行缓存（`RowsCacheLRU`）。  
-  - 构造 `TransferOp` 并选择 CPU/GPU。  
-  - 执行 Lanczos/幂迭代、Hutch/Hutch++、上下界与惩罚项。  
-  - 小规模时调用阶段一获得 `exact_trace`/`exact_rows_m`。  
+- `evaluate_rules_batch` 接收规则位串列表，自动：
+  - 规范化、行缓存（`RowsCacheLRU`）。
+  - 构造 `TransferOp` 并选择 CPU/GPU。
+  - 执行 Lanczos/幂迭代、Hutch/Hutch++、上下界与惩罚项。
+  - 计算规则图的度序列与拉普拉斯（含归一化形式）、邻接谱间隙（`adj_lambda1/2`）、代数连通度（`laplacian_alg_conn`）、平均聚类系数等结构谱指标，并返回结构识别结果（若启用 `rules.structures`）。
+  - 小规模时调用阶段一获得 `exact_trace`/`exact_rows_m`。
 - 输出字段包含 `rule_count`、`sum_lambda_powers`（惩罚后的估计模式数）、`lower_bound`、`upper_bound`、`rows_m`、`active_k` 等，便于多目标排序。
 
 ### 阶段三：多目标遗传搜索
@@ -110,6 +112,14 @@
 
 - **凹凸性解读**：前沿上升段呈“向上凹”提示结构尚在扩展，出现“向下凹”时意味着进入收益递减区，即膝点附近。  
 - **谱-结构协同**：经验发现 `clustering`、`k-core`、$\lambda_1$ 与谱间隙 $\lambda_1-\lambda_2$ 与膝点形成高度相关。
+
+### 谱指标解读与使用
+- **度矩阵 $D$**：对角为节点度数（自环仅计入对角），决定拉普拉斯的尺度。
+- **无向拉普拉斯 $L=D-A$**：其第二小特征值 $\lambda_2(L)$（代数连通度）越大，说明图越稳健、分量越少。
+- **归一化拉普拉斯 $\mathcal{L}=I-D^{-1/2} A D^{-1/2}$**：抑制度差的影响；$\lambda_2(\mathcal{L})$ 接近 0 表示近似分离、接近 2 表示存在强二分结构。
+- **邻接谱间隙与顶特征值**：`adj_lambda1/2` 与 `adj_spectral_gap` 捕捉扩散与主导模式强度，常与膝点跃迁相关。
+- **聚类系数**：平均局部三角密度，区分树状/低闭合（近二部）与高闭合（团状）的规则图。
+- **结构识别**：若 `rules/structures` 可用，`archetype_hits` 与 `archetype_tags` 会标记星核、自环富集、近二分等模式，可与上述谱指标交叉验证。
 
 ---
 
