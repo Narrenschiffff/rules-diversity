@@ -194,6 +194,35 @@ python -c "from pathlib import Path; from rules.viz import plot_pareto_from_csv;
 ```
 > 若使用自定义分析脚本，请先调用 `rules.logging_setup.setup_logging()` 统一日志格式；上例演示如何跨平台批量汇总 GA 输出。
 
+### 示例 5：统一流水线 CLI（精确 + 谱估计 + 缓存）
+新脚本 `scripts/run_pipeline.py` 封装了精确计数、谱估计、对称规范化、边界模式与缓存，支持 JSON/YAML 配置与进度条，并默认接入 `rules.logging_setup` 统一日志输出：
+
+```yaml
+# config.yml
+n: 5
+k: 4
+boundary: torus          # 也支持 open（仅精确计数路径）
+sym_mode: perm
+use_exact: true          # rows_m 超过 exact_rows_cap 会自动跳过
+use_spectral: true
+rules:
+  - name: cycle
+    pairs: [[0,1],[1,2],[2,3],[3,0]]
+    allow_self_loops: true
+  - name: custom_bits
+    bits: "111100100"  # 长度需匹配 k 的上三角编码
+```
+
+运行命令（CLI 参数可覆盖配置文件）：
+```bash
+python scripts/run_pipeline.py --config config.yml --run-tag demo --out-dir ./pipeline_out \
+    --trace-mode hutchpp --lanczos-r 4 --heartbeat 5
+```
+输出目录：`./pipeline_out/demo/`
+- `summary.csv` / `summary.jsonl`：包含规则位串（raw/canon）、精确计数 `exact_Z`、行数 `rows_m`、谱估计核心字段 (`sum_lambda_powers`、`lambda_max`、上下界等)、缓存键 `cache_key`、日志备注。
+- `cache/`：按规则 + 边界生成的精确计数 JSON 缓存，便于二次复用；谱估计结果复用 `rules.eval` 内置缓存（`RULES_EVAL_CACHE` 或 `--cache-dir`）。
+- 进度条：默认使用 `tqdm`，如未安装则每隔 `--heartbeat` 秒打印一次进度日志。
+
 ---
 
 ## 8. 配置要点与实验记录
