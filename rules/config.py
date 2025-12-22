@@ -22,6 +22,10 @@ RESULTS_ROOT = Path(os.getenv("RULES_RESULTS_ROOT", "./notebooks/results")).reso
 OUT_CSV_DEFAULT = RESULTS_ROOT / "out_csv"
 OUT_FIG_DEFAULT = RESULTS_ROOT / "figs"
 
+# 评估缓存目录（json 级别，可自定义）
+EVAL_CACHE_DIR = Path(os.getenv("RULES_EVAL_CACHE", "~/.cache/rules-diversity/eval")).expanduser().resolve()
+EVAL_CACHE_VERSION = os.getenv("RULES_EVAL_CACHE_VERSION", "v1")
+
 # LRU 行缓存容量（eval.RowsCacheLRU）
 ROWS_LRU_CAPACITY = int(os.getenv("RULES_ROWS_LRU", "128"))
 

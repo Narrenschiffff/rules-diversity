@@ -14,6 +14,7 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import torch
 
+from . import config
 from .eval import (
     canonical_bits, bits_from_rule, rule_from_bits, apply_rule_symmetry,
     evaluate_rules_batch, RowsCacheLRU, summarize_trace_comparison
@@ -230,7 +231,11 @@ class GAConfig:
                  sym_mode: str = "perm",
                  enable_exact: bool = True,
                  enable_spectral: bool = True,
-                 exact_threshold: str | int | float = "nk<=12"):
+                 exact_threshold: str | int | float = "nk<=12",
+                 boundary: str | None = None,
+                 cache_dir=None,
+                 use_cache: bool = True,
+                 ):
         self.pop_size = pop_size
         self.generations = generations
         self.p_mut = p_mut
@@ -252,6 +257,9 @@ class GAConfig:
         self.enable_exact = enable_exact
         self.enable_spectral = enable_spectral
         self.exact_threshold = exact_threshold
+        self.boundary = (boundary or config.BOUNDARY_MODE)
+        self.cache_dir = cache_dir if cache_dir is not None else config.EVAL_CACHE_DIR
+        self.use_cache = use_cache
 
 # ---------- CSV appenders ----------
 def _append_front_rows_csv(csv_path_front: str, tag: str, n: int, k: int,
@@ -342,6 +350,9 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
     enable_exact    = _bool_or(getattr(ga_conf, "enable_exact", True), True)
     enable_spectral = _bool_or(getattr(ga_conf, "enable_spectral", True), True)
     exact_threshold = getattr(ga_conf, "exact_threshold", "nk<=12")
+    boundary        = getattr(ga_conf, "boundary", config.BOUNDARY_MODE) or config.BOUNDARY_MODE
+    cache_dir       = getattr(ga_conf, "cache_dir", config.EVAL_CACHE_DIR)
+    use_cache       = _bool_or(getattr(ga_conf, "use_cache", True), True)
 
     if fast_eval or device=="cpu":
         r_vals = min(r_vals, 2); power_iters = min(power_iters, 16); hutch_s = min(hutch_s, 8)
@@ -349,7 +360,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
     logger.info(
         f"GA start | n={n}, k={k}, device={device}, sym={sym_mode}, pop={pop_size}, gens={generations}, "
         f"fast_eval={fast_eval}, seed_from_stage1={seed_from_stage1}, exact={enable_exact}, spectral={enable_spectral}, "
-        f"exact_th={exact_threshold}")
+        f"exact_th={exact_threshold}, boundary={boundary}, cache_dir={cache_dir}, cache={'on' if use_cache else 'off'}")
 
     # init population
     pop: List[np.ndarray] = []
@@ -384,13 +395,16 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
         if miss_bits:
             outs = evaluate_rules_batch(n, k, miss_bits,
                                         sym_mode=sym_mode,
+                                        boundary=boundary,
                                         device=device, use_lanczos=use_lanczos,
                                         r_vals=r_vals, power_iters=power_iters,
                                         trace_mode=trace_mode, hutch_s=hutch_s,
                                         lru_rows=rows_lru, max_streams=max_streams,
                                         enable_exact=enable_exact,
                                         enable_spectral=enable_spectral,
-                                        exact_threshold=exact_threshold)
+                                        exact_threshold=exact_threshold,
+                                        cache_dir=cache_dir,
+                                        use_cache=use_cache)
             for pos, fit in zip(miss_pos, outs):
                 key = keys[pos]
                 cache[key] = fit; results[pos] = fit

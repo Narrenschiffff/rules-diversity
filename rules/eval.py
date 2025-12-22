@@ -15,11 +15,20 @@ rules/eval.py
 """
 
 from typing import List, Tuple, Dict, Optional
+from pathlib import Path
 import math
 import itertools
 import logging
 import numpy as np
 import torch
+
+from . import config
+from .cache import (
+    ensure_eval_cache_dir,
+    make_eval_cache_key,
+    load_eval_cache,
+    dump_eval_cache,
+)
 
 # ------------------------------
 # 通用小工具
@@ -620,6 +629,7 @@ def evaluate_rules_batch(n: int,
                          k: int,
                          bits_list: List[np.ndarray],
                          sym_mode: str = "perm",
+                         boundary: str = config.BOUNDARY_MODE,
                          device: str = "cuda",
                          use_lanczos: bool = True,
                          r_vals: int = 3,
@@ -630,7 +640,10 @@ def evaluate_rules_batch(n: int,
                          max_streams: int = 2,
                          enable_exact: bool = True,
                          enable_spectral: bool = True,
-                         exact_threshold="nk<=12") -> List[Dict]:
+                         exact_threshold="nk<=12",
+                         cache_dir: Optional[str | Path] = None,
+                         use_cache: bool = True,
+                         ) -> List[Dict]:
     """
     批量评估规则个体，输出：
       - rows_m, lambda_max, lambda_top2, spectral_gap, sum_lambda_powers
@@ -649,6 +662,12 @@ def evaluate_rules_batch(n: int,
             return min(64, base * 2)
         return base
 
+    boundary = (boundary or "torus").lower()
+    if boundary not in {"torus"}:
+        raise ValueError(f"boundary={boundary} not supported in fast evaluator")
+
+    cache_root = ensure_eval_cache_dir(cache_dir) if use_cache else None
+
     # ---------- CPU 路径 ----------
     if (device == "cpu") or (not torch.cuda.is_available()):
         outs: List[Dict] = []
@@ -663,6 +682,20 @@ def evaluate_rules_batch(n: int,
             exact_allowed, exact_reason = _should_use_exact(enable_exact, exact_threshold, n, k_sym, m)
             spectral_allowed = enable_spectral and (m > 0)
             spectral_reason = "" if spectral_allowed else ("rows_m=0" if m == 0 else "spectral disabled")
+
+            active_classes = np.unique(rows) if m > 0 else np.array([], dtype=int)
+            used = np.zeros(k_sym, dtype=bool)
+            used[active_classes] = True
+            active_k = int(used.sum())
+            active_k_raw = int(sum(class_sizes[c] for c in active_classes)) if m > 0 else 0
+
+            cache_key = None
+            if cache_root is not None:
+                cache_key = make_eval_cache_key(bits_sym, active_k, boundary, sym_mode, n)
+                cached = load_eval_cache(cache_root, cache_key)
+                if cached is not None:
+                    outs.append(cached)
+                    continue
 
             trace_exact: Optional[float] = None
             trace_estimate: Optional[float] = None
@@ -684,12 +717,13 @@ def evaluate_rules_batch(n: int,
                     "spectral_gap": 0.0,
                     "sum_lambda_powers": -1e300,
                     "rows_m": 0,
-                    "active_k": 0,
-                    "active_k_raw": 0,
+                    "active_k": active_k,
+                    "active_k_raw": active_k_raw,
                     "active_k_sym": 0,
                     "k_raw": k,
                     "k_sym": k_sym,
                     "sym_mode": sym_mode,
+                    "boundary": boundary,
                     "lower_bound": 0.0, "upper_bound": 0.0,
                     "lower_bound_raw": 0.0, "upper_bound_raw": 0.0,
                     "upper_bound_raw_gersh": 0.0, "upper_bound_raw_maxdeg": 0.0,
@@ -704,14 +738,16 @@ def evaluate_rules_batch(n: int,
                     "trace_error_rel": trace_error_rel if trace_error_rel is not None else "",
                     "eval_note": "; ".join(eval_notes) if eval_notes else "",
                 })
+                if cache_root is not None and cache_key is not None:
+                    dump_eval_cache(cache_root, cache_key, fit, meta_extra={
+                        "boundary": boundary,
+                        "sym_mode": sym_mode,
+                        "active_k": active_k,
+                        "k_sym": k_sym,
+                        "n": n,
+                    })
                 outs.append(fit)
                 continue
-
-            used = np.zeros(k_sym, dtype=bool)
-            active_classes = np.unique(rows)
-            used[active_classes] = True
-            active_k = int(used.sum())
-            active_k_raw = int(sum(class_sizes[c] for c in active_classes))
 
             s_adapt = _adaptive_samples(m, hutch_s)
             lambda1 = lambda2 = lam_pos = 0.0
@@ -811,6 +847,7 @@ def evaluate_rules_batch(n: int,
                 "k_raw": k,
                 "k_sym": k_sym,
                 "sym_mode": sym_mode,
+                "boundary": boundary,
                 "lower_bound": lb, "upper_bound": ub,
                 "lower_bound_raw": lb_raw, "upper_bound_raw": ub_raw,
                 "upper_bound_raw_gersh": ub_raw_gersh, "upper_bound_raw_maxdeg": ub_raw_maxdeg,
@@ -830,7 +867,14 @@ def evaluate_rules_batch(n: int,
                     fit["trace_error_rel"] = trace_error_rel
             if eval_notes:
                 fit["eval_note"] = "; ".join(eval_notes)
-
+            if cache_root is not None and cache_key is not None:
+                dump_eval_cache(cache_root, cache_key, fit, meta_extra={
+                    "boundary": boundary,
+                    "sym_mode": sym_mode,
+                    "active_k": active_k,
+                    "k_sym": k_sym,
+                    "n": n,
+                })
             outs.append(fit)
         return outs
 
@@ -857,6 +901,20 @@ def evaluate_rules_batch(n: int,
         spectral_allowed = enable_spectral and (m > 0)
         spectral_reason = "" if spectral_allowed else ("rows_m=0" if m == 0 else "spectral disabled")
 
+        active_classes = np.unique(rows) if m > 0 else np.array([], dtype=int)
+        used = np.zeros(k_sym, dtype=bool)
+        used[active_classes] = True
+        active_k = int(used.sum())
+        active_k_raw = int(sum(class_sizes[c] for c in active_classes)) if m > 0 else 0
+
+        cache_key = None
+        if cache_root is not None:
+            cache_key = make_eval_cache_key(bits_sym, active_k, boundary, sym_mode, n)
+            cached = load_eval_cache(cache_root, cache_key)
+            if cached is not None:
+                outputs[idx] = cached
+                continue
+
         trace_exact: Optional[float] = None
         trace_estimate: Optional[float] = None
         trace_error: Optional[float] = None
@@ -876,12 +934,13 @@ def evaluate_rules_batch(n: int,
                 "spectral_gap": 0.0,
                 "sum_lambda_powers": -1e300,
                 "rows_m": 0,
-                "active_k": 0,
-                "active_k_raw": 0,
+                "active_k": active_k,
+                "active_k_raw": active_k_raw,
                 "active_k_sym": 0,
                 "k_raw": k,
                 "k_sym": k_sym,
                 "sym_mode": sym_mode,
+                "boundary": boundary,
                 "lower_bound": 0.0, "upper_bound": 0.0,
                 "lower_bound_raw": 0.0, "upper_bound_raw": 0.0,
                 "upper_bound_raw_gersh": 0.0, "upper_bound_raw_maxdeg": 0.0,
@@ -894,13 +953,15 @@ def evaluate_rules_batch(n: int,
                 "eval_note": "; ".join(eval_notes) if eval_notes else "",
                 **graph_stats,
             }
+            if cache_root is not None and cache_key is not None:
+                dump_eval_cache(cache_root, cache_key, outputs[idx], meta_extra={
+                    "boundary": boundary,
+                    "sym_mode": sym_mode,
+                    "active_k": active_k,
+                    "k_sym": k_sym,
+                    "n": n,
+                })
             continue
-
-        used = np.zeros(k_sym, dtype=bool)
-        active_classes = np.unique(rows)
-        used[active_classes] = True
-        active_k = int(used.sum())
-        active_k_raw = int(sum(class_sizes[c] for c in active_classes))
 
         s_adapt = _adaptive_samples(m, hutch_s)
         st = streams[idx % len(streams)]
@@ -1000,6 +1061,7 @@ def evaluate_rules_batch(n: int,
                 "k_raw": k,
                 "k_sym": k_sym,
                 "sym_mode": sym_mode,
+                "boundary": boundary,
                 "lower_bound": lb, "upper_bound": ub,
                 "lower_bound_raw": lb_raw, "upper_bound_raw": ub_raw,
                 "upper_bound_raw_gersh": ub_raw_gersh, "upper_bound_raw_maxdeg": ub_raw_maxdeg,
@@ -1019,6 +1081,15 @@ def evaluate_rules_batch(n: int,
                     fit["trace_error_rel"] = trace_error_rel
             if eval_notes:
                 fit["eval_note"] = "; ".join(eval_notes)
+
+            if cache_root is not None and cache_key is not None:
+                dump_eval_cache(cache_root, cache_key, fit, meta_extra={
+                    "boundary": boundary,
+                    "sym_mode": sym_mode,
+                    "active_k": active_k,
+                    "k_sym": k_sym,
+                    "n": n,
+                })
 
             outputs[idx] = fit
 
