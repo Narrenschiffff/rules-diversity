@@ -541,6 +541,77 @@ def _upper_bound_raw(R_np: np.ndarray, n: int) -> Dict[str, float]:
     rho_gersh  = max(1.0, min(float(k), deg_mean))
     return {"rho_gersh": rho_gersh, "rho_maxdeg": rho_maxdeg}
 
+
+def _parse_exact_threshold(threshold) -> Tuple[str, Optional[float]]:
+    """
+    返回 (mode, limit):
+      - mode ∈ {"nk", "rows"}
+      - limit 若为 None 表示无穷制
+    支持示例："nk<=12"、"rows<=200000"、"500000"（视为 rows）、None。
+    """
+    mode = "nk"; limit: Optional[float] = None
+    if threshold is None:
+        return mode, limit
+    if isinstance(threshold, (int, float)):
+        return "rows", float(threshold)
+    s = str(threshold).strip().lower()
+    if not s:
+        return mode, limit
+    import re
+    nums = re.findall(r"[-+]?[0-9]*\.?[0-9]+", s)
+    if "row" in s or s.startswith("m"):
+        mode = "rows"
+    elif "nk" in s:
+        mode = "nk"
+    try:
+        if nums:
+            limit = float(nums[0])
+    except Exception:
+        limit = None
+    return mode, limit
+
+
+def _should_use_exact(enable_exact: bool, threshold, n: int, k_sym: int, rows_m: int) -> Tuple[bool, str]:
+    if not enable_exact:
+        return False, "exact disabled"
+    mode, limit = _parse_exact_threshold(threshold)
+    if limit is None:
+        return True, ""
+    if mode == "nk" and (n * k_sym) > limit:
+        return False, f"n*k={n*k_sym} exceeds {limit}"
+    if mode == "rows" and rows_m > limit:
+        return False, f"rows_m={rows_m} exceeds {limit}"
+    return True, ""
+
+
+def summarize_trace_comparison(fits: List[Dict], warn_rel: float = 0.05, logger=logging.getLogger(__name__)) -> None:
+    """输出精确值 vs 估计值摘要，用于 CLI 日志或调试。"""
+    rel_errs = []
+    for f in fits:
+        if "trace_exact" not in f or "trace_estimate" not in f:
+            continue
+        try:
+            exact = float(f.get("trace_exact", float("nan")))
+            est = float(f.get("trace_estimate", float("nan")))
+        except Exception:
+            continue
+        if not (np.isfinite(exact) and np.isfinite(est)):
+            continue
+        if exact == 0:
+            continue
+        rel_errs.append(abs(est - exact) / max(1e-15, abs(exact)))
+    if not rel_errs:
+        return
+    rel_errs = sorted(rel_errs)
+    p50 = rel_errs[len(rel_errs)//2]
+    p90 = rel_errs[int(len(rel_errs)*0.9)]
+    max_e = rel_errs[-1]
+    msg = f"[compare] exact vs est | count={len(rel_errs)}, median={p50:.3e}, p90={p90:.3e}, max={max_e:.3e}"
+    if max_e >= warn_rel:
+        logger.warning(msg)
+    else:
+        logger.info(msg)
+
 # ------------------------------
 # 批量评估
 # ------------------------------
@@ -556,7 +627,10 @@ def evaluate_rules_batch(n: int,
                          trace_mode: str = "hutchpp",
                          hutch_s: int = 24,
                          lru_rows: Optional[RowsCacheLRU] = None,
-                         max_streams: int = 2) -> List[Dict]:
+                         max_streams: int = 2,
+                         enable_exact: bool = True,
+                         enable_spectral: bool = True,
+                         exact_threshold="nk<=12") -> List[Dict]:
     """
     批量评估规则个体，输出：
       - rows_m, lambda_max, lambda_top2, spectral_gap, sum_lambda_powers
@@ -564,7 +638,8 @@ def evaluate_rules_batch(n: int,
       - lower_bound / upper_bound（raw 与惩罚后）
       - 结构上界：upper_bound_raw_gersh / upper_bound_raw_maxdeg
       - archetype_tags（若 rules.structures 存在）
-      - exact_Z（小规模可得时）
+      - exact_Z（启用且阈值允许时）
+      - trace_exact / trace_estimate / trace_error（若同时有精确值与估计值）
     """
     PENALTY_ALPHA = 1.5
     def _adaptive_samples(m: int, base: int) -> int:
@@ -579,17 +654,30 @@ def evaluate_rules_batch(n: int,
         outs: List[Dict] = []
         for idx, bits in enumerate(bits_list):
             bits_sym, k_sym, raw_to_class, class_sizes = apply_rule_symmetry(bits, k, sym_mode)
-            SMALL_NK = (n <= 4 and k_sym <= 3)
             R = rule_from_bits(k_sym, bits_sym)
             deg, comps = _graph_degrees_and_components(R)
             graph_stats = _graph_spectral_metrics(R)
 
             rows = enumerate_ring_rows_fast(n, k_sym, R)
             m = int(rows.shape[0])
+            exact_allowed, exact_reason = _should_use_exact(enable_exact, exact_threshold, n, k_sym, m)
+            spectral_allowed = enable_spectral and (m > 0)
+            spectral_reason = "" if spectral_allowed else ("rows_m=0" if m == 0 else "spectral disabled")
+
+            trace_exact: Optional[float] = None
+            trace_estimate: Optional[float] = None
+            trace_error: Optional[float] = None
+            trace_error_rel: Optional[float] = None
+            eval_notes: List[str] = []
+            if not spectral_allowed:
+                eval_notes.append(f"spectral:{spectral_reason}")
+            if not exact_allowed:
+                eval_notes.append(f"exact:{exact_reason}")
+
             if m == 0:
                 # 上界也为 0
                 ub_rhos = _upper_bound_raw(R, n)
-                outs.append({
+                fit = {
                     "rule_count": int(bits.sum()),
                     "lambda_max": 0.0,
                     "lambda_top2": (0.0, 0.0),
@@ -608,7 +696,15 @@ def evaluate_rules_batch(n: int,
                     "archetype_hits": {},
                     "archetype_tags": "",
                     **graph_stats,
+                }
+                fit.update({
+                    "trace_exact": trace_exact if trace_exact is not None else "",
+                    "trace_estimate": trace_estimate if trace_estimate is not None else -1e300,
+                    "trace_error": trace_error if trace_error is not None else "",
+                    "trace_error_rel": trace_error_rel if trace_error_rel is not None else "",
+                    "eval_note": "; ".join(eval_notes) if eval_notes else "",
                 })
+                outs.append(fit)
                 continue
 
             used = np.zeros(k_sym, dtype=bool)
@@ -618,43 +714,53 @@ def evaluate_rules_batch(n: int,
             active_k_raw = int(sum(class_sizes[c] for c in active_classes))
 
             s_adapt = _adaptive_samples(m, hutch_s)
-            op = TransferOp(rows, R, device="cpu", dtype=torch.float64, block_size_j=2048)
+            lambda1 = lambda2 = lam_pos = 0.0
+            lb_raw = lb = 0.0
+            ub_raw = ub = 0.0
+            spectral_gap = 0.0
+            sum_lp = -1e300
 
-            if use_lanczos:
-                evals = lanczos_top_r(op, r=r_vals, iters=max(2*r_vals, 20), seed=idx, verbose=False)
-                lambda1 = float(evals[0]) if len(evals) > 0 else 0.0
-                lambda2 = float(evals[1]) if len(evals) > 1 else 0.0
-                lam_pos = max(0.0, lambda1)
-                lb_raw = lam_pos ** n
-                lb_r = sum((max(0.0, lam) ** n) for lam in evals) if len(evals) > 0 else 0.0
-                lb_raw = max(lb_raw, lb_r)
-                if trace_mode == "lanczos_sum":
-                    est = float(lb_r)
-                elif trace_mode == "hutch":
-                    est = float(estimate_trace_T_power_hutch(op, n_power=n, s=s_adapt, seed=idx))
-                elif trace_mode == "hutchpp":
-                    est = float(estimate_trace_T_power_hutchpp(op, n_power=n, s=s_adapt, seed=idx))
+            if spectral_allowed:
+                op = TransferOp(rows, R, device="cpu", dtype=torch.float64, block_size_j=2048)
+
+                if use_lanczos:
+                    evals = lanczos_top_r(op, r=r_vals, iters=max(2*r_vals, 20), seed=idx, verbose=False)
+                    lambda1 = float(evals[0]) if len(evals) > 0 else 0.0
+                    lambda2 = float(evals[1]) if len(evals) > 1 else 0.0
+                    lam_pos = max(0.0, lambda1)
+                    lb_raw = lam_pos ** n
+                    lb_r = sum((max(0.0, lam) ** n) for lam in evals) if len(evals) > 0 else 0.0
+                    lb_raw = max(lb_raw, lb_r)
+                    if trace_mode == "lanczos_sum":
+                        est = float(lb_r)
+                    elif trace_mode == "hutch":
+                        est = float(estimate_trace_T_power_hutch(op, n_power=n, s=s_adapt, seed=idx))
+                    elif trace_mode == "hutchpp":
+                        est = float(estimate_trace_T_power_hutchpp(op, n_power=n, s=s_adapt, seed=idx))
+                    else:
+                        est = float(lam_pos ** n)
                 else:
+                    lambda1, _ = power_iteration(op, iters=power_iters, tol=1e-9, verbose=False, seed=idx)
+                    lambda2 = 0.0
+                    lam_pos = max(0.0, lambda1)
+                    lb_raw = lam_pos ** n
                     est = float(lam_pos ** n)
+
+                ub_raw = float(m) * (lam_pos ** n)
+                spectral_gap = max(0.0, lambda1 - lambda2)
+
+                penal = 1.0
+                if comps > 1:
+                    penal *= (0.5 ** (comps - 1))
+                if np.any(deg == 0):
+                    penal *= (active_k / k) ** PENALTY_ALPHA
+
+                sum_lp = est * penal
+                lb = lb_raw * penal
+                ub = ub_raw * penal
+                trace_estimate = sum_lp
             else:
-                lambda1, _ = power_iteration(op, iters=power_iters, tol=1e-9, verbose=False, seed=idx)
-                lambda2 = 0.0
-                lam_pos = max(0.0, lambda1)
-                lb_raw = lam_pos ** n
-                est = float(lam_pos ** n)
-
-            ub_raw = float(m) * (lam_pos ** n)
-            spectral_gap = max(0.0, lambda1 - lambda2)
-
-            penal = 1.0
-            if comps > 1:
-                penal *= (0.5 ** (comps - 1))
-            if np.any(deg == 0):
-                penal *= (active_k / k) ** PENALTY_ALPHA
-
-            sum_lp = est * penal
-            lb = lb_raw * penal
-            ub = ub_raw * penal
+                sum_lp = float(trace_exact) if trace_exact is not None else -1e300
 
             # 结构上界（与 m 结合）
             ub_rhos = _upper_bound_raw(R, n)
@@ -670,6 +776,27 @@ def evaluate_rules_batch(n: int,
             except Exception:
                 archetype_tags = ""
                 archetype_hits = {}
+
+            if exact_allowed:
+                try:
+                    from .stage1_exact import count_patterns_transfer_matrix
+                    trace_exact = float(count_patterns_transfer_matrix(n, k_sym, R, return_rows=False))
+                except Exception as exc:
+                    exact_reason = f"exact failed: {exc.__class__.__name__}"
+                    eval_notes.append(f"exact:{exact_reason}")
+            # 当谱估计被禁用但 exact 已成功时，沿用精确值作为 sum_lambda_powers，避免 NA。
+            if (not spectral_allowed) and (trace_exact is not None):
+                sum_lp = trace_exact
+                lb = lb_raw = trace_exact
+                ub = ub_raw = trace_exact
+                trace_estimate = trace_exact
+
+            if trace_estimate is None:
+                trace_estimate = sum_lp
+            if (trace_exact is not None) and (trace_estimate is not None) and np.isfinite(trace_exact) and np.isfinite(trace_estimate):
+                trace_error = trace_estimate - trace_exact
+                if trace_exact != 0:
+                    trace_error_rel = trace_error / trace_exact
 
             fit = {
                 "rule_count": int(bits.sum()),
@@ -692,14 +819,17 @@ def evaluate_rules_batch(n: int,
                 **graph_stats,
             }
 
-            # 小规模精确计数
-            if SMALL_NK:
-                try:
-                    from .stage1_exact import count_patterns_transfer_matrix
-                    exact_Z = int(count_patterns_transfer_matrix(n, k, R, return_rows=False))
-                    fit["exact_Z"] = exact_Z
-                except Exception:
-                    pass
+            if trace_exact is not None:
+                fit["exact_Z"] = int(trace_exact)
+                fit["trace_exact"] = trace_exact
+            if trace_estimate is not None:
+                fit["trace_estimate"] = trace_estimate
+            if trace_error is not None:
+                fit["trace_error"] = trace_error
+                if trace_error_rel is not None:
+                    fit["trace_error_rel"] = trace_error_rel
+            if eval_notes:
+                fit["eval_note"] = "; ".join(eval_notes)
 
             outs.append(fit)
         return outs
@@ -711,7 +841,6 @@ def evaluate_rules_batch(n: int,
 
     for idx, bits in enumerate(bits_list):
         bits_sym, k_sym, raw_to_class, class_sizes = apply_rule_symmetry(bits, k, sym_mode)
-        SMALL_NK = (n <= 4 and k_sym <= 3)
         key = (sym_mode + "|").encode("utf-8") + bits_sym.tobytes()
         R = rule_from_bits(k_sym, bits_sym)
         deg, comps = _graph_degrees_and_components(R)
@@ -724,6 +853,20 @@ def evaluate_rules_batch(n: int,
                 rows_lru.put(key, rows)
 
         m = int(rows.shape[0])
+        exact_allowed, exact_reason = _should_use_exact(enable_exact, exact_threshold, n, k_sym, m)
+        spectral_allowed = enable_spectral and (m > 0)
+        spectral_reason = "" if spectral_allowed else ("rows_m=0" if m == 0 else "spectral disabled")
+
+        trace_exact: Optional[float] = None
+        trace_estimate: Optional[float] = None
+        trace_error: Optional[float] = None
+        trace_error_rel: Optional[float] = None
+        eval_notes: List[str] = []
+        if not spectral_allowed:
+            eval_notes.append(f"spectral:{spectral_reason}")
+        if not exact_allowed:
+            eval_notes.append(f"exact:{exact_reason}")
+
         if m == 0:
             ub_rhos = _upper_bound_raw(R, n)
             outputs[idx] = {
@@ -744,6 +887,11 @@ def evaluate_rules_batch(n: int,
                 "upper_bound_raw_gersh": 0.0, "upper_bound_raw_maxdeg": 0.0,
                 "archetype_hits": {},
                 "archetype_tags": "",
+                "trace_exact": trace_exact if trace_exact is not None else "",
+                "trace_estimate": trace_estimate if trace_estimate is not None else -1e300,
+                "trace_error": trace_error if trace_error is not None else "",
+                "trace_error_rel": trace_error_rel if trace_error_rel is not None else "",
+                "eval_note": "; ".join(eval_notes) if eval_notes else "",
                 **graph_stats,
             }
             continue
@@ -756,44 +904,55 @@ def evaluate_rules_batch(n: int,
 
         s_adapt = _adaptive_samples(m, hutch_s)
         st = streams[idx % len(streams)]
-        with torch.cuda.stream(st):
-            op = TransferOp(rows, R, device=device, dtype=torch.float64, block_size_j=4096)
 
-            if use_lanczos:
-                evals = lanczos_top_r(op, r=r_vals, iters=max(2*r_vals, 20), seed=idx, verbose=False)
-                lambda1 = float(evals[0]) if len(evals) > 0 else 0.0
-                lambda2 = float(evals[1]) if len(evals) > 1 else 0.0
-                lam_pos = max(0.0, lambda1)
-                lb_raw = lam_pos ** n
-                lb_r = sum((max(0.0, lam) ** n) for lam in evals) if len(evals) > 0 else 0.0
-                lb_raw = max(lb_raw, lb_r)
-                if trace_mode == "lanczos_sum":
-                    est = float(lb_r)
-                elif trace_mode == "hutch":
-                    est = float(estimate_trace_T_power_hutch(op, n_power=n, s=s_adapt, seed=idx))
-                elif trace_mode == "hutchpp":
-                    est = float(estimate_trace_T_power_hutchpp(op, n_power=n, s=s_adapt, seed=idx))
+        lambda1 = lambda2 = lam_pos = 0.0
+        lb_raw = lb = 0.0
+        ub_raw = ub = 0.0
+        spectral_gap = 0.0
+        sum_lp = -1e300
+
+        if spectral_allowed:
+            with torch.cuda.stream(st):
+                op = TransferOp(rows, R, device=device, dtype=torch.float64, block_size_j=4096)
+
+                if use_lanczos:
+                    evals = lanczos_top_r(op, r=r_vals, iters=max(2*r_vals, 20), seed=idx, verbose=False)
+                    lambda1 = float(evals[0]) if len(evals) > 0 else 0.0
+                    lambda2 = float(evals[1]) if len(evals) > 1 else 0.0
+                    lam_pos = max(0.0, lambda1)
+                    lb_raw = lam_pos ** n
+                    lb_r = sum((max(0.0, lam) ** n) for lam in evals) if len(evals) > 0 else 0.0
+                    lb_raw = max(lb_raw, lb_r)
+                    if trace_mode == "lanczos_sum":
+                        est = float(lb_r)
+                    elif trace_mode == "hutch":
+                        est = float(estimate_trace_T_power_hutch(op, n_power=n, s=s_adapt, seed=idx))
+                    elif trace_mode == "hutchpp":
+                        est = float(estimate_trace_T_power_hutchpp(op, n_power=n, s=s_adapt, seed=idx))
+                    else:
+                        est = float(lam_pos ** n)
                 else:
+                    lambda1, _ = power_iteration(op, iters=power_iters, tol=1e-9, verbose=False, seed=idx)
+                    lambda2 = 0.0
+                    lam_pos = max(0.0, lambda1)
+                    lb_raw = lam_pos ** n
                     est = float(lam_pos ** n)
-            else:
-                lambda1, _ = power_iteration(op, iters=power_iters, tol=1e-9, verbose=False, seed=idx)
-                lambda2 = 0.0
-                lam_pos = max(0.0, lambda1)
-                lb_raw = lam_pos ** n
-                est = float(lam_pos ** n)
 
-            ub_raw = float(m) * (lam_pos ** n)
-            spectral_gap = max(0.0, lambda1 - lambda2)
+                ub_raw = float(m) * (lam_pos ** n)
+                spectral_gap = max(0.0, lambda1 - lambda2)
 
-            penal = 1.0
-            if comps > 1:
-                penal *= (0.5 ** (comps - 1))
-            if np.any(deg == 0):
-                penal *= (active_k / k) ** PENALTY_ALPHA
+                penal = 1.0
+                if comps > 1:
+                    penal *= (0.5 ** (comps - 1))
+                if np.any(deg == 0):
+                    penal *= (active_k / k) ** PENALTY_ALPHA
 
-            sum_lp = est * penal
-            lb = lb_raw * penal
-            ub = ub_raw * penal
+                sum_lp = est * penal
+                lb = lb_raw * penal
+                ub = ub_raw * penal
+                trace_estimate = sum_lp
+        else:
+            sum_lp = float(trace_exact) if trace_exact is not None else -1e300
 
             ub_rhos = _upper_bound_raw(R, n)
             ub_raw_gersh = float(m) * (ub_rhos["rho_gersh"] ** n)
@@ -807,6 +966,26 @@ def evaluate_rules_batch(n: int,
             except Exception:
                 archetype_tags = ""
                 archetype_hits = {}
+
+            if exact_allowed:
+                try:
+                    from .stage1_exact import count_patterns_transfer_matrix
+                    trace_exact = float(count_patterns_transfer_matrix(n, k_sym, R, return_rows=False))
+                except Exception as exc:
+                    exact_reason = f"exact failed: {exc.__class__.__name__}"
+                    eval_notes.append(f"exact:{exact_reason}")
+            if (not spectral_allowed) and (trace_exact is not None):
+                sum_lp = trace_exact
+                lb = lb_raw = trace_exact
+                ub = ub_raw = trace_exact
+                trace_estimate = trace_exact
+
+            if trace_estimate is None:
+                trace_estimate = sum_lp
+            if (trace_exact is not None) and (trace_estimate is not None) and np.isfinite(trace_exact) and np.isfinite(trace_estimate):
+                trace_error = trace_estimate - trace_exact
+                if trace_exact != 0:
+                    trace_error_rel = trace_error / trace_exact
 
             fit = {
                 "rule_count": int(bits.sum()),
@@ -829,13 +1008,17 @@ def evaluate_rules_batch(n: int,
                 **graph_stats,
             }
 
-            if SMALL_NK:
-                try:
-                    from .stage1_exact import count_patterns_transfer_matrix
-                    exact_Z = int(count_patterns_transfer_matrix(n, k, R, return_rows=False))
-                    fit["exact_Z"] = exact_Z
-                except Exception:
-                    pass
+            if trace_exact is not None:
+                fit["exact_Z"] = int(trace_exact)
+                fit["trace_exact"] = trace_exact
+            if trace_estimate is not None:
+                fit["trace_estimate"] = trace_estimate
+            if trace_error is not None:
+                fit["trace_error"] = trace_error
+                if trace_error_rel is not None:
+                    fit["trace_error_rel"] = trace_error_rel
+            if eval_notes:
+                fit["eval_note"] = "; ".join(eval_notes)
 
             outputs[idx] = fit
 

@@ -39,7 +39,7 @@ def _jitter(xs: np.ndarray, scale: float = 0.12) -> np.ndarray:
 def _load_rows(csv_paths:Iterable[str])->Dict[str,List[dict]]:
     runs={}
     for p in csv_paths:
-        if not os.path.exists(p): 
+        if not os.path.exists(p):
             continue
         with open(p,"r",encoding="utf-8") as f:
             rdr = list(csv.DictReader(f))
@@ -47,14 +47,42 @@ def _load_rows(csv_paths:Iterable[str])->Dict[str,List[dict]]:
         tag = os.path.basename(p)
         for r in rdr: r["_file"]=p
         runs.setdefault(tag,[]).extend(rdr)
+        _warn_trace_diff(rdr, label=tag)
     return runs
 
+
+def _warn_trace_diff(rows: List[dict], label: str = "") -> None:
+    errs = []
+    for r in rows:
+        te = r.get("trace_estimate", r.get("sum_lambda_powers", ""))
+        tx = r.get("trace_exact", r.get("exact_Z", ""))
+        try:
+            te = float(te) if te not in ("", None) else float("nan")
+            tx = float(tx) if tx not in ("", None) else float("nan")
+        except Exception:
+            continue
+        if not (np.isfinite(te) and np.isfinite(tx)):
+            continue
+        if tx == 0:
+            continue
+        errs.append(abs(te - tx) / max(1e-15, abs(tx)))
+    if not errs:
+        return
+    errs.sort()
+    p50 = errs[len(errs)//2]
+    p90 = errs[int(len(errs)*0.9)]
+    msg = f"[viz] trace est vs exact ({label}) count={len(errs)}, median={p50:.3e}, p90={p90:.3e}, max={errs[-1]:.3e}"
+    if errs[-1] > 0.05:
+        print(msg + " [WARN]")
+    else:
+        print(msg)
+
 def _y_metric(row: dict) -> float:
-    v = row.get("sum_lambda_powers","")
+    v = row.get("trace_estimate", row.get("sum_lambda_powers",""))
     if v!="":
         try: return float(v)
         except: pass
-    v = row.get("Z_exact","")
+    v = row.get("trace_exact", row.get("Z_exact",""))
     if v!="":
         try: return float(v)
         except: pass

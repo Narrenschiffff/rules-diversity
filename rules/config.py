@@ -31,6 +31,11 @@ POWER_ITERS = int(os.getenv("RULES_POWER_ITERS", "50"))
 HUTCH_S = int(os.getenv("RULES_HUTCH_S", "24"))
 TRACE_MODE = os.getenv("RULES_TRACE_MODE", "hutchpp")  # hutch|hutchpp|lanczos_sum
 
+# 精确/谱估计开关与阈值
+ENABLE_EXACT = os.getenv("RULES_ENABLE_EXACT", "1") != "0"
+ENABLE_SPECTRAL = os.getenv("RULES_ENABLE_SPECTRAL", "1") != "0"
+EXACT_THRESHOLD = os.getenv("RULES_EXACT_THRESHOLD", "nk<=12")
+
 # 对称性分析默认
 SYM_GEO_OPS = os.getenv("RULES_SYM_GEO_OPS", "rot,ref,trans")
 SYM_ENUM_LIMIT = int(os.getenv("RULES_SYM_ENUM_LIMIT", "1000000"))
