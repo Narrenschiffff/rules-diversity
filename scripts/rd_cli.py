@@ -145,6 +145,9 @@ def cmd_ga(args):
         enable_exact=not args.no_exact,
         enable_spectral=not args.no_spectral,
         exact_threshold=args.exact_threshold,
+        boundary=args.boundary,
+        cache_dir=args.cache_dir,
+        use_cache=not args.no_cache,
     )
     pareto, csv_front, csv_gen = ga_search_with_batch(n, k, conf, out_csv_dir=args.out_csv)
     print("[GA] Front CSV:", csv_front)
@@ -158,6 +161,7 @@ def cmd_ga(args):
                 reports = evaluate_rules_batch(
                     n=n, k=k, bits_list=bits_batch,
                     sym_mode=mode,
+                    boundary=args.boundary,
                     device=args.device if args.device else conf.device,
                     use_lanczos=not args.no_lanczos,
                     r_vals=args.r_vals, power_iters=args.power_iters,
@@ -166,6 +170,8 @@ def cmd_ga(args):
                     enable_exact=not args.no_exact,
                     enable_spectral=not args.no_spectral,
                     exact_threshold=args.exact_threshold,
+                    cache_dir=args.cache_dir,
+                    use_cache=not args.no_cache,
                 )
                 summarize_trace_comparison(reports, logger=logging.getLogger(__name__))
                 best = max((float(r.get("sum_lambda_powers", -1e300)) for r in reports), default=float("nan"))
@@ -413,6 +419,8 @@ def main():
     sp.add_argument("--pop-size", type=int, default=24); sp.add_argument("--generations", type=int, default=10)
     sp.add_argument("--p-mut", type=float, default=0.08); sp.add_argument("--p-cx", type=float, default=0.85)
     sp.add_argument("--elite-keep", type=int, default=6)
+    sp.add_argument("--boundary", default=_config.BOUNDARY_MODE, choices=["torus", "open"],
+                    help="网格边界条件；目前估计器仅支持 torus，参数用于缓存隔离")
     sp.add_argument("--no-lanczos", action="store_true")
     sp.add_argument("--r-vals", type=int, default=3); sp.add_argument("--power-iters", type=int, default=50)
     sp.add_argument("--trace-mode", default="hutchpp", choices=["hutchpp","hutch","lanczos_sum"])
@@ -422,6 +430,8 @@ def main():
     sp.add_argument("--no-spectral", action="store_true", help="禁用谱估计（仅依赖精确计数）")
     sp.add_argument("--exact-threshold", default=_config.EXACT_THRESHOLD,
                     help="精确计数阈值：如 nk<=12 或 rows<=500000")
+    sp.add_argument("--cache-dir", default=str(_config.EVAL_CACHE_DIR), help="评估结果缓存目录")
+    sp.add_argument("--no-cache", action="store_true", help="禁用评估缓存（始终重新计算）")
     # 新增
     sp.add_argument("--progress-every", type=int, default=2)
     sp.add_argument("--fast-eval", action="store_true")

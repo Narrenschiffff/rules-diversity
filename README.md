@@ -201,12 +201,16 @@ python -c "from pathlib import Path; from rules.viz import plot_pareto_from_csv;
   - `device`、`use_lanczos`、`trace_mode` 控制谱估计策略。  
   - `hutch_s_base`、`estimate_second_moment`、`upper_bounds` 管理采样自适应与上界策略。  
   - `parallel_backend`、`max_streams`、`block_size_i/j` 管控 CPU/GPU 资源利用。  
-- `GAConfig`：  
-  - `pop_size`、`generations`、`p_cx`、`p_mut` 调整遗传算法搜索强度。  
-  - `lru_rows_capacity`、`batch_streams` 优化批量评估吞吐。  
-- **记录模板**：建议为每个 $(n,k)$ 保存：  
-  1) 帕累托点集合 $(|R|,\, \widehat{\mathrm{Pattern}})$；  
-  2) 典型规则位串 + 结构解读；  
+- `GAConfig`：
+  - `pop_size`、`generations`、`p_cx`、`p_mut` 调整遗传算法搜索强度。
+  - `lru_rows_capacity`、`batch_streams` 优化批量评估吞吐。
+- **评估缓存**：默认写入 `~/.cache/rules-diversity/eval`（可通过环境变量 `RULES_EVAL_CACHE` 或 CLI `--cache-dir` 覆盖，`--no-cache` 禁用）。
+  - **键设计**：对称化规则位串 + 有效状态数 `active_k` + 边界模式 + 对称选项 + 棋盘规模 `n`，避免跨设置污染。
+  - **命中策略**：`evaluate_rules_batch` 在执行谱估计/精确计数前优先查找缓存命中，直接返回已有的转移算子谱估计或精确值。
+  - **失效条件**：元数据记录来源与版本号（`RULES_EVAL_CACHE_VERSION`）；修改版本或删除目录即可强制重新计算。
+- **记录模板**：建议为每个 $(n,k)$ 保存：
+  1) 帕累托点集合 $(|R|,\, \widehat{\mathrm{Pattern}})$；
+  2) 典型规则位串 + 结构解读；
   3) 运行时间、硬件、采样参数、估计误差或上下界；  
   4) 可视化图像（散点、增长曲线、典型图案示例）。
 
