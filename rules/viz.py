@@ -51,6 +51,54 @@ def _load_rows(csv_paths:Iterable[str])->Dict[str,List[dict]]:
     return runs
 
 
+def summarize_runs(csv_paths: Iterable[str], sym_filter: Optional[str] = None) -> Dict[str, dict]:
+    """Summarize CSV artifacts for quick diagnostics.
+
+    - counts per symmetry mode
+    - active_k / active_k_raw ranges
+    - boundaries observed
+    """
+    runs = _load_rows(csv_paths)
+    out: Dict[str, dict] = {}
+    for tag, rows in runs.items():
+        filtered: List[dict] = []
+        for r in rows:
+            if sym_filter and str(r.get("sym_mode", "")).lower() != sym_filter.lower():
+                continue
+            filtered.append(r)
+        if not filtered:
+            continue
+
+        sym_counts: Dict[str, int] = {}
+        active_k: List[int] = []
+        active_k_raw: List[int] = []
+        boundaries = set()
+        for r in filtered:
+            sym_counts[str(r.get("sym_mode", "")) or "unknown"] = sym_counts.get(str(r.get("sym_mode", "")) or "unknown", 0) + 1
+            try:
+                active_k.append(int(r.get("active_k", 0)))
+            except Exception:
+                pass
+            try:
+                active_k_raw.append(int(r.get("active_k_raw", r.get("active_k", 0))))
+            except Exception:
+                pass
+            b = str(r.get("boundary", "")).strip()
+            if b:
+                boundaries.add(b)
+
+        out[tag] = {
+            "rows": len(filtered),
+            "symmetry_counts": sym_counts,
+            "active_k_min": min(active_k) if active_k else None,
+            "active_k_max": max(active_k) if active_k else None,
+            "active_k_raw_min": min(active_k_raw) if active_k_raw else None,
+            "active_k_raw_max": max(active_k_raw) if active_k_raw else None,
+            "boundaries": sorted(boundaries),
+        }
+    return out
+
+
 def _warn_trace_diff(rows: List[dict], label: str = "") -> None:
     errs = []
     for r in rows:
@@ -156,20 +204,22 @@ def _discover_all_nk(paths: Iterable[str]) -> List[Tuple[int,int]]:
             if (n is not None) and (k is not None): seen.add((n,k))
     return sorted(seen)
 
-def _collect_by_series_for_nk(csv_paths: Iterable[str], n:int, k:int)->Dict[str,List[dict]]:
+def _collect_by_series_for_nk(csv_paths: Iterable[str], n:int, k:int, sym_filter: Optional[str] = None)->Dict[str,List[dict]]:
     out={"stage1_raw":[], "stage1_canon":[], "ga_canon":[]}
     for p in csv_paths:
         if not os.path.exists(p): continue
         with open(p,"r",encoding="utf-8") as f:
             rows=list(csv.DictReader(f))
         if not rows: continue
-        # 过滤 (n,k)
+        # 过滤 (n,k) + 对称模式（可选）
         if "n" in rows[0] and "k" in rows[0]:
             rows=[r for r in rows if str(r.get("n","")).isdigit() and str(r.get("k","")).isdigit()
                   and int(r["n"])==n and int(r["k"])==k]
         else:
             fn_n, fn_k = _nk_from_fname(os.path.basename(p))
             if not (fn_n==n and fn_k==k): rows=[]
+        if sym_filter:
+            rows=[r for r in rows if str(r.get("sym_mode",""))==sym_filter]
         if not rows: continue
         base=os.path.basename(p)
         for r in rows:
@@ -250,9 +300,10 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
                                 n: int, k: int,
                                 out_dir: str = "./out_fig",
                                 y_log: bool = False,
-                                style: str = "default") -> Tuple[str,str,str]:
+                                style: str = "default",
+                                sym_filter: Optional[str] = None) -> Tuple[str,str,str]:
     apply_style(style); os.makedirs(out_dir, exist_ok=True)
-    series = _collect_by_series_for_nk(front_paths, n, k)
+    series = _collect_by_series_for_nk(front_paths, n, k, sym_filter=sym_filter)
     order  = ["stage1_raw", "stage1_canon", "ga_canon"]
     markers= {"stage1_raw":"s", "stage1_canon":"o", "ga_canon":"^"}
     linest = {"stage1_raw":"--", "stage1_canon":"-", "ga_canon":"-."}
@@ -364,7 +415,8 @@ def plot_all(front_paths: List[str],
              n: Optional[int]=None, k: Optional[int]=None,
              out_dir: str="./out_fig",
              y_log: bool=False,
-             style: str="default")->List[str]:
+             style: str="default",
+             sym_filter: Optional[str] = None)->List[str]:
     """
     兼容 rd_cli.py:
       - 若给定 n,k：仅绘制该 (n,k) 的三张图；
@@ -374,11 +426,11 @@ def plot_all(front_paths: List[str],
     apply_style(style); os.makedirs(out_dir, exist_ok=True)
     outs=[]
     if (n is not None) and (k is not None):
-        outs += list(plot_three_raw_canon_for_nk(front_paths, n, k, out_dir=out_dir, y_log=y_log, style=style))
+        outs += list(plot_three_raw_canon_for_nk(front_paths, n, k, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter))
         return outs
     # 自动发现
     for n0,k0 in _discover_all_nk(front_paths):
-        outs += list(plot_three_raw_canon_for_nk(front_paths, n0, k0, out_dir=out_dir, y_log=y_log, style=style))
+        outs += list(plot_three_raw_canon_for_nk(front_paths, n0, k0, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter))
     return outs
 
 # =========================
@@ -390,9 +442,10 @@ def _cli():
     ap.add_argument("--out-dir", default="./out_fig")
     ap.add_argument("--style", default="default", choices=list(_STYLES.keys()))
     ap.add_argument("--y-log", action="store_true")
+    ap.add_argument("--sym-filter", default=None, help="only plot rows whose sym_mode matches this value")
     ap.add_argument("--n", type=int); ap.add_argument("--k", type=int)
     args = ap.parse_args()
-    plot_all(args.front, n=args.n, k=args.k, out_dir=args.out_dir, y_log=args.y_log, style=args.style)
+    plot_all(args.front, n=args.n, k=args.k, out_dir=args.out_dir, y_log=args.y_log, style=args.style, sym_filter=args.sym_filter)
 
 if __name__ == "__main__":
     _cli()
