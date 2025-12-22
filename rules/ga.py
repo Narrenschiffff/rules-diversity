@@ -16,7 +16,7 @@ import torch
 
 from .eval import (
     canonical_bits, bits_from_rule, rule_from_bits, apply_rule_symmetry,
-    evaluate_rules_batch, RowsCacheLRU
+    evaluate_rules_batch, RowsCacheLRU, summarize_trace_comparison
 )
 from .utils_io import make_run_tag
 
@@ -227,7 +227,10 @@ class GAConfig:
                  lru_rows_capacity=128, batch_streams=2,
                  progress_every=2, fast_eval=False,
                  seed_from_stage1=False, max_stage1_seeds=256,
-                 sym_mode: str = "perm"):
+                 sym_mode: str = "perm",
+                 enable_exact: bool = True,
+                 enable_spectral: bool = True,
+                 exact_threshold: str | int | float = "nk<=12"):
         self.pop_size = pop_size
         self.generations = generations
         self.p_mut = p_mut
@@ -246,6 +249,9 @@ class GAConfig:
         self.seed_from_stage1 = seed_from_stage1
         self.max_stage1_seeds = max_stage1_seeds
         self.sym_mode = sym_mode
+        self.enable_exact = enable_exact
+        self.enable_spectral = enable_spectral
+        self.exact_threshold = exact_threshold
 
 # ---------- CSV appenders ----------
 def _append_front_rows_csv(csv_path_front: str, tag: str, n: int, k: int,
@@ -281,6 +287,11 @@ def _append_front_rows_csv(csv_path_front: str, tag: str, n: int, k: int,
                 f"{float(fit.get('upper_bound_raw_maxdeg', 0.0)):.6e}",
                 fit.get("archetype_tags",""),
                 ("" if (fit.get("exact_Z","")== "") else str(int(fit.get("exact_Z")))),
+                fit.get("trace_exact", ""),
+                fit.get("trace_estimate", ""),
+                fit.get("trace_error", ""),
+                fit.get("trace_error_rel", ""),
+                fit.get("eval_note", ""),
             ])
 
 # ---------- main ----------
@@ -301,7 +312,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                     "lower_bound","upper_bound",
                     "lower_bound_raw","upper_bound_raw",
                     "upper_bound_raw_gersh","upper_bound_raw_maxdeg",
-                    "archetype_tags","exact_Z"])
+                    "archetype_tags","exact_Z",
+                    "trace_exact","trace_estimate","trace_error","trace_error_rel","eval_note"])
     with open(csv_gen, "w", newline="", encoding="utf-8") as f:
         w=csv.writer(f)
         w.writerow(["run_tag","n","k","generation","front0_size",
@@ -327,11 +339,17 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
     seed_from_stage1= _bool_or(getattr(ga_conf, "seed_from_stage1", False), False)
     max_seeds       = _int_or(getattr(ga_conf, "max_stage1_seeds", 256), 256)
     sym_mode        = getattr(ga_conf, "sym_mode", "perm") or "perm"
+    enable_exact    = _bool_or(getattr(ga_conf, "enable_exact", True), True)
+    enable_spectral = _bool_or(getattr(ga_conf, "enable_spectral", True), True)
+    exact_threshold = getattr(ga_conf, "exact_threshold", "nk<=12")
 
     if fast_eval or device=="cpu":
         r_vals = min(r_vals, 2); power_iters = min(power_iters, 16); hutch_s = min(hutch_s, 8)
 
-    logger.info(f"GA start | n={n}, k={k}, device={device}, sym={sym_mode}, pop={pop_size}, gens={generations}, fast_eval={fast_eval}, seed_from_stage1={seed_from_stage1}")
+    logger.info(
+        f"GA start | n={n}, k={k}, device={device}, sym={sym_mode}, pop={pop_size}, gens={generations}, "
+        f"fast_eval={fast_eval}, seed_from_stage1={seed_from_stage1}, exact={enable_exact}, spectral={enable_spectral}, "
+        f"exact_th={exact_threshold}")
 
     # init population
     pop: List[np.ndarray] = []
@@ -369,10 +387,18 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                         device=device, use_lanczos=use_lanczos,
                                         r_vals=r_vals, power_iters=power_iters,
                                         trace_mode=trace_mode, hutch_s=hutch_s,
-                                        lru_rows=rows_lru, max_streams=max_streams)
+                                        lru_rows=rows_lru, max_streams=max_streams,
+                                        enable_exact=enable_exact,
+                                        enable_spectral=enable_spectral,
+                                        exact_threshold=exact_threshold)
             for pos, fit in zip(miss_pos, outs):
                 key = keys[pos]
                 cache[key] = fit; results[pos] = fit
+        if enable_exact and enable_spectral:
+            try:
+                summarize_trace_comparison([r for r in results if isinstance(r, dict)], logger=logger)
+            except Exception:
+                logger.debug("compare summary failed", exc_info=True)
         return results, normed
 
     # generations

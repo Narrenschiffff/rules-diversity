@@ -118,7 +118,7 @@ def cmd_stage1(args):
 
 def cmd_ga(args):
     from rules.ga import GAConfig, ga_search_with_batch
-    from rules.eval import evaluate_rules_batch
+    from rules.eval import evaluate_rules_batch, summarize_trace_comparison
     n, k = int(args.n), int(args.k)
     os.makedirs(args.out_csv, exist_ok=True)
 
@@ -142,6 +142,9 @@ def cmd_ga(args):
         progress_every=args.progress_every, fast_eval=args.fast_eval,
         seed_from_stage1=args.seed_from_stage1, max_stage1_seeds=args.max_stage1_seeds,
         sym_mode=sym_modes[0],
+        enable_exact=not args.no_exact,
+        enable_spectral=not args.no_spectral,
+        exact_threshold=args.exact_threshold,
     )
     pareto, csv_front, csv_gen = ga_search_with_batch(n, k, conf, out_csv_dir=args.out_csv)
     print("[GA] Front CSV:", csv_front)
@@ -160,7 +163,11 @@ def cmd_ga(args):
                     r_vals=args.r_vals, power_iters=args.power_iters,
                     trace_mode=args.trace_mode, hutch_s=args.hutch_s,
                     lru_rows=None, max_streams=args.batch_streams,
+                    enable_exact=not args.no_exact,
+                    enable_spectral=not args.no_spectral,
+                    exact_threshold=args.exact_threshold,
                 )
+                summarize_trace_comparison(reports, logger=logging.getLogger(__name__))
                 best = max((float(r.get("sum_lambda_powers", -1e300)) for r in reports), default=float("nan"))
                 mmin = min((int(r.get("rows_m", 0)) for r in reports), default=0)
                 mmax = max((int(r.get("rows_m", 0)) for r in reports), default=0)
@@ -411,6 +418,10 @@ def main():
     sp.add_argument("--trace-mode", default="hutchpp", choices=["hutchpp","hutch","lanczos_sum"])
     sp.add_argument("--hutch-s", type=int, default=24)
     sp.add_argument("--lru-rows-capacity", type=int, default=128); sp.add_argument("--batch-streams", type=int, default=2)
+    sp.add_argument("--no-exact", action="store_true", help="禁用精确计数/对照（默认开启，受阈值限制）")
+    sp.add_argument("--no-spectral", action="store_true", help="禁用谱估计（仅依赖精确计数）")
+    sp.add_argument("--exact-threshold", default=_config.EXACT_THRESHOLD,
+                    help="精确计数阈值：如 nk<=12 或 rows<=500000")
     # 新增
     sp.add_argument("--progress-every", type=int, default=2)
     sp.add_argument("--fast-eval", action="store_true")
