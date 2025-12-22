@@ -14,6 +14,9 @@ DEFAULT_STYLE = os.getenv("RULES_STYLE", "ieee")
 # 设备（eval.TransferOp 会再次判断）
 DEFAULT_DEVICE = os.getenv("RULES_DEVICE", "cuda")
 
+# 边界模式（torus|open）
+BOUNDARY_MODE = os.getenv("RULES_BOUNDARY", "torus")
+
 # 结果根目录（示例；各 CLI 可覆盖）
 RESULTS_ROOT = Path(os.getenv("RULES_RESULTS_ROOT", "./notebooks/results")).resolve()
 OUT_CSV_DEFAULT = RESULTS_ROOT / "out_csv"

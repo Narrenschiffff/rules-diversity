@@ -20,6 +20,7 @@ import numpy as np
 __all__ = [
     "make_rule_matrix",
     "neighbors_torus",
+    "neighbors_grid",
     "count_patterns_backtrack",
     "enumerate_ring_rows",
     "build_row_compat_matrix",
@@ -68,24 +69,49 @@ def neighbors_torus(i, j, n):
             (i, (j - 1) % n),
             (i, (j + 1) % n)]
 
+
+def neighbors_grid(i: int, j: int, n: int, boundary: str = "torus"):
+    if boundary == "torus":
+        return neighbors_torus(i, j, n)
+    if boundary == "open":
+        out = []
+        for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            ni, nj = i + di, j + dj
+            if 0 <= ni < n and 0 <= nj < n:
+                out.append((ni, nj))
+        return out
+    raise ValueError(f"unknown boundary={boundary}")
+
 # ---------- 回溯计数（用于对照） ----------
-def count_patterns_backtrack(n, k, R):
+def count_patterns_backtrack(n, k, R, boundary: str = "torus"):
+    if boundary not in {"torus", "open"}:
+        raise ValueError(f"unknown boundary={boundary}")
     grid = [[-1] * n for _ in range(n)]
     total = 0
+
     def ok_left(i, j, v):
-        lj = (j - 1) % n; lv = grid[i][lj]
+        if boundary == "open" and j == 0:
+            return True
+        lj = (j - 1) % n if boundary == "torus" else j - 1
+        lv = grid[i][lj]
         return True if lv == -1 else bool(R[v, lv])
+
     def ok_up(i, j, v):
-        ui = (i - 1) % n; uv = grid[ui][j]
+        if boundary == "open" and i == 0:
+            return True
+        ui = (i - 1) % n if boundary == "torus" else i - 1
+        uv = grid[ui][j]
         return True if uv == -1 else bool(R[v, uv])
+
     def dfs(pos):
         nonlocal total
         if pos == n*n:
-            for i in range(n):
-                for j in range(n):
-                    v = grid[i][j]
-                    if not R[v, grid[i][(j+1)%n]]: return
-                    if not R[v, grid[(i+1)%n][j]]: return
+            if boundary == "torus":
+                for i in range(n):
+                    for j in range(n):
+                        v = grid[i][j]
+                        if not R[v, grid[i][(j+1)%n]]: return
+                        if not R[v, grid[(i+1)%n][j]]: return
             total += 1; return
         i, j = divmod(pos, n)
         for v in range(k):
@@ -97,11 +123,18 @@ def count_patterns_backtrack(n, k, R):
     return total
 
 # ---------- 转移矩阵计数（主力） ----------
-def enumerate_ring_rows(n, k, R):
+def enumerate_ring_rows(n, k, R, boundary: str = "torus"):
+    if boundary not in {"torus", "open"}:
+        raise ValueError(f"unknown boundary={boundary}")
     rows, seq = [], [-1]*n
+
     def dfs(pos):
         if pos == n:
-            if R[seq[-1], seq[0]]: rows.append(seq.copy())
+            if boundary == "torus":
+                if R[seq[-1], seq[0]]:
+                    rows.append(seq.copy())
+            else:
+                rows.append(seq.copy())
             return
         for v in range(k):
             if pos==0 or R[seq[pos-1], v]:
@@ -118,20 +151,27 @@ def build_row_compat_matrix(rows, R):
             if ok: T[i,j]=1
     return T
 
-def count_patterns_transfer_matrix(n, k, R, return_rows=False):
-    rows = enumerate_ring_rows(n,k,R)
+def count_patterns_transfer_matrix(n, k, R, boundary: str = "torus", return_rows=False):
+    rows = enumerate_ring_rows(n, k, R, boundary=boundary)
     T = build_row_compat_matrix(rows, R)
-    M = np.array(T, dtype=object)
-    for _ in range(n-1):
-        M = M @ T
-    Z = int(np.trace(M))
+    if boundary == "torus":
+        M = np.array(T, dtype=object)
+        for _ in range(n-1):
+            M = M @ T
+        Z = int(np.trace(M))
+    else:
+        counts = np.ones(len(rows), dtype=object)
+        M = np.array(T, dtype=object)
+        for _ in range(n-1):
+            counts = counts @ M
+        Z = int(np.sum(counts))
     if return_rows: return Z, rows, T, M
     return Z
 
-def cross_check(n, k, R, verbose=True):
-    a = count_patterns_backtrack(n,k,R)
-    b = count_patterns_transfer_matrix(n,k,R)
-    if verbose: print(f"[check] n={n},k={k} backtrack={a}, transfer={b}")
+def cross_check(n, k, R, boundary: str = "torus", verbose=True):
+    a = count_patterns_backtrack(n, k, R, boundary=boundary)
+    b = count_patterns_transfer_matrix(n, k, R, boundary=boundary)
+    if verbose: print(f"[check] n={n},k={k} boundary={boundary} backtrack={a}, transfer={b}")
     assert a==b, "计数不一致"
     return a
 
@@ -245,6 +285,7 @@ def scan_all_rules_exact(n:int,
                          canonical:bool=True,
                          mark_archetypes:bool=True,
                          save_rows_m:bool=True,
+                         boundary: str = "torus",
                          run_tag:Optional[str]=None)->Tuple[str,str]:
     """
     返回值保持兼容：返回“canon”版本的 (all_csv, pareto_csv) 路径；
@@ -259,14 +300,15 @@ def scan_all_rules_exact(n:int,
     for bits_raw in _enumerate_all_rule_bits_raw(k):
         bits_canon = _canonical_bits(bits_raw, k)
         R = _rule_from_bits_any(k, bits_raw)
-        Z, rows_m = count_patterns_transfer_matrix(n,k,R), 0
+        Z, rows_m = count_patterns_transfer_matrix(n, k, R, boundary=boundary), 0
         if save_rows_m:
-            _, rows, *_ = count_patterns_transfer_matrix(n,k,R, return_rows=True)
+            _, rows, *_ = count_patterns_transfer_matrix(n, k, R, boundary=boundary, return_rows=True)
             rows_m = len(rows)
 
         row_base = {
             "run_tag": tag,
             "n": n, "k": k,
+            "boundary": boundary,
             "rule_bits_raw": "".join(str(int(x)) for x in bits_raw.tolist()),
             "rule_bits_canon": "".join(str(int(x)) for x in bits_canon.tolist()),
             "rule_count": int(bits_raw.sum()),
