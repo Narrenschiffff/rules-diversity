@@ -27,5 +27,6 @@ where = ["."]
 include = ["rules", "rules.*"]
 
 [project.scripts]
-rules-run-ga = "scripts.rd.cli:main"
-rules-stage1 = "scripts.rd.cli:main"
+rules-run-ga = "scripts.rd_cli:main"
+rules-stage1 = "scripts.rd_cli:main"
+rules-pipeline = "scripts.run_pipeline:main"

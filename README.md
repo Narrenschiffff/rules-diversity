@@ -2,6 +2,11 @@
 
 本仓库围绕如下核心问题：在 $n\times n$ 的环面网格上，给定 $k$ 种状态与一组对称的邻接规则 $R$，如何在**使用最少规则**的前提下**最大化可行图案数量**，并识别多目标帕累托前沿上的**结构转折点（knee point）**。研究框架来自组合优化、图同态理论与谱方法，同时与《系统科学概论》系列讲义（`lecture1-Intro.pdf`、`lecture2-GoL和蚂蚁.pdf`、`lecture3-多主体.pdf`）中的“局部规则驱动的涌现”主题保持一致。
 
+> **快速导览**
+> - 若想直接跑一遍“精确 + 谱估计 + 对称处理 + 边界开关 + 缓存”统一流水线，请跳转到 [§7.1 示例 1](#示例-1精确计数) 与 [§7.5 示例 5](#示例-5统一流水线-CLI精确--谱估计--缓存)。
+> - 如果要改代码或做二次开发，可以从 [§3 仓库结构总览](#3-仓库结构总览) 与 [§4 算法阶段与实现细节](#4-算法阶段与实现细节) 定位模块，再结合 [§5 数据分析流程](#5-数据分析流程) 了解输出结果的字段含义。
+> - 需要自定义规则/配置时，优先使用 `scripts/run_pipeline.py` 提供的配置文件 + CLI 覆盖模式；命令行参数详见 [§7 示例](#7-实验复现与快速上手)。
+
 ---
 
 ## 1. 背景与研究目标
@@ -40,6 +45,19 @@
 - **对称化**：`rules.eval.canonical_bits` 对位串进行置换同构规范化，$k\le 8$ 时枚举全排列，大规模时采用度数与自环启发式。
 - **谱-结构剖析**：`evaluate_rules_batch` 在构造规则图后会额外输出度矩阵、无向/归一化拉普拉斯、邻接谱间隙、代数连通度与平均聚类系数，便于后续结构对齐与解释。
 
+### 功能开关总览（CLI 与 API 通用）
+| 需求 | CLI 入口 | 配置字段 | 说明 |
+| --- | --- | --- | --- |
+| 置换对称 / 交换对称 | `--sym-mode {none,perm,perm+swap}` | `sym_mode` | `perm` 走规则位串规范化，`perm+swap` 额外合并邻接等价节点；`none` 不做对称处理。 |
+| 边界模式 | `--boundary {torus,open}` | `boundary` | `torus` 为循环边界；`open` 为非循环边界（精确计数路径支持）。 |
+| 精确计算开关 | `--exact / --no-exact` | `use_exact` | 若开启，且行数未超过 `exact_rows_cap`，调用行枚举 + 转移矩阵精确计数。 |
+| 谱估计开关 | `--spectral / --no-spectral` | `use_spectral` | 启用/关闭 Hutch/Hutch++ 迹估计与 Lanczos 顶值估计。 |
+| 阈值联动 | `--exact-rows-cap` | `exact_rows_cap` | 行数超过阈值即跳过精确计算，以谱估计为主。 |
+| 缓存 | `--cache-dir / --no-cache` | `cache_dir` | 规则位串 + 有效状态数 + 边界 + 对称模式 + `n` 共同构成缓存键；命中后直接复用计算结果。 |
+| 设备选择 | `--device cpu|cuda` | `device` | `rules.eval.TransferOp` 支持 CPU/GPU，默认自动检测。 |
+
+> 若使用 Python API，可直接向 `evaluate_rules_batch` 传入上述同名参数；`scripts/run_pipeline.py` 将 CLI/配置映射到同一接口。
+
 ---
 
 ## 3. 仓库结构总览
@@ -50,7 +68,7 @@
 | `rules/ga.py` | 简化 NSGA-II 流程：初始化、交叉、变异、不可行修复、非支配排序、拥挤距离、`evaluate_rules_batch` 集成、CSV 输出。 |
 | `rules/config.py` | `EvalConfig`、`GAConfig` 等配置数据类，集中管理设备、采样数、迭代次数、缓存与并行策略。 |
 | `rules/spectrum.py` | 谱计算工具：幂迭代、Lanczos 顶值、迹估计。 |
-| `rules/viz.py` | 数据可视化：帕累托散点、增长曲线、上下界叠加、二阶差分与 L-curve 膝点检测 (`detect_knee`)。 |
+| `rules/viz.py` | 数据可视化：帕累托散点、增长曲线、上下界叠加、二阶差分与 L-curve 膝点检测 (`detect_knee`)，支持按 `sym_mode` 过滤与运行摘要 (`summarize_runs`)。 |
 | `rules/utils_io.py` | CSV 读写与实验记录辅助。 |
 | `rules/logging_setup.py` | 统一日志格式与第三方库降噪。 |
 | `scripts/run_stage1.py` | 阶段一 CLI：手动配置 $(n,k)$ 与规则，输出精确计数。 |
@@ -84,21 +102,52 @@
   - CLI `scripts/run_ga.py` 支持 `--nk`、`--gens`、`--pop`、`--trace`、`--device`、`--out-csv`、`--out-fig` 等参数。
 
 ### 阶段四：数据分析与膝点识别
-- `rules.viz.plot_pareto_from_csv` 汇总多次实验，生成：  
-  1) 帕累托散点（横轴 $|R|$，纵轴估计的模式数）。  
-  2) 增长曲线：累积最佳点随规则数变化，并叠加上下界及 knee 标记。  
+- `rules.viz.plot_pareto_from_csv` 汇总多次实验，生成：
+  1) 帕累托散点（横轴 $|R|$，纵轴估计的模式数）。
+  2) 增长曲线：累积最佳点随规则数变化，并叠加上下界及 knee 标记。
+- `rules.viz.plot_all(front_paths, sym_filter="perm")`：在包含多种对称模式的 CSV 中，仅保留指定 `sym_mode` 进行绘制。
+- `rules.viz.summarize_runs(csvs, sym_filter=None)`：快速统计每个 CSV 的对称模式计数、`active_k`/`active_k_raw` 范围及边界模式，便于排查数据质量。
 - `detect_knee` 结合二阶差分与 L-curve 曲率，输出稳定的膝点候选，并由 `_annotate_knee` 在图中标注。
 
 ---
 
 ## 5. 数据分析流程
-1. **CSV 记录**：`rules/utils_io` 提供追加/初始化工具，GA 搜索自动写入 `out_csv/pareto_front_*.csv`。  
-2. **指标解析**：重点指标包括 `sum_lambda_powers`（经惩罚的模式估计）、`lambda_max`、`lower_bound_raw`/`upper_bound_raw`、`active_k`。  
-3. **膝点诊断**：  
-   - **二阶差分**：检测增量收益骤降的位置。  
-   - **L-curve 曲率**：在 log–log 空间拟合曲线并计算曲率最大点。  
-   - **投票融合**：`detect_knee` 内置二阶差分与 L-curve 两种候选，可在增长曲线中同时标注，辅助判断膝点置信度。  
+1. **CSV 记录**：`rules/utils_io` 提供追加/初始化工具，GA 搜索自动写入 `out_csv/pareto_front_*.csv`。
+2. **指标解析**：重点指标包括 `sum_lambda_powers`（经惩罚的模式估计）、`lambda_max`、`lower_bound_raw`/`upper_bound_raw`、`active_k`。
+3. **膝点诊断**：
+   - **二阶差分**：检测增量收益骤降的位置。
+   - **L-curve 曲率**：在 log–log 空间拟合曲线并计算曲率最大点。
+   - **投票融合**：`detect_knee` 内置二阶差分与 L-curve 两种候选，可在增长曲线中同时标注，辅助判断膝点置信度。
+   - **对称模式过滤**：若同一目录下存在 `sym_mode` 不同的运行，绘制/汇总时建议传入 `sym_filter` 聚焦某一模式，避免不同有效状态数混杂造成的解读偏差。
 4. **结构对照**：结合 `canonical_bits` 输出的标准位串，可在后续分析中关联特定 motif。
+
+### 输出文件与字段对照
+- **流水线 / GA CSV**
+  - `rule_bits_raw` / `rule_bits_canon`：原始与对称化后的位串。
+  - `rows_m` / `active_k`：合法行数量与有效状态数（对称模式下会发生折算）。
+  - `exact_Z` / `exact_note`：精确计数结果及跳过原因。
+  - `sum_lambda_powers` / `lambda_max` / `adj_spectral_gap`：谱估计核心指标。
+  - `lower_bound` / `upper_bound`：估计上下界；`upper_bound_note` 说明使用的上界类型。
+  - `cache_key`：包含规则、边界、对称、规模的缓存键，便于快速定位缓存命中情况。
+- **JSONL 摘要**（流水线）
+  - 行内包含与 CSV 相同的字段，便于流式处理。
+  - 若启用 exact/spectral 双开关，JSONL 中会包含两种模式的对照（精确值为 baseline）。
+- **日志**
+  - 统一通过 `rules.logging_setup.setup_logging` 控制，CLI 默认 INFO 级别。
+  - 运行中会输出对称模式、缓存命中率、行枚举规模、估计采样数、边界模式等关键信息。
+
+### 可视化与数据诊断示例
+```bash
+# 仅绘制 perm 对称模式的 GA 与阶段一结果，并输出三张图至 out_fig/
+python - <<'PY'
+from pathlib import Path
+from rules import viz
+
+csvs = sorted(str(p) for p in Path('out_csv').glob('pareto_front_*.csv'))
+viz.plot_all(csvs, n=2, k=2, out_dir='out_fig', sym_filter='perm')
+print(viz.summarize_runs(csvs, sym_filter='perm'))
+PY
+```
 
 ---
 
@@ -124,6 +173,13 @@
 ---
 
 ## 7. 实验复现与快速上手
+
+### 调用方式索引
+- **最小样例/教学演示**：`scripts/run_stage1.py`（或安装后 `rules-stage1`），走精确枚举路径，便于理解规则-图案映射。
+- **批量评估 / 研究复现**：`scripts/run_pipeline.py`（或安装后 `rules-pipeline`），统一支持对称性、边界、精确/谱估计双开关与缓存，是推荐入口。
+- **多目标遗传搜索**：`scripts/run_ga.py`（或安装后 `rules-run-ga`），适合同时探索多个 $(n,k)$ 组合的帕累托前沿。
+- **可视化与 knee 点分析**：`rules.viz.plot_pareto_from_csv` / `detect_knee`，可在 GA 输出或自定义 CSV 上复用。
+- **API 复用**：直接调用 `evaluate_rules_batch`、`make_rule_matrix`、`bits_from_rule` 等函数，灵活嵌入其他优化器或实验框架。
 
 ### 环境安装
 ```bash
@@ -222,6 +278,22 @@ python scripts/run_pipeline.py --config config.yml --run-tag demo --out-dir ./pi
 - `summary.csv` / `summary.jsonl`：包含规则位串（raw/canon）、精确计数 `exact_Z`、行数 `rows_m`、谱估计核心字段 (`sum_lambda_powers`、`lambda_max`、上下界等)、缓存键 `cache_key`、日志备注。
 - `cache/`：按规则 + 边界生成的精确计数 JSON 缓存，便于二次复用；谱估计结果复用 `rules.eval` 内置缓存（`RULES_EVAL_CACHE` 或 `--cache-dir`）。
 - 进度条：默认使用 `tqdm`，如未安装则每隔 `--heartbeat` 秒打印一次进度日志。
+
+### CLI 快速参考（安装后）
+通过 `pip install -e .` 安装后会暴露以下命令行工具（对应 `pyproject.toml` 的 `project.scripts`）：
+- `rules-run-ga` / `rules-stage1` → 统一 CLI `scripts/rd_cli.py`，包含穷举 `stage1`、GA 搜索、可视化、motif 分析、对称性扫描等子命令。
+- `rules-pipeline` → 统一流水线 `scripts/run_pipeline.py`，支持配置文件 + CLI 覆盖。
+
+示例：
+```bash
+# 小规模快速验证：仅走精确路径，结果写入 ./pipeline_out/unit
+rules-pipeline --n 2 --k 2 --rule-bits 111 --no-spectral --run-tag unit \
+  --out-dir ./pipeline_out --cache-dir ./pipeline_out/cache
+```
+
+### 测试与质量检查
+- 运行全量测试：`pytest`
+- 新增了流水线 CLI 的单测，覆盖规则解析（位串 / 边集合）与“仅精确计算”分支的落盘行为，便于回归验证工程化接口。
 
 ---
 
