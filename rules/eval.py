@@ -406,6 +406,22 @@ def estimate_trace_T_power_hutchpp(op, n_power: int, s: int = 32, seed: int = 0)
 # 结构性指标
 # ------------------------------
 
+def _clustering_coeff(G: np.ndarray) -> float:
+    """平均聚类系数（逐点邻接子图三角率均值）。"""
+    k = G.shape[0]
+    cvals = []
+    for u in range(k):
+        nbr = np.flatnonzero(G[u])
+        d = len(nbr)
+        if d < 2:
+            cvals.append(0.0)
+            continue
+        sub = G[np.ix_(nbr, nbr)]
+        e = np.triu(sub, 1).sum()
+        cvals.append(2.0 * e / (d * (d - 1)))
+    return float(np.mean(cvals)) if cvals else 0.0
+
+
 def _graph_degrees_and_components(R_np: np.ndarray) -> Tuple[np.ndarray, int]:
     k = R_np.shape[0]
     deg = R_np.sum(axis=1).astype(int)  # 自环计度
@@ -426,6 +442,63 @@ def _graph_degrees_and_components(R_np: np.ndarray) -> Tuple[np.ndarray, int]:
                         visited[v] = True
                         stack.append(v)
     return deg, comps
+
+
+def _graph_spectral_metrics(R_np: np.ndarray) -> Dict:
+    """
+    构造无向图的谱指标：度矩阵、拉普拉斯（标准/归一化）、
+    邻接谱间隙与代数连通度、聚类系数。
+    自环从图中移除，仅计入度矩阵的对角。
+    """
+    k = R_np.shape[0]
+    G = R_np.astype(float)
+    np.fill_diagonal(G, 0.0)
+
+    deg = G.sum(axis=1)
+    D = np.diag(deg)
+    L = D - G
+    if k == 0:
+        return {
+            "degree_sequence": [],
+            "degree_matrix": [],
+            "laplacian": [],
+            "laplacian_norm": [],
+            "laplacian_alg_conn": 0.0,
+            "laplacian_alg_conn_norm": 0.0,
+            "adj_lambda1": 0.0,
+            "adj_lambda2": 0.0,
+            "adj_spectral_gap": 0.0,
+            "clustering_coeff": 0.0,
+        }
+
+    adj_eigs = np.linalg.eigvalsh(G)
+    adj_lambda1 = float(adj_eigs[-1]) if adj_eigs.size > 0 else 0.0
+    adj_lambda2 = float(adj_eigs[-2]) if adj_eigs.size >= 2 else 0.0
+    adj_gap = adj_lambda1 - adj_lambda2
+
+    lap_eigs = np.linalg.eigvalsh(L)
+    laplacian_alg_conn = float(np.sort(lap_eigs)[1]) if lap_eigs.size >= 2 else 0.0
+
+    sqrt_deg = np.sqrt(deg)
+    inv_sqrt = np.where(sqrt_deg > 0, 1.0 / sqrt_deg, 0.0)
+    L_norm = np.eye(k) - (inv_sqrt[:, None] * G * inv_sqrt[None, :])
+    lap_norm_eigs = np.linalg.eigvalsh(L_norm)
+    laplacian_alg_conn_norm = float(np.sort(lap_norm_eigs)[1]) if lap_norm_eigs.size >= 2 else 0.0
+
+    clustering = _clustering_coeff(G.astype(bool))
+
+    return {
+        "degree_sequence": deg.astype(float).tolist(),
+        "degree_matrix": D.astype(float).tolist(),
+        "laplacian": L.astype(float).tolist(),
+        "laplacian_norm": L_norm.astype(float).tolist(),
+        "laplacian_alg_conn": laplacian_alg_conn,
+        "laplacian_alg_conn_norm": laplacian_alg_conn_norm,
+        "adj_lambda1": adj_lambda1,
+        "adj_lambda2": adj_lambda2,
+        "adj_spectral_gap": adj_gap,
+        "clustering_coeff": clustering,
+    }
 
 # ------------------------------
 # LRU 行缓存
@@ -509,6 +582,7 @@ def evaluate_rules_batch(n: int,
             SMALL_NK = (n <= 4 and k_sym <= 3)
             R = rule_from_bits(k_sym, bits_sym)
             deg, comps = _graph_degrees_and_components(R)
+            graph_stats = _graph_spectral_metrics(R)
 
             rows = enumerate_ring_rows_fast(n, k_sym, R)
             m = int(rows.shape[0])
@@ -531,7 +605,9 @@ def evaluate_rules_batch(n: int,
                     "lower_bound": 0.0, "upper_bound": 0.0,
                     "lower_bound_raw": 0.0, "upper_bound_raw": 0.0,
                     "upper_bound_raw_gersh": 0.0, "upper_bound_raw_maxdeg": 0.0,
+                    "archetype_hits": {},
                     "archetype_tags": "",
+                    **graph_stats,
                 })
                 continue
 
@@ -590,8 +666,10 @@ def evaluate_rules_batch(n: int,
                 from .structures import recognize_archetypes
                 arc = recognize_archetypes(bits)
                 archetype_tags = ";".join([kk for kk,v in arc.items() if v])
+                archetype_hits = {k: bool(v) for k, v in arc.items()}
             except Exception:
                 archetype_tags = ""
+                archetype_hits = {}
 
             fit = {
                 "rule_count": int(bits.sum()),
@@ -609,7 +687,9 @@ def evaluate_rules_batch(n: int,
                 "lower_bound": lb, "upper_bound": ub,
                 "lower_bound_raw": lb_raw, "upper_bound_raw": ub_raw,
                 "upper_bound_raw_gersh": ub_raw_gersh, "upper_bound_raw_maxdeg": ub_raw_maxdeg,
+                "archetype_hits": archetype_hits,
                 "archetype_tags": archetype_tags,
+                **graph_stats,
             }
 
             # 小规模精确计数
@@ -635,6 +715,7 @@ def evaluate_rules_batch(n: int,
         key = (sym_mode + "|").encode("utf-8") + bits_sym.tobytes()
         R = rule_from_bits(k_sym, bits_sym)
         deg, comps = _graph_degrees_and_components(R)
+        graph_stats = _graph_spectral_metrics(R)
 
         rows = rows_lru.get(key)
         if rows is None:
@@ -661,7 +742,9 @@ def evaluate_rules_batch(n: int,
                 "lower_bound": 0.0, "upper_bound": 0.0,
                 "lower_bound_raw": 0.0, "upper_bound_raw": 0.0,
                 "upper_bound_raw_gersh": 0.0, "upper_bound_raw_maxdeg": 0.0,
+                "archetype_hits": {},
                 "archetype_tags": "",
+                **graph_stats,
             }
             continue
 
@@ -720,8 +803,10 @@ def evaluate_rules_batch(n: int,
                 from .structures import recognize_archetypes
                 arc = recognize_archetypes(bits)
                 archetype_tags = ";".join([kk for kk,v in arc.items() if v])
+                archetype_hits = {k: bool(v) for k, v in arc.items()}
             except Exception:
                 archetype_tags = ""
+                archetype_hits = {}
 
             fit = {
                 "rule_count": int(bits.sum()),
@@ -739,7 +824,9 @@ def evaluate_rules_batch(n: int,
                 "lower_bound": lb, "upper_bound": ub,
                 "lower_bound_raw": lb_raw, "upper_bound_raw": ub_raw,
                 "upper_bound_raw_gersh": ub_raw_gersh, "upper_bound_raw_maxdeg": ub_raw_maxdeg,
+                "archetype_hits": archetype_hits,
                 "archetype_tags": archetype_tags,
+                **graph_stats,
             }
 
             if SMALL_NK:
