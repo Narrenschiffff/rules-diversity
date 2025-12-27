@@ -393,19 +393,93 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                 miss_bits.append(bb)
                 miss_pos.append(i)
         if miss_bits:
-            outs = evaluate_rules_batch(n, k, miss_bits,
-                                        sym_mode=sym_mode,
-                                        boundary=boundary,
-                                        device=device, use_lanczos=use_lanczos,
-                                        r_vals=r_vals, power_iters=power_iters,
-                                        trace_mode=trace_mode, hutch_s=hutch_s,
-                                        lru_rows=rows_lru, max_streams=max_streams,
-                                        enable_exact=enable_exact,
-                                        enable_spectral=enable_spectral,
-                                        exact_threshold=exact_threshold,
-                                        cache_dir=cache_dir,
-                                        use_cache=use_cache)
+            # 先试主设备（如 CUDA），失败时重试一次主设备，最后才回退 CPU，尽量保持 GPU 路径以提高吞吐。
+            try:
+                outs = evaluate_rules_batch(n, k, miss_bits,
+                                            sym_mode=sym_mode,
+                                            boundary=boundary,
+                                            device=device, use_lanczos=use_lanczos,
+                                            r_vals=r_vals, power_iters=power_iters,
+                                            trace_mode=trace_mode, hutch_s=hutch_s,
+                                            lru_rows=rows_lru, max_streams=max_streams,
+                                            enable_exact=enable_exact,
+                                            enable_spectral=enable_spectral,
+                                            exact_threshold=exact_threshold,
+                                            cache_dir=cache_dir,
+                                            use_cache=use_cache)
+            except Exception:
+                outs = None
+                if device == "cuda":
+                    logger.warning("evaluate_rules_batch failed on CUDA; retrying on CUDA once", exc_info=True)
+                    try:
+                        outs = evaluate_rules_batch(n, k, miss_bits,
+                                                    sym_mode=sym_mode,
+                                                    boundary=boundary,
+                                                    device=device, use_lanczos=use_lanczos,
+                                                    r_vals=r_vals, power_iters=power_iters,
+                                                    trace_mode=trace_mode, hutch_s=hutch_s,
+                                                    lru_rows=rows_lru, max_streams=max_streams,
+                                                    enable_exact=enable_exact,
+                                                    enable_spectral=enable_spectral,
+                                                    exact_threshold=exact_threshold,
+                                                    cache_dir=cache_dir,
+                                                    use_cache=use_cache)
+                    except Exception:
+                        logger.warning("second CUDA attempt failed; fallback to CPU", exc_info=True)
+                if outs is None:
+                    outs = evaluate_rules_batch(n, k, miss_bits,
+                                                sym_mode=sym_mode,
+                                                boundary=boundary,
+                                                device="cpu", use_lanczos=use_lanczos,
+                                                r_vals=r_vals, power_iters=power_iters,
+                                                trace_mode=trace_mode, hutch_s=hutch_s,
+                                                lru_rows=rows_lru, max_streams=max_streams,
+                                                enable_exact=enable_exact,
+                                                enable_spectral=enable_spectral,
+                                                exact_threshold=exact_threshold,
+                                                cache_dir=cache_dir,
+                                                use_cache=use_cache)
             for pos, fit in zip(miss_pos, outs):
+                key = keys[pos]
+                cache[key] = fit; results[pos] = fit
+
+        # CUDA 在少量环境下可能返回 None（如内核异常）。先尝试再跑一次 CUDA，仍为 None 时才回退 CPU。
+        if any(r is None for r in results):
+            retry_bits = [bits_batch[i] for i, r in enumerate(results) if r is None]
+            retry_pos  = [i for i, r in enumerate(results) if r is None]
+            outs = None
+            if device == "cuda":
+                logger.warning("found None fits on CUDA; retrying those on CUDA")
+                try:
+                    outs = evaluate_rules_batch(n, k, retry_bits,
+                                                sym_mode=sym_mode,
+                                                boundary=boundary,
+                                                device=device, use_lanczos=use_lanczos,
+                                                r_vals=r_vals, power_iters=power_iters,
+                                                trace_mode=trace_mode, hutch_s=hutch_s,
+                                                lru_rows=rows_lru, max_streams=max_streams,
+                                                enable_exact=enable_exact,
+                                                enable_spectral=enable_spectral,
+                                                exact_threshold=exact_threshold,
+                                                cache_dir=cache_dir,
+                                                use_cache=use_cache)
+                except Exception:
+                    logger.warning("CUDA retry for None fits failed; fallback to CPU", exc_info=True)
+            if outs is None:
+                logger.warning("fallback CPU eval for %d None fits", len(retry_bits))
+                outs = evaluate_rules_batch(n, k, retry_bits,
+                                            sym_mode=sym_mode,
+                                            boundary=boundary,
+                                            device="cpu", use_lanczos=use_lanczos,
+                                            r_vals=r_vals, power_iters=power_iters,
+                                            trace_mode=trace_mode, hutch_s=hutch_s,
+                                            lru_rows=rows_lru, max_streams=max_streams,
+                                            enable_exact=enable_exact,
+                                            enable_spectral=enable_spectral,
+                                            exact_threshold=exact_threshold,
+                                            cache_dir=cache_dir,
+                                            use_cache=use_cache)
+            for pos, fit in zip(retry_pos, outs):
                 key = keys[pos]
                 cache[key] = fit; results[pos] = fit
         if enable_exact and enable_spectral:
