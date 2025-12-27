@@ -14,7 +14,7 @@ rules/eval.py
 依赖：numpy, torch, matplotlib（仅个别函数用, 不在此文件画图）
 """
 
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Union
 from pathlib import Path
 import math
 import itertools
@@ -641,7 +641,7 @@ def evaluate_rules_batch(n: int,
                          enable_exact: bool = True,
                          enable_spectral: bool = True,
                          exact_threshold="nk<=12",
-                         cache_dir: Optional[str | Path] = None,
+                         cache_dir: Optional[Union[str, Path]] = None,
                          use_cache: bool = True,
                          ) -> List[Dict]:
     """
