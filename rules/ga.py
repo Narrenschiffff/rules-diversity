@@ -135,6 +135,13 @@ def _remap_bits(bits: np.ndarray, k: int, order: List[int]) -> np.ndarray:
     P = R[np.ix_(order, order)]
     return bits_from_rule(P)
 
+def _infer_k_from_bits(bits: np.ndarray) -> int:
+    """Infer k from symmetric bit-length L = k + k*(k-1)/2."""
+    L = int(bits.size)
+    disc = 1 + 8 * L
+    k = int((disc ** 0.5 - 1) // 2)
+    return k
+
 # ---------- variation operators (with alignment) ----------
 def mutate(bits: np.ndarray, p_mut: float, k: int) -> np.ndarray:
     m = bits.copy()
@@ -143,16 +150,20 @@ def mutate(bits: np.ndarray, p_mut: float, k: int) -> np.ndarray:
     return _ensure_minimal_feasible(m, k)
 
 def crossover_aligned(a: np.ndarray, b: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    """均匀交叉，兼容 perm+swap 压缩后的 k_sym（自动从位长反推 k）。"""
+    k_a = _infer_k_from_bits(a); k_b = _infer_k_from_bits(b)
+    k_use = k_a if k_a == k_b else min(k_a, k_b, k)
+
     # 构造两亲本共同的稳定顺序，再做均匀交叉（更保留块结构）
-    Ra = rule_from_bits(k, a); Rb = rule_from_bits(k, b)
-    order = _stable_node_order(Ra)  # 用 A 的顺序即可（经验足够）
-    aa = _remap_bits(a, k, order); bb = _remap_bits(b, k, order)
+    Ra = rule_from_bits(k_use, a); Rb = rule_from_bits(k_use, b)
+    order = _stable_node_order(Ra)  # 用 A 的顺序即可
+    aa = _remap_bits(a, k_use, order); bb = _remap_bits(b, k_use, order)
     L = aa.size
     mask = np.random.rand(L) < 0.5
     c1 = np.where(mask, aa, bb).astype(np.uint8)
     c2 = np.where(mask, bb, aa).astype(np.uint8)
-    c1 = canonical_bits(c1, k); c2 = canonical_bits(c2, k)
-    c1 = _ensure_minimal_feasible(c1, k); c2 = _ensure_minimal_feasible(c2, k)
+    c1 = canonical_bits(c1, k_use); c2 = canonical_bits(c2, k_use)
+    c1 = _ensure_minimal_feasible(c1, k_use); c2 = _ensure_minimal_feasible(c2, k_use)
     return c1, c2
 
 def init_population(k: int, pop_size: int, bias_sparse: bool = True) -> List[np.ndarray]:
