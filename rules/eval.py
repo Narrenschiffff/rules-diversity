@@ -178,6 +178,7 @@ def enumerate_ring_rows_fast(n: int, k: int, R: np.ndarray,
     if boundary not in {"torus", "open"}:
         raise ValueError(f"boundary={boundary} not supported")
     assert k <= 16, "enumerate_ring_rows_fast: current implementation assumes k ≤ 16."
+
     allowed_next = np.zeros(k, dtype=np.uint32)
     for c in range(k):
         mask = 0
@@ -186,6 +187,10 @@ def enumerate_ring_rows_fast(n: int, k: int, R: np.ndarray,
             if row[d]:
                 mask |= (1 << d)
         allowed_next[c] = np.uint32(mask)
+
+    if boundary == "open":
+        return _enumerate_ring_rows_fast_open(n, k, allowed_next, batch_limit=batch_limit)
+
     allowed_prev = np.zeros(k, dtype=np.uint32)
     for d in range(k):
         mask = 0
@@ -194,7 +199,16 @@ def enumerate_ring_rows_fast(n: int, k: int, R: np.ndarray,
             if col[c]:
                 mask |= (1 << c)
         allowed_prev[d] = np.uint32(mask)
+    return _enumerate_ring_rows_fast_torus(
+        n=n,
+        k=k,
+        allowed_next=allowed_next,
+        allowed_prev=allowed_prev,
+        batch_limit=batch_limit,
+    )
 
+
+def _enumerate_ring_rows_fast_open(n: int, k: int, allowed_next: np.ndarray, batch_limit: int = 200_000) -> np.ndarray:
     out_chunks: List[np.ndarray] = []
     cur_batch: List[List[int]] = []
 
@@ -202,24 +216,69 @@ def enumerate_ring_rows_fast(n: int, k: int, R: np.ndarray,
         nonlocal cur_batch
         if not cur_batch:
             return
-        arr = np.array(cur_batch, dtype=np.int16)
-        out_chunks.append(arr)
+        out_chunks.append(np.array(cur_batch, dtype=np.int16))
         cur_batch = []
+
+    path = np.empty(n, dtype=np.int16)
+
+    def dfs_build(col: int, last_c: int):
+        nonlocal cur_batch
+        if col == n:
+            cur_batch.append(path.copy().tolist())
+            if len(cur_batch) >= batch_limit:
+                flush_batch()
+            return
+        mask = int(allowed_next[last_c])
+        while mask:
+            lsb = mask & -mask
+            nxt = (lsb.bit_length() - 1)
+            path[col] = nxt
+            dfs_build(col + 1, nxt)
+            mask ^= lsb
+
+    for s in range(k):
+        path[0] = s
+        if n == 1:
+            cur_batch.append([s])
+            continue
+        mask2 = int(allowed_next[s])
+        while mask2:
+            lsb = mask2 & -mask2
+            c2 = (lsb.bit_length() - 1)
+            path[1] = c2
+            dfs_build(col=2, last_c=c2)
+            mask2 ^= lsb
+
+    flush_batch()
+    if not out_chunks:
+        return np.empty((0, n), dtype=np.int16)
+    return np.vstack(out_chunks)
+
+
+def _enumerate_ring_rows_fast_torus(n: int, k: int, allowed_next: np.ndarray, allowed_prev: np.ndarray,
+                                    batch_limit: int = 200_000) -> np.ndarray:
+    out_chunks: List[np.ndarray] = []
+    cur_batch: List[List[int]] = []
+
+    def flush_batch():
+        nonlocal cur_batch
+        if cur_batch:
+            out_chunks.append(np.array(cur_batch, dtype=np.int16))
+            cur_batch = []
 
     path = np.empty(n, dtype=np.int16)
 
     def dfs_build(col: int, last_c: int, first_c: int):
         nonlocal cur_batch
         if col == n:
-            if boundary == "torus":
-                if ((int(allowed_next[last_c]) >> first_c) & 1) == 0:
-                    return
+            if ((int(allowed_next[last_c]) >> first_c) & 1) == 0:
+                return
             cur_batch.append(path.copy().tolist())
             if len(cur_batch) >= batch_limit:
                 flush_batch()
             return
         mask = int(allowed_next[last_c])
-        if boundary == "torus" and col == n - 1:
+        if col == n - 1:
             mask &= ((1 << first_c) | int(allowed_prev[first_c]))
         while mask:
             lsb = mask & -mask
@@ -231,10 +290,7 @@ def enumerate_ring_rows_fast(n: int, k: int, R: np.ndarray,
     for s in range(k):
         path[0] = s
         if n == 1:
-            if boundary == "torus":
-                if ((int(allowed_next[s]) >> s) & 1) != 0:
-                    cur_batch.append([s])
-            else:
+            if ((int(allowed_next[s]) >> s) & 1) != 0:
                 cur_batch.append([s])
             continue
         mask2 = int(allowed_next[s])
@@ -246,9 +302,43 @@ def enumerate_ring_rows_fast(n: int, k: int, R: np.ndarray,
             mask2 ^= lsb
 
     flush_batch()
-    if not out_chunks:
-        return np.empty((0, n), dtype=np.int16)
-    return np.vstack(out_chunks)
+    return np.empty((0, n), dtype=np.int16) if not out_chunks else np.vstack(out_chunks)
+
+
+def _build_transfer_sparse(rows_np: np.ndarray, R_np: np.ndarray, dtype: torch.dtype, device: torch.device,
+                           block_size_i: int, block_size_j: int, max_nnz: Optional[int] = None) -> Optional[torch.Tensor]:
+    m, n = rows_np.shape
+    rows_idx_parts: List[np.ndarray] = []
+    cols_idx_parts: List[np.ndarray] = []
+
+    for i0 in range(0, m, block_size_i):
+        i1 = min(i0 + block_size_i, m)
+        aL = rows_np[i0:i1, :]
+        for j0 in range(0, m, block_size_j):
+            j1 = min(j0 + block_size_j, m)
+            bL = rows_np[j0:j1, :]
+            comp = np.ones((i1 - i0, j1 - j0), dtype=bool)
+            for c in range(n):
+                comp &= R_np[aL[:, c][:, None], bL[:, c][None, :]]
+                if not comp.any():
+                    break
+            if comp.any():
+                ai, aj = np.nonzero(comp)
+                rows_idx_parts.append(ai.astype(np.int64) + i0)
+                cols_idx_parts.append(aj.astype(np.int64) + j0)
+
+    if not rows_idx_parts:
+        return None
+
+    rows_idx = np.concatenate(rows_idx_parts)
+    cols_idx = np.concatenate(cols_idx_parts)
+    if max_nnz is not None and rows_idx.size > max_nnz:
+        return None
+
+    values = torch.ones(rows_idx.size, dtype=dtype, device=device)
+    indices = torch.stack([torch.from_numpy(rows_idx).to(device), torch.from_numpy(cols_idx).to(device)], dim=0)
+    sp = torch.sparse_coo_tensor(indices, values, size=(m, m), dtype=dtype, device=device)
+    return sp.coalesce()
 
 # ------------------------------
 # TransferOp（不显式构造 T）
@@ -257,7 +347,10 @@ def enumerate_ring_rows_fast(n: int, k: int, R: np.ndarray,
 class TransferOp:
     def __init__(self, rows_np: np.ndarray, R_np: np.ndarray,
                  device: str = "cuda", dtype: torch.dtype = torch.float64,
-                 block_size_j: Optional[int] = None, block_size_i: Optional[int] = None):
+                 block_size_j: Optional[int] = None, block_size_i: Optional[int] = None,
+                 build_sparse: bool = False, build_sparse_max_nnz: int = 5_000_000):
+        rows_np = np.asarray(rows_np, dtype=np.int64)
+        R_np = np.asarray(R_np, dtype=bool)
         self.device = torch.device(device)
         self.dtype = dtype
         self.rows = torch.from_numpy(rows_np.astype(np.int64)).to(self.device)  # (m,n)
@@ -273,6 +366,17 @@ class TransferOp:
             block_size_i = min(block_size_i, 1024)
         self.block_size_i = int(block_size_i)
         self.block_size_j = int(block_size_j)
+        self.transfer_sparse: Optional[torch.Tensor] = None
+        if build_sparse and self.m > 0:
+            self.transfer_sparse = _build_transfer_sparse(
+                rows_np=rows_np,
+                R_np=R_np,
+                dtype=self.dtype,
+                device=self.device,
+                block_size_i=self.block_size_i,
+                block_size_j=self.block_size_j,
+                max_nnz=build_sparse_max_nnz,
+            )
 
     @torch.no_grad()
     def matvec(self, x: torch.Tensor) -> torch.Tensor:
@@ -280,6 +384,10 @@ class TransferOp:
         rows = self.rows
         R = self.R
         m, n = self.m, self.n
+        if self.transfer_sparse is not None:
+            y_sp = torch.sparse.mm(self.transfer_sparse, x.to(self.dtype).view(-1, 1))
+            return y_sp.view(-1)
+
         y = torch.zeros_like(x, dtype=self.dtype, device=self.device)
 
         for i0 in range(0, m, self.block_size_i):
@@ -767,7 +875,14 @@ def evaluate_rules_batch(n: int,
             sum_lp = -1e300
 
             if spectral_allowed:
-                op = TransferOp(rows, R, device="cpu", dtype=torch.float64, block_size_j=2048)
+                op = TransferOp(
+                    rows,
+                    R,
+                    device="cpu",
+                    dtype=torch.float64,
+                    block_size_j=2048,
+                    build_sparse=(boundary == "open"),
+                )
 
                 if use_lanczos:
                     evals = lanczos_top_r(op, r=r_vals, iters=max(2*r_vals, 20), seed=idx, verbose=False)
@@ -983,7 +1098,14 @@ def evaluate_rules_batch(n: int,
 
         if spectral_allowed:
             with torch.cuda.stream(st):
-                op = TransferOp(rows, R, device=device, dtype=torch.float64, block_size_j=4096)
+                op = TransferOp(
+                    rows,
+                    R,
+                    device=device,
+                    dtype=torch.float64,
+                    block_size_j=4096,
+                    build_sparse=(boundary == "open"),
+                )
 
                 if use_lanczos:
                     evals = lanczos_top_r(op, r=r_vals, iters=max(2*r_vals, 20), seed=idx, verbose=False)

@@ -23,6 +23,7 @@ __all__ = [
     "neighbors_grid",
     "count_patterns_backtrack",
     "enumerate_ring_rows",
+    "enumerate_ring_rows_fast",
     "build_row_compat_matrix",
     "count_patterns_transfer_matrix",
     "cross_check",
@@ -141,6 +142,99 @@ def enumerate_ring_rows(n, k, R, boundary: str = "torus"):
                 seq[pos]=v; dfs(pos+1); seq[pos]=-1
     dfs(0); return rows
 
+
+def enumerate_ring_rows_fast(n: int, k: int, R: np.ndarray, boundary: str = "torus"):
+    if boundary not in {"torus", "open"}:
+        raise ValueError(f"unknown boundary={boundary}")
+    if k > 16:
+        return enumerate_ring_rows(n, k, R, boundary=boundary)
+
+    allowed_next = np.zeros(k, dtype=np.uint32)
+    for c in range(k):
+        mask = 0
+        row = R[c]
+        for d in range(k):
+            if row[d]:
+                mask |= (1 << d)
+        allowed_next[c] = np.uint32(mask)
+
+    if boundary == "open":
+        return _enumerate_ring_rows_fast_open(n, k, allowed_next)
+    allowed_prev = np.zeros(k, dtype=np.uint32)
+    for d in range(k):
+        mask = 0
+        col = R[:, d]
+        for c in range(k):
+            if col[c]:
+                mask |= (1 << c)
+        allowed_prev[d] = np.uint32(mask)
+    return _enumerate_ring_rows_fast_torus(n, k, allowed_next, allowed_prev)
+
+
+def _enumerate_ring_rows_fast_open(n: int, k: int, allowed_next: np.ndarray):
+    path = np.empty(n, dtype=np.int16)
+    out: List[List[int]] = []
+
+    def dfs_build(col: int, last_c: int):
+        if col == n:
+            out.append(path.copy().tolist())
+            return
+        mask = int(allowed_next[last_c])
+        while mask:
+            lsb = mask & -mask
+            nxt = (lsb.bit_length() - 1)
+            path[col] = nxt
+            dfs_build(col + 1, nxt)
+            mask ^= lsb
+
+    for s in range(k):
+        path[0] = s
+        if n == 1:
+            out.append([s]); continue
+        mask2 = int(allowed_next[s])
+        while mask2:
+            lsb = mask2 & -mask2
+            c2 = (lsb.bit_length() - 1)
+            path[1] = c2
+            dfs_build(2, c2)
+            mask2 ^= lsb
+    return out
+
+
+def _enumerate_ring_rows_fast_torus(n: int, k: int, allowed_next: np.ndarray, allowed_prev: np.ndarray):
+    path = np.empty(n, dtype=np.int16)
+    out: List[List[int]] = []
+
+    def dfs_build(col: int, last_c: int, first_c: int):
+        if col == n:
+            if ((int(allowed_next[last_c]) >> first_c) & 1) != 0:
+                out.append(path.copy().tolist())
+            return
+        mask = int(allowed_next[last_c])
+        if col == n - 1:
+            mask &= ((1 << first_c) | int(allowed_prev[first_c]))
+        while mask:
+            lsb = mask & -mask
+            nxt = (lsb.bit_length() - 1)
+            path[col] = nxt
+            dfs_build(col + 1, nxt, first_c)
+            mask ^= lsb
+
+    for s in range(k):
+        path[0] = s
+        if n == 1:
+            if ((int(allowed_next[s]) >> s) & 1) != 0:
+                out.append([s])
+            continue
+        mask2 = int(allowed_next[s])
+        while mask2:
+            lsb = mask2 & -mask2
+            c2 = (lsb.bit_length() - 1)
+            path[1] = c2
+            dfs_build(2, c2, s)
+            mask2 ^= lsb
+    return out
+
 def build_row_compat_matrix(rows, R):
     m = len(rows); T = np.zeros((m, m), dtype=np.int64)
     for i,a in enumerate(rows):
@@ -152,7 +246,10 @@ def build_row_compat_matrix(rows, R):
     return T
 
 def count_patterns_transfer_matrix(n, k, R, boundary: str = "torus", return_rows=False):
-    rows = enumerate_ring_rows(n, k, R, boundary=boundary)
+    if k <= 16:
+        rows = enumerate_ring_rows_fast(n, k, R, boundary=boundary)
+    else:
+        rows = enumerate_ring_rows(n, k, R, boundary=boundary)
     T = build_row_compat_matrix(rows, R)
     if boundary == "torus":
         M = np.array(T, dtype=object)
