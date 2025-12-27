@@ -10,6 +10,9 @@ Usage (from repo root):
 You can override ranges, boundaries, or output root via env vars:
     N_MIN=2 N_MAX=5 BOUNDARIES=torus,open OUT_ROOT=./results python scripts/run_ga_batch.py
 
+Quick open-only sweep (smaller n/k, pure exact path):
+    BOUNDARIES=open N_MAX=3 GA_GENS=8 GA_POP=64 python scripts/run_ga_batch.py
+
 Notes:
 - open 边界仅走精确计数（自动禁用谱估计），默认在 CPU 上运行，结果落到 open_csv/open_csv_swap。
 - torus 边界默认优先 CUDA，失败后回退 CPU，结果落到 torus_csv/torus_csv_swap。
@@ -26,6 +29,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+GA_GENS = int(os.environ.get("GA_GENS", 16))
+GA_POP = int(os.environ.get("GA_POP", 96))
 os.environ.setdefault("PYTHONPATH", str(ROOT))
 try:
     import rules  # noqa: F401
@@ -57,7 +62,7 @@ def ga_batch(n: int, k: int, sym: str, boundary: str, out_root: Path) -> None:
     spectral_flags = "" if boundary == "torus" else "--no-spectral --no-lanczos"
     base = textwrap.dedent(
         f"""
-        python scripts/rd_cli.py ga --n {n} --k {k} --generations 16 --pop-size 96 \
+        python scripts/rd_cli.py ga --n {n} --k {k} --generations {GA_GENS} --pop-size {GA_POP} \
           --trace-mode hutchpp --r-vals 4 --hutch-s 32 {spectral_flags}\
           --sym {sym} --boundary {boundary} --device {device} \
           --out-csv {out_dir.as_posix()}
