@@ -653,6 +653,7 @@ def evaluate_rules_batch(n: int,
       - archetype_tags（若 rules.structures 存在）
       - exact_Z（启用且阈值允许时）
       - trace_exact / trace_estimate / trace_error（若同时有精确值与估计值）
+    注：boundary 支持 {"torus", "open"}；open 边界仅走精确计数（CPU），谱估计/fast evaluator 会被关闭。
     """
     PENALTY_ALPHA = 1.5
     def _adaptive_samples(m: int, base: int) -> int:
@@ -663,8 +664,10 @@ def evaluate_rules_batch(n: int,
         return base
 
     boundary = (boundary or "torus").lower()
-    if boundary not in {"torus"}:
-        raise ValueError(f"boundary={boundary} not supported in fast evaluator")
+    if boundary not in {"torus", "open"}:
+        raise ValueError(f"boundary={boundary} not supported")
+    if boundary == "open":
+        device = "cpu"  # fast evaluator (GPU + spectral) 仅支持 torus
 
     cache_root = ensure_eval_cache_dir(cache_dir) if use_cache else None
 
@@ -677,11 +680,24 @@ def evaluate_rules_batch(n: int,
             deg, comps = _graph_degrees_and_components(R)
             graph_stats = _graph_spectral_metrics(R)
 
-            rows = enumerate_ring_rows_fast(n, k_sym, R)
+            if boundary == "torus":
+                rows = enumerate_ring_rows_fast(n, k_sym, R)
+            else:
+                from .stage1_exact import enumerate_ring_rows
+                rows_list = enumerate_ring_rows(n, k_sym, R, boundary=boundary)
+                rows = np.array(rows_list, dtype=np.int16) if rows_list else np.empty((0, n), dtype=np.int16)
             m = int(rows.shape[0])
             exact_allowed, exact_reason = _should_use_exact(enable_exact, exact_threshold, n, k_sym, m)
-            spectral_allowed = enable_spectral and (m > 0)
-            spectral_reason = "" if spectral_allowed else ("rows_m=0" if m == 0 else "spectral disabled")
+            spectral_allowed = enable_spectral and (m > 0) and (boundary == "torus")
+            if spectral_allowed:
+                spectral_reason = ""
+            else:
+                if m == 0:
+                    spectral_reason = "rows_m=0"
+                elif boundary != "torus":
+                    spectral_reason = f"boundary={boundary} not supported for spectral"
+                else:
+                    spectral_reason = "spectral disabled"
 
             active_classes = np.unique(rows) if m > 0 else np.array([], dtype=int)
             used = np.zeros(k_sym, dtype=bool)
@@ -816,7 +832,7 @@ def evaluate_rules_batch(n: int,
             if exact_allowed:
                 try:
                     from .stage1_exact import count_patterns_transfer_matrix
-                    trace_exact = float(count_patterns_transfer_matrix(n, k_sym, R, return_rows=False))
+                    trace_exact = float(count_patterns_transfer_matrix(n, k_sym, R, boundary=boundary, return_rows=False))
                 except Exception as exc:
                     exact_reason = f"exact failed: {exc.__class__.__name__}"
                     eval_notes.append(f"exact:{exact_reason}")
@@ -885,7 +901,7 @@ def evaluate_rules_batch(n: int,
 
     for idx, bits in enumerate(bits_list):
         bits_sym, k_sym, raw_to_class, class_sizes = apply_rule_symmetry(bits, k, sym_mode)
-        key = (sym_mode + "|").encode("utf-8") + bits_sym.tobytes()
+        key = (boundary + "|" + sym_mode + "|").encode("utf-8") + bits_sym.tobytes()
         R = rule_from_bits(k_sym, bits_sym)
         deg, comps = _graph_degrees_and_components(R)
         graph_stats = _graph_spectral_metrics(R)
@@ -898,8 +914,16 @@ def evaluate_rules_batch(n: int,
 
         m = int(rows.shape[0])
         exact_allowed, exact_reason = _should_use_exact(enable_exact, exact_threshold, n, k_sym, m)
-        spectral_allowed = enable_spectral and (m > 0)
-        spectral_reason = "" if spectral_allowed else ("rows_m=0" if m == 0 else "spectral disabled")
+        spectral_allowed = enable_spectral and (m > 0) and (boundary == "torus")
+        if spectral_allowed:
+            spectral_reason = ""
+        else:
+            if m == 0:
+                spectral_reason = "rows_m=0"
+            elif boundary != "torus":
+                spectral_reason = f"boundary={boundary} not supported for spectral"
+            else:
+                spectral_reason = "spectral disabled"
 
         active_classes = np.unique(rows) if m > 0 else np.array([], dtype=int)
         used = np.zeros(k_sym, dtype=bool)
@@ -1031,7 +1055,7 @@ def evaluate_rules_batch(n: int,
             if exact_allowed:
                 try:
                     from .stage1_exact import count_patterns_transfer_matrix
-                    trace_exact = float(count_patterns_transfer_matrix(n, k_sym, R, return_rows=False))
+                    trace_exact = float(count_patterns_transfer_matrix(n, k_sym, R, boundary=boundary, return_rows=False))
                 except Exception as exc:
                     exact_reason = f"exact failed: {exc.__class__.__name__}"
                     eval_notes.append(f"exact:{exact_reason}")

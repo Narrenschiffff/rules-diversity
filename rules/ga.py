@@ -350,7 +350,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
     enable_exact    = _bool_or(getattr(ga_conf, "enable_exact", True), True)
     enable_spectral = _bool_or(getattr(ga_conf, "enable_spectral", True), True)
     exact_threshold = getattr(ga_conf, "exact_threshold", "nk<=12")
-    boundary        = getattr(ga_conf, "boundary", config.BOUNDARY_MODE) or config.BOUNDARY_MODE
+    boundary        = (getattr(ga_conf, "boundary", config.BOUNDARY_MODE) or config.BOUNDARY_MODE).lower()
     cache_dir       = getattr(ga_conf, "cache_dir", config.EVAL_CACHE_DIR)
     use_cache       = _bool_or(getattr(ga_conf, "use_cache", True), True)
 
@@ -393,18 +393,36 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                 miss_bits.append(bb)
                 miss_pos.append(i)
         if miss_bits:
-            outs = evaluate_rules_batch(n, k, miss_bits,
-                                        sym_mode=sym_mode,
-                                        boundary=boundary,
-                                        device=device, use_lanczos=use_lanczos,
-                                        r_vals=r_vals, power_iters=power_iters,
-                                        trace_mode=trace_mode, hutch_s=hutch_s,
-                                        lru_rows=rows_lru, max_streams=max_streams,
-                                        enable_exact=enable_exact,
-                                        enable_spectral=enable_spectral,
-                                        exact_threshold=exact_threshold,
-                                        cache_dir=cache_dir,
-                                        use_cache=use_cache)
+            eval_kwargs = dict(
+                n=n,
+                k=k,
+                bits_list=miss_bits,
+                sym_mode=sym_mode,
+                boundary=boundary,
+                device=device,
+                use_lanczos=use_lanczos,
+                r_vals=r_vals,
+                power_iters=power_iters,
+                trace_mode=trace_mode,
+                hutch_s=hutch_s,
+                lru_rows=rows_lru,
+                max_streams=max_streams,
+                enable_exact=enable_exact,
+                enable_spectral=enable_spectral,
+                exact_threshold=exact_threshold,
+                cache_dir=cache_dir,
+                use_cache=use_cache,
+            )
+            if boundary == "open":
+                eval_kwargs.update({
+                    "device": "cpu",
+                    "enable_exact": True,
+                    "enable_spectral": False,
+                    "use_lanczos": False,
+                    "trace_mode": "hutchpp",
+                    "max_streams": 1,
+                })
+            outs = evaluate_rules_batch(**eval_kwargs)
             for pos, fit in zip(miss_pos, outs):
                 key = keys[pos]
                 cache[key] = fit; results[pos] = fit
