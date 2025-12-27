@@ -420,7 +420,7 @@ def main():
     sp.add_argument("--p-mut", type=float, default=0.08); sp.add_argument("--p-cx", type=float, default=0.85)
     sp.add_argument("--elite-keep", type=int, default=6)
     sp.add_argument("--boundary", default=_config.BOUNDARY_MODE, choices=["torus", "open"],
-                    help="网格边界条件；目前估计器仅支持 torus，参数用于缓存隔离")
+                    help="网格边界条件；torus=环面，open=开放边界（与谱/精确评估共用缓存隔离）")
     sp.add_argument("--no-lanczos", action="store_true")
     sp.add_argument("--r-vals", type=int, default=3); sp.add_argument("--power-iters", type=int, default=50)
     sp.add_argument("--trace-mode", default="hutchpp", choices=["hutchpp","hutch","lanczos_sum"])

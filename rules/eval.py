@@ -172,7 +172,11 @@ def apply_rule_symmetry(bits: np.ndarray, k: int, mode: str) -> Tuple[np.ndarray
 # ------------------------------
 
 def enumerate_ring_rows_fast(n: int, k: int, R: np.ndarray,
-                             batch_limit: int = 200_000) -> np.ndarray:
+                             batch_limit: int = 200_000,
+                             boundary: str = "torus") -> np.ndarray:
+    boundary = (boundary or "torus").lower()
+    if boundary not in {"torus", "open"}:
+        raise ValueError(f"boundary={boundary} not supported")
     assert k <= 16, "enumerate_ring_rows_fast: current implementation assumes k ≤ 16."
     allowed_next = np.zeros(k, dtype=np.uint32)
     for c in range(k):
@@ -207,13 +211,15 @@ def enumerate_ring_rows_fast(n: int, k: int, R: np.ndarray,
     def dfs_build(col: int, last_c: int, first_c: int):
         nonlocal cur_batch
         if col == n:
-            if ((int(allowed_next[last_c]) >> first_c) & 1) != 0:
-                cur_batch.append(path.copy().tolist())
-                if len(cur_batch) >= batch_limit:
-                    flush_batch()
+            if boundary == "torus":
+                if ((int(allowed_next[last_c]) >> first_c) & 1) == 0:
+                    return
+            cur_batch.append(path.copy().tolist())
+            if len(cur_batch) >= batch_limit:
+                flush_batch()
             return
         mask = int(allowed_next[last_c])
-        if col == n - 1:
+        if boundary == "torus" and col == n - 1:
             mask &= ((1 << first_c) | int(allowed_prev[first_c]))
         while mask:
             lsb = mask & -mask
@@ -225,7 +231,10 @@ def enumerate_ring_rows_fast(n: int, k: int, R: np.ndarray,
     for s in range(k):
         path[0] = s
         if n == 1:
-            if ((int(allowed_next[s]) >> s) & 1) != 0:
+            if boundary == "torus":
+                if ((int(allowed_next[s]) >> s) & 1) != 0:
+                    cur_batch.append([s])
+            else:
                 cur_batch.append([s])
             continue
         mask2 = int(allowed_next[s])
@@ -669,70 +678,7 @@ def evaluate_rules_batch(n: int,
 
     cache_root = ensure_eval_cache_dir(cache_dir) if use_cache else None
 
-    # ---------- open 边界：仅精确计数 ----------
-    if boundary == "open":
-        outs: List[Dict] = []
-        for idx, bits in enumerate(bits_list):
-            bits_sym, k_sym, raw_to_class, class_sizes = apply_rule_symmetry(bits, k, sym_mode)
-            R = rule_from_bits(k_sym, bits_sym)
-            rows = enumerate_ring_rows(n=n, k=k_sym, R=R, boundary="open")
-            m = len(rows)
-            active_classes = np.unique(rows) if m > 0 else np.array([], dtype=int)
-            used = np.zeros(k_sym, dtype=bool)
-            used[active_classes] = True
-            active_k = int(used.sum())
-            active_k_raw = int(sum(class_sizes[c] for c in active_classes)) if m > 0 else 0
-
-            cache_key = None
-            if cache_root is not None:
-                cache_key = make_eval_cache_key(bits_sym, active_k, boundary, sym_mode, n)
-                cached = load_eval_cache(cache_root, cache_key)
-                if cached is not None:
-                    outs.append(cached)
-                    continue
-
-            eval_note = ""
-            if m == 0:
-                Z_exact = 0.0
-                eval_note = "open_boundary_rows_m0"
-            else:
-                Z_exact = float(count_patterns_transfer_matrix(n=n, k=k_sym, R=R, boundary="open"))
-                eval_note = "open_boundary_exact"
-
-            fit = {
-                "rule_count": int(bits.sum()),
-                "lambda_max": 0.0,
-                "lambda_top2": (0.0, 0.0),
-                "spectral_gap": 0.0,
-                "sum_lambda_powers": Z_exact,
-                "rows_m": m,
-                "active_k": active_k,
-                "active_k_raw": active_k_raw,
-                "active_k_sym": active_k,
-                "k_raw": k,
-                "k_sym": k_sym,
-                "sym_mode": sym_mode,
-                "boundary": boundary,
-                "lower_bound": Z_exact, "upper_bound": Z_exact,
-                "lower_bound_raw": Z_exact, "upper_bound_raw": Z_exact,
-                "upper_bound_raw_gersh": Z_exact, "upper_bound_raw_maxdeg": Z_exact,
-                "archetype_hits": {}, "archetype_tags": "",
-                "trace_exact": Z_exact, "trace_estimate": Z_exact,
-                "trace_error": "", "trace_error_rel": "",
-                "eval_note": eval_note,
-            }
-            if cache_root is not None and cache_key is not None:
-                dump_eval_cache(cache_root, cache_key, fit, meta_extra={
-                    "boundary": boundary,
-                    "sym_mode": sym_mode,
-                    "active_k": active_k,
-                    "k_sym": k_sym,
-                    "n": n,
-                })
-            outs.append(fit)
-        return outs
-
-    # ---------- torus 边界：原有 CPU/GPU 分支 ----------
+    # ---------- CPU 分支 ----------
     if (device == "cpu") or (not torch.cuda.is_available()):
         outs: List[Dict] = []
         for idx, bits in enumerate(bits_list):
@@ -741,7 +687,7 @@ def evaluate_rules_batch(n: int,
             deg, comps = _graph_degrees_and_components(R)
             graph_stats = _graph_spectral_metrics(R)
 
-            rows = enumerate_ring_rows_fast(n, k_sym, R)
+            rows = enumerate_ring_rows_fast(n, k_sym, R, boundary=boundary)
             m = int(rows.shape[0])
             exact_allowed, exact_reason = _should_use_exact(enable_exact, exact_threshold, n, k_sym, m)
             spectral_allowed = enable_spectral and (m > 0)
@@ -879,7 +825,7 @@ def evaluate_rules_batch(n: int,
 
             if exact_allowed:
                 try:
-                    trace_exact = float(count_patterns_transfer_matrix(n, k_sym, R, return_rows=False))
+                    trace_exact = float(count_patterns_transfer_matrix(n, k_sym, R, boundary=boundary, return_rows=False))
                 except Exception as exc:
                     exact_reason = f"exact failed: {exc.__class__.__name__}"
                     eval_notes.append(f"exact:{exact_reason}")
@@ -948,14 +894,14 @@ def evaluate_rules_batch(n: int,
 
     for idx, bits in enumerate(bits_list):
         bits_sym, k_sym, raw_to_class, class_sizes = apply_rule_symmetry(bits, k, sym_mode)
-        key = (sym_mode + "|").encode("utf-8") + bits_sym.tobytes()
+        key = f"{sym_mode}|{boundary}|n={n}|".encode("utf-8") + bits_sym.tobytes()
         R = rule_from_bits(k_sym, bits_sym)
         deg, comps = _graph_degrees_and_components(R)
         graph_stats = _graph_spectral_metrics(R)
 
         rows = rows_lru.get(key)
         if rows is None:
-            rows = enumerate_ring_rows_fast(n, k_sym, R)
+            rows = enumerate_ring_rows_fast(n, k_sym, R, boundary=boundary)
             if rows.shape[0] > 0 and rows.shape[0] <= 1_000_000:
                 rows_lru.put(key, rows)
 
@@ -1078,82 +1024,82 @@ def evaluate_rules_batch(n: int,
         else:
             sum_lp = float(trace_exact) if trace_exact is not None else -1e300
 
-            ub_rhos = _upper_bound_raw(R, n)
-            ub_raw_gersh = float(m) * (ub_rhos["rho_gersh"] ** n)
-            ub_raw_maxdeg = float(m) * (ub_rhos["rho_maxdeg"] ** n)
+        ub_rhos = _upper_bound_raw(R, n)
+        ub_raw_gersh = float(m) * (ub_rhos["rho_gersh"] ** n)
+        ub_raw_maxdeg = float(m) * (ub_rhos["rho_maxdeg"] ** n)
 
+        try:
+            from .structures import recognize_archetypes
+            arc = recognize_archetypes(bits)
+            archetype_tags = ";".join([kk for kk,v in arc.items() if v])
+            archetype_hits = {k: bool(v) for k, v in arc.items()}
+        except Exception:
+            archetype_tags = ""
+            archetype_hits = {}
+
+        if exact_allowed:
             try:
-                from .structures import recognize_archetypes
-                arc = recognize_archetypes(bits)
-                archetype_tags = ";".join([kk for kk,v in arc.items() if v])
-                archetype_hits = {k: bool(v) for k, v in arc.items()}
-            except Exception:
-                archetype_tags = ""
-                archetype_hits = {}
+                trace_exact = float(count_patterns_transfer_matrix(n, k_sym, R, boundary=boundary, return_rows=False))
+            except Exception as exc:
+                exact_reason = f"exact failed: {exc.__class__.__name__}"
+                eval_notes.append(f"exact:{exact_reason}")
+        if (not spectral_allowed) and (trace_exact is not None):
+            sum_lp = trace_exact
+            lb = lb_raw = trace_exact
+            ub = ub_raw = trace_exact
+            trace_estimate = trace_exact
 
-            if exact_allowed:
-                try:
-                    trace_exact = float(count_patterns_transfer_matrix(n, k_sym, R, return_rows=False))
-                except Exception as exc:
-                    exact_reason = f"exact failed: {exc.__class__.__name__}"
-                    eval_notes.append(f"exact:{exact_reason}")
-            if (not spectral_allowed) and (trace_exact is not None):
-                sum_lp = trace_exact
-                lb = lb_raw = trace_exact
-                ub = ub_raw = trace_exact
-                trace_estimate = trace_exact
+        if trace_estimate is None:
+            trace_estimate = sum_lp
+        if (trace_exact is not None) and (trace_estimate is not None) and np.isfinite(trace_exact) and np.isfinite(trace_estimate):
+            trace_error = trace_estimate - trace_exact
+            if trace_exact != 0:
+                trace_error_rel = trace_error / trace_exact
 
-            if trace_estimate is None:
-                trace_estimate = sum_lp
-            if (trace_exact is not None) and (trace_estimate is not None) and np.isfinite(trace_exact) and np.isfinite(trace_estimate):
-                trace_error = trace_estimate - trace_exact
-                if trace_exact != 0:
-                    trace_error_rel = trace_error / trace_exact
+        fit = {
+            "rule_count": int(bits.sum()),
+            "lambda_max": lambda1,
+            "lambda_top2": (lambda1, lambda2),
+            "spectral_gap": spectral_gap,
+            "sum_lambda_powers": sum_lp,
+            "rows_m": m,
+            "active_k": active_k,
+            "active_k_raw": active_k_raw,
+            "active_k_sym": active_k,
+            "k_raw": k,
+            "k_sym": k_sym,
+            "sym_mode": sym_mode,
+            "boundary": boundary,
+            "lower_bound": lb, "upper_bound": ub,
+            "lower_bound_raw": lb_raw, "upper_bound_raw": ub_raw,
+            "upper_bound_raw_gersh": ub_raw_gersh, "upper_bound_raw_maxdeg": ub_raw_maxdeg,
+            "archetype_hits": archetype_hits,
+            "archetype_tags": archetype_tags,
+            **graph_stats,
+        }
 
-            fit = {
-                "rule_count": int(bits.sum()),
-                "lambda_max": lambda1,
-                "lambda_top2": (lambda1, lambda2),
-                "spectral_gap": spectral_gap,
-                "sum_lambda_powers": sum_lp,
-                "rows_m": m,
-                "active_k": active_k,
-                "active_k_raw": active_k_raw,
-                "active_k_sym": active_k,
-                "k_raw": k,
-                "k_sym": k_sym,
-                "sym_mode": sym_mode,
+        if trace_exact is not None:
+            fit["exact_Z"] = int(trace_exact)
+            fit["trace_exact"] = trace_exact
+        if trace_estimate is not None:
+            fit["trace_estimate"] = trace_estimate
+        if trace_error is not None:
+            fit["trace_error"] = trace_error
+            if trace_error_rel is not None:
+                fit["trace_error_rel"] = trace_error_rel
+        if eval_notes:
+            fit["eval_note"] = "; ".join(eval_notes)
+
+        if cache_root is not None and cache_key is not None:
+            dump_eval_cache(cache_root, cache_key, fit, meta_extra={
                 "boundary": boundary,
-                "lower_bound": lb, "upper_bound": ub,
-                "lower_bound_raw": lb_raw, "upper_bound_raw": ub_raw,
-                "upper_bound_raw_gersh": ub_raw_gersh, "upper_bound_raw_maxdeg": ub_raw_maxdeg,
-                "archetype_hits": archetype_hits,
-                "archetype_tags": archetype_tags,
-                **graph_stats,
-            }
+                "sym_mode": sym_mode,
+                "active_k": active_k,
+                "k_sym": k_sym,
+                "n": n,
+            })
 
-            if trace_exact is not None:
-                fit["exact_Z"] = int(trace_exact)
-                fit["trace_exact"] = trace_exact
-            if trace_estimate is not None:
-                fit["trace_estimate"] = trace_estimate
-            if trace_error is not None:
-                fit["trace_error"] = trace_error
-                if trace_error_rel is not None:
-                    fit["trace_error_rel"] = trace_error_rel
-            if eval_notes:
-                fit["eval_note"] = "; ".join(eval_notes)
-
-            if cache_root is not None and cache_key is not None:
-                dump_eval_cache(cache_root, cache_key, fit, meta_extra={
-                    "boundary": boundary,
-                    "sym_mode": sym_mode,
-                    "active_k": active_k,
-                    "k_sym": k_sym,
-                    "n": n,
-                })
-
-            outputs[idx] = fit
+        outputs[idx] = fit
 
     torch.cuda.synchronize()
     return outputs
