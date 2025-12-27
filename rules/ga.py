@@ -419,6 +419,10 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
         results = [None]*len(bits_batch)
         miss_bits, miss_pos = [], []
         for i, bb in enumerate(bits_batch):
+            # 防御：若个体位长与目标 k 不一致（perm+swap 压缩或历史遗留），先对齐再送入对称化
+            Lk = _L_from_k(k)
+            if bb.size != Lk:
+                bb = _pad_to_len(bb, Lk)[:Lk]
             sym_b, _, _, _ = apply_rule_symmetry(bb, k, sym_mode)
             normed.append(sym_b)
             key = sym_b.tobytes()
