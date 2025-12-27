@@ -879,7 +879,6 @@ def evaluate_rules_batch(n: int,
 
             if exact_allowed:
                 try:
-                    from .stage1_exact import count_patterns_transfer_matrix
                     trace_exact = float(count_patterns_transfer_matrix(n, k_sym, R, return_rows=False))
                 except Exception as exc:
                     exact_reason = f"exact failed: {exc.__class__.__name__}"
@@ -1094,7 +1093,6 @@ def evaluate_rules_batch(n: int,
 
             if exact_allowed:
                 try:
-                    from .stage1_exact import count_patterns_transfer_matrix
                     trace_exact = float(count_patterns_transfer_matrix(n, k_sym, R, return_rows=False))
                 except Exception as exc:
                     exact_reason = f"exact failed: {exc.__class__.__name__}"
