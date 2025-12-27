@@ -414,6 +414,43 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
     rows_lru = RowsCacheLRU(capacity=lru_cap)
 
     def eval_batch(bits_batch: List[np.ndarray]):
+        boundary_mode = (boundary or "torus").lower()
+        eval_boundary = "open" if boundary_mode == "open" else boundary
+        eval_device = "cpu" if boundary_mode == "open" else device
+        eval_enable_spectral = False if boundary_mode == "open" else enable_spectral
+        eval_enable_exact = True if boundary_mode == "open" else enable_exact
+
+        def _normalize_fit_fields(fit: Dict) -> Dict:
+            f = {} if fit is None else dict(fit)
+            slp = f.get("sum_lambda_powers")
+            if slp is None or not np.isfinite(_float_or(slp, np.inf)):
+                candidates = [f.get("trace_estimate"), f.get("trace_exact")]
+                slp = -1e300
+                for c in candidates:
+                    try:
+                        val = float(c)
+                        if np.isfinite(val):
+                            slp = val
+                            break
+                    except Exception:
+                        continue
+            f["sum_lambda_powers"] = float(slp)
+
+            for key in ("lower_bound", "upper_bound", "lower_bound_raw", "upper_bound_raw", "upper_bound_raw_gersh", "upper_bound_raw_maxdeg"):
+                try:
+                    f[key] = float(f.get(key, 0.0))
+                except Exception:
+                    f[key] = 0.0
+
+            trace_exact = f.get("trace_exact")
+            f["trace_exact"] = trace_exact if trace_exact is not None else ""
+            try:
+                f["trace_estimate"] = float(f.get("trace_estimate", f["sum_lambda_powers"]))
+            except Exception:
+                f["trace_estimate"] = float(f["sum_lambda_powers"])
+            if f.get("eval_note") is None:
+                f["eval_note"] = ""
+            return f
         normed = []
         keys = []
         results = [None]*len(bits_batch)
@@ -428,7 +465,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
             key = sym_b.tobytes()
             keys.append(key)
             if key in cache:
-                results[i] = cache[key]
+                results[i] = _normalize_fit_fields(cache[key])
             else:
                 miss_bits.append(bb)
                 miss_pos.append(i)
@@ -437,30 +474,30 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
             try:
                 outs = evaluate_rules_batch(n, k, miss_bits,
                                             sym_mode=sym_mode,
-                                            boundary=boundary,
-                                            device=device, use_lanczos=use_lanczos,
+                                            boundary=eval_boundary,
+                                            device=eval_device, use_lanczos=use_lanczos,
                                             r_vals=r_vals, power_iters=power_iters,
                                             trace_mode=trace_mode, hutch_s=hutch_s,
                                             lru_rows=rows_lru, max_streams=max_streams,
-                                            enable_exact=enable_exact,
-                                            enable_spectral=enable_spectral,
+                                            enable_exact=eval_enable_exact,
+                                            enable_spectral=eval_enable_spectral,
                                             exact_threshold=exact_threshold,
                                             cache_dir=cache_dir,
                                             use_cache=use_cache)
             except Exception:
                 outs = None
-                if device == "cuda":
+                if device == "cuda" and boundary_mode != "open":
                     logger.warning("evaluate_rules_batch failed on CUDA; retrying on CUDA once", exc_info=True)
                     try:
                         outs = evaluate_rules_batch(n, k, miss_bits,
                                                     sym_mode=sym_mode,
-                                                    boundary=boundary,
+                                                    boundary=eval_boundary,
                                                     device=device, use_lanczos=use_lanczos,
                                                     r_vals=r_vals, power_iters=power_iters,
                                                     trace_mode=trace_mode, hutch_s=hutch_s,
                                                     lru_rows=rows_lru, max_streams=max_streams,
-                                                    enable_exact=enable_exact,
-                                                    enable_spectral=enable_spectral,
+                                                    enable_exact=eval_enable_exact,
+                                                    enable_spectral=eval_enable_spectral,
                                                     exact_threshold=exact_threshold,
                                                     cache_dir=cache_dir,
                                                     use_cache=use_cache)
@@ -469,37 +506,38 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                 if outs is None:
                     outs = evaluate_rules_batch(n, k, miss_bits,
                                                 sym_mode=sym_mode,
-                                                boundary=boundary,
+                                                boundary=eval_boundary,
                                                 device="cpu", use_lanczos=use_lanczos,
                                                 r_vals=r_vals, power_iters=power_iters,
                                                 trace_mode=trace_mode, hutch_s=hutch_s,
                                                 lru_rows=rows_lru, max_streams=max_streams,
-                                                enable_exact=enable_exact,
-                                                enable_spectral=enable_spectral,
+                                                enable_exact=eval_enable_exact,
+                                                enable_spectral=eval_enable_spectral,
                                                 exact_threshold=exact_threshold,
                                                 cache_dir=cache_dir,
                                                 use_cache=use_cache)
             for pos, fit in zip(miss_pos, outs):
                 key = keys[pos]
-                cache[key] = fit; results[pos] = fit
+                fit_norm = _normalize_fit_fields(fit)
+                cache[key] = fit_norm; results[pos] = fit_norm
 
         # CUDA 在少量环境下可能返回 None（如内核异常）。先尝试再跑一次 CUDA，仍为 None 时才回退 CPU。
         if any(r is None for r in results):
             retry_bits = [bits_batch[i] for i, r in enumerate(results) if r is None]
             retry_pos  = [i for i, r in enumerate(results) if r is None]
             outs = None
-            if device == "cuda":
+            if device == "cuda" and boundary_mode != "open":
                 logger.warning("found None fits on CUDA; retrying those on CUDA")
                 try:
                     outs = evaluate_rules_batch(n, k, retry_bits,
                                                 sym_mode=sym_mode,
-                                                boundary=boundary,
+                                                boundary=eval_boundary,
                                                 device=device, use_lanczos=use_lanczos,
                                                 r_vals=r_vals, power_iters=power_iters,
                                                 trace_mode=trace_mode, hutch_s=hutch_s,
                                                 lru_rows=rows_lru, max_streams=max_streams,
-                                                enable_exact=enable_exact,
-                                                enable_spectral=enable_spectral,
+                                                enable_exact=eval_enable_exact,
+                                                enable_spectral=eval_enable_spectral,
                                                 exact_threshold=exact_threshold,
                                                 cache_dir=cache_dir,
                                                 use_cache=use_cache)
@@ -509,19 +547,20 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                 logger.warning("fallback CPU eval for %d None fits", len(retry_bits))
                 outs = evaluate_rules_batch(n, k, retry_bits,
                                             sym_mode=sym_mode,
-                                            boundary=boundary,
+                                            boundary=eval_boundary,
                                             device="cpu", use_lanczos=use_lanczos,
                                             r_vals=r_vals, power_iters=power_iters,
                                             trace_mode=trace_mode, hutch_s=hutch_s,
                                             lru_rows=rows_lru, max_streams=max_streams,
-                                            enable_exact=enable_exact,
-                                            enable_spectral=enable_spectral,
+                                            enable_exact=eval_enable_exact,
+                                            enable_spectral=eval_enable_spectral,
                                             exact_threshold=exact_threshold,
                                             cache_dir=cache_dir,
                                             use_cache=use_cache)
             for pos, fit in zip(retry_pos, outs):
                 key = keys[pos]
-                cache[key] = fit; results[pos] = fit
+                fit_norm = _normalize_fit_fields(fit)
+                cache[key] = fit_norm; results[pos] = fit_norm
 
         # 最后兜底：仍存在 None（例如上游异常未覆盖），统一用 CPU 重算对应个体，确保后续排序安全。
         if any(r is None for r in results):
@@ -530,19 +569,22 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
             logger.warning("found None fits after retries; final CPU recompute for %d items", len(retry_bits))
             outs = evaluate_rules_batch(n, k, retry_bits,
                                         sym_mode=sym_mode,
-                                        boundary=boundary,
+                                        boundary=eval_boundary,
                                         device="cpu", use_lanczos=use_lanczos,
                                         r_vals=r_vals, power_iters=power_iters,
                                         trace_mode=trace_mode, hutch_s=hutch_s,
                                         lru_rows=rows_lru, max_streams=max_streams,
-                                        enable_exact=enable_exact,
-                                        enable_spectral=enable_spectral,
+                                        enable_exact=eval_enable_exact,
+                                        enable_spectral=eval_enable_spectral,
                                         exact_threshold=exact_threshold,
                                         cache_dir=cache_dir,
                                         use_cache=use_cache)
             for pos, fit in zip(retry_pos, outs):
                 key = keys[pos]
-                cache[key] = fit; results[pos] = fit
+                fit_norm = _normalize_fit_fields(fit)
+                cache[key] = fit_norm; results[pos] = fit_norm
+        results = [_normalize_fit_fields(r) for r in results]
+
         if enable_exact and enable_spectral:
             try:
                 summarize_trace_comparison([r for r in results if isinstance(r, dict)], logger=logger)

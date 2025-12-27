@@ -49,7 +49,7 @@
 | 需求 | CLI 入口 | 配置字段 | 说明 |
 | --- | --- | --- | --- |
 | 置换对称 / 交换对称 | `--sym-mode {none,perm,perm+swap}` | `sym_mode` | `perm` 走规则位串规范化，`perm+swap` 额外合并邻接等价节点；`none` 不做对称处理。 |
-| 边界模式 | `--boundary {torus,open}` | `boundary` | `torus` 为循环边界；`open` 为非循环边界（精确计数路径支持）。 |
+| 边界模式 | `--boundary {torus,open}` | `boundary` | `torus` 为循环边界；`open` 仅走精确计数路径（当前仅 CPU，规模大时行数爆炸需谨慎）。 |
 | 精确计算开关 | `--exact / --no-exact` | `use_exact` | 若开启，且行数未超过 `exact_rows_cap`，调用行枚举 + 转移矩阵精确计数。 |
 | 谱估计开关 | `--spectral / --no-spectral` | `use_spectral` | 启用/关闭 Hutch/Hutch++ 迹估计与 Lanczos 顶值估计。 |
 | 阈值联动 | `--exact-rows-cap` | `exact_rows_cap` | 行数超过阈值即跳过精确计算，以谱估计为主。 |
@@ -227,6 +227,7 @@ python scripts/run_ga.py --nk "(6,3);(6,4)" --gens 12 --pop 32 --trace hutchpp -
     --out-csv ./out_csv --out-fig ./out_fig
 ```
 脚本会在 `out_csv/` 写入每代帕累托点，并在 `out_fig/` 输出散点 + 增长曲线，日志默认保存在控制台。
+> `--boundary open` 仅支持精确计数路径，当前实现只跑在 CPU 上；行枚举随规模增长极快，建议仅在小型 $(n,k)$ 上启用。
 
 ### 示例 4：多平台命令行
 ```bash
@@ -257,7 +258,7 @@ python -c "from pathlib import Path; from rules.viz import plot_pareto_from_csv;
 # config.yml
 n: 5
 k: 4
-boundary: torus          # 也支持 open（仅精确计数路径）
+boundary: torus          # 也支持 open（仅精确计数，当前仅 CPU，规模大需谨慎）
 sym_mode: perm
 use_exact: true          # rows_m 超过 exact_rows_cap 会自动跳过
 use_spectral: true
