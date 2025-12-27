@@ -142,6 +142,13 @@ def _infer_k_from_bits(bits: np.ndarray) -> int:
     k = int((disc ** 0.5 - 1) // 2)
     return k
 
+def _pad_to_len(bits: np.ndarray, L: int) -> np.ndarray:
+    if bits.size == L:
+        return bits
+    out = np.zeros(L, dtype=bits.dtype)
+    out[:min(L, bits.size)] = bits[:min(L, bits.size)]
+    return out
+
 # ---------- variation operators (with alignment) ----------
 def mutate(bits: np.ndarray, p_mut: float, k: int) -> np.ndarray:
     m = bits.copy()
@@ -152,7 +159,11 @@ def mutate(bits: np.ndarray, p_mut: float, k: int) -> np.ndarray:
 def crossover_aligned(a: np.ndarray, b: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
     """均匀交叉，兼容 perm+swap 压缩后的 k_sym（自动从位长反推 k）。"""
     k_a = _infer_k_from_bits(a); k_b = _infer_k_from_bits(b)
-    k_use = k_a if k_a == k_b else min(k_a, k_b, k)
+    # 目标位长：覆盖原始 k、两个亲本的位长（含压缩的 k_sym）
+    L_target = max(a.size, b.size, _L_from_k(k_a), _L_from_k(k_b), _L_from_k(k))
+    a = _pad_to_len(a, L_target)
+    b = _pad_to_len(b, L_target)
+    k_use = _infer_k_from_bits(np.zeros(L_target, dtype=np.uint8))
 
     # 构造两亲本共同的稳定顺序，再做均匀交叉（更保留块结构）
     Ra = rule_from_bits(k_use, a); Rb = rule_from_bits(k_use, b)
