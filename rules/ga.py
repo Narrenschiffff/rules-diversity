@@ -157,6 +157,12 @@ def _canonical_auto(bits: np.ndarray) -> np.ndarray:
     k_use = _infer_k_from_bits(bits)
     return canonical_bits(bits, k_use)
 
+def _canonical_fixed_k(bits: np.ndarray, k: int) -> np.ndarray:
+    """Canonicalize after padding/truncating to match target k bit-length."""
+    L = _L_from_k(k)
+    bits = _pad_to_len(bits, L)[:L]
+    return canonical_bits(bits, k)
+
 # ---------- variation operators (with alignment) ----------
 def mutate(bits: np.ndarray, p_mut: float, k: int) -> np.ndarray:
     m = bits.copy()
@@ -569,12 +575,12 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
             if random.random() < p_cx and len(new_pop)+1 < pop_size:
                 p1, p2 = tournament(), tournament()
                 c1, c2 = crossover_aligned(p1, p2, k)
-                c1 = _canonical_auto(mutate(c1, p_mut, k))
-                c2 = _canonical_auto(mutate(c2, p_mut, k))
+                c1 = _canonical_fixed_k(_canonical_auto(mutate(c1, p_mut, k)), k)
+                c2 = _canonical_fixed_k(_canonical_auto(mutate(c2, p_mut, k)), k)
                 new_pop += [c1, c2]
             else:
                 p = tournament()
-                c = _canonical_auto(mutate(p, p_mut, k))
+                c = _canonical_fixed_k(_canonical_auto(mutate(p, p_mut, k)), k)
                 new_pop.append(c)
         pop = new_pop[:pop_size]
 
