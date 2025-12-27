@@ -148,6 +148,18 @@ viz.plot_all(csvs, n=2, k=2, out_dir='out_fig', sym_filter='perm')
 print(viz.summarize_runs(csvs, sym_filter='perm'))
 PY
 ```
+#### open / torus 混合增长曲线示例
+在 open 边界下仅写入精确计数（禁用谱估计），但 CSV 字段与 torus 结果兼容，可直接用 `viz.plot_all` 生成同一张增长曲线：
+```python
+from pathlib import Path
+from rules import viz
+
+torus = sorted(str(p) for p in Path("results/torus_csv").glob("*.csv"))
+open_ = sorted(str(p) for p in Path("results/open_csv").glob("*.csv"))
+fronts = torus + open_
+viz.plot_all(fronts, n=4, k=3, out_dir="results/fig_open_torus", sym_filter="perm")
+```
+> open CSV 仅包含精确值，但列名与 torus 对齐；`plot_all` 会自动选择 `trace_estimate/sum_lambda_powers` 或 `exact_Z` 作为纵轴，因此混合输入也能绘制增长曲线与膝点。
 
 ---
 
