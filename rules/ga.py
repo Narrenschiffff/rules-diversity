@@ -114,13 +114,16 @@ def _load_stage1_seeds(out_csv_dir: str, n: int, k: int, max_seeds: int) -> List
 
 # ---------- feasibility & parent alignment ----------
 def _ensure_minimal_feasible(bits: np.ndarray, k: int) -> np.ndarray:
-    R = rule_from_bits(k, bits)
+    # 若位长与期望的 k 不一致（例如 perm+swap 压缩后的 k_sym），动态推断 k_use
+    k_expected = _L_from_k(k)
+    k_use = k if bits.size == k_expected else _infer_k_from_bits(bits)
+    R = rule_from_bits(k_use, bits)
     if int(R.sum()) == 0:
-        if k == 1:
+        if k_use == 1:
             R[0,0] = True
         else:
             R[0,0] = True; R[1,1] = True
-    return canonical_bits(bits_from_rule(R), k)
+    return canonical_bits(bits_from_rule(R), k_use)
 
 def _stable_node_order(R: np.ndarray) -> List[int]:
     # degree desc, selfloop desc, adjacency row (as '1'/'0') desc
