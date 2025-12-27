@@ -152,6 +152,11 @@ def _pad_to_len(bits: np.ndarray, L: int) -> np.ndarray:
     out[:min(L, bits.size)] = bits[:min(L, bits.size)]
     return out
 
+def _canonical_auto(bits: np.ndarray) -> np.ndarray:
+    """Canonicalize using k inferred from bit-length."""
+    k_use = _infer_k_from_bits(bits)
+    return canonical_bits(bits, k_use)
+
 # ---------- variation operators (with alignment) ----------
 def mutate(bits: np.ndarray, p_mut: float, k: int) -> np.ndarray:
     m = bits.copy()
@@ -564,12 +569,12 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
             if random.random() < p_cx and len(new_pop)+1 < pop_size:
                 p1, p2 = tournament(), tournament()
                 c1, c2 = crossover_aligned(p1, p2, k)
-                c1 = canonical_bits(mutate(c1, p_mut, k), k)
-                c2 = canonical_bits(mutate(c2, p_mut, k), k)
+                c1 = _canonical_auto(mutate(c1, p_mut, k))
+                c2 = _canonical_auto(mutate(c2, p_mut, k))
                 new_pop += [c1, c2]
             else:
                 p = tournament()
-                c = canonical_bits(mutate(p, p_mut, k), k)
+                c = _canonical_auto(mutate(p, p_mut, k))
                 new_pop.append(c)
         pop = new_pop[:pop_size]
 
