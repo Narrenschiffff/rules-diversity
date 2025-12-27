@@ -256,42 +256,39 @@ def run_pipeline(args: argparse.Namespace) -> List[Dict[str, Any]]:
         # spectral path
         spectral_info: Dict[str, Any] = {}
         if use_spectral:
-            if boundary != "torus":
-                spectral_info["spectral_note"] = "spectral evaluator supports torus only"
-            else:
-                try:
-                    reports = evaluate_rules_batch(
-                        n=n,
-                        k=k,
-                        bits_list=[bits_canon],
-                        sym_mode=sym_mode,
-                        boundary=boundary,
-                        device=device,
-                        use_lanczos=True,
-                        r_vals=lanczos_r,
-                        power_iters=power_iters,
-                        trace_mode=trace_mode,
-                        hutch_s=hutch_s,
-                        lru_rows=None,
-                        max_streams=args.max_streams or cfg.get("max_streams", 2),
-                        enable_exact=use_exact,
-                        enable_spectral=True,
-                        exact_threshold=cfg.get("exact_threshold", rules_config.EXACT_THRESHOLD),
-                        cache_dir=str(cache_dir),
-                        use_cache=use_cache,
+            try:
+                reports = evaluate_rules_batch(
+                    n=n,
+                    k=k,
+                    bits_list=[bits_canon],
+                    sym_mode=sym_mode,
+                    boundary=boundary,
+                    device=device,
+                    use_lanczos=True,
+                    r_vals=lanczos_r,
+                    power_iters=power_iters,
+                    trace_mode=trace_mode,
+                    hutch_s=hutch_s,
+                    lru_rows=None,
+                    max_streams=args.max_streams or cfg.get("max_streams", 2),
+                    enable_exact=use_exact,
+                    enable_spectral=True,
+                    exact_threshold=cfg.get("exact_threshold", rules_config.EXACT_THRESHOLD),
+                    cache_dir=str(cache_dir),
+                    use_cache=use_cache,
+                )
+                spectral_info = reports[0] if reports else {}
+                if spectral_info:
+                    spectral_info["cache_key"] = make_eval_cache_key(
+                        bits_canon,
+                        int(spectral_info.get("active_k", spectral_info.get("k_sym", k))),
+                        boundary,
+                        sym_mode,
+                        n,
                     )
-                    spectral_info = reports[0] if reports else {}
-                    if spectral_info:
-                        spectral_info["cache_key"] = make_eval_cache_key(
-                            bits_canon,
-                            int(spectral_info.get("active_k", spectral_info.get("k_sym", k))),
-                            boundary,
-                            sym_mode,
-                            n,
-                        )
-                except Exception:
-                    LOGGER.exception("spectral evaluation failed for %s", label)
-                    spectral_info["spectral_note"] = "spectral failed"
+            except Exception:
+                LOGGER.exception("spectral evaluation failed for %s", label)
+                spectral_info["spectral_note"] = "spectral failed"
         else:
             spectral_info["spectral_note"] = "spectral disabled"
 
