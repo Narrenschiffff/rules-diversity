@@ -412,13 +412,22 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
     # cache
     cache: Dict[bytes, Dict] = {}
     rows_lru = RowsCacheLRU(capacity=lru_cap)
+    open_path_logged = False
 
     def eval_batch(bits_batch: List[np.ndarray]):
+        nonlocal open_path_logged
         boundary_mode = (boundary or "torus").lower()
-        eval_boundary = "open" if boundary_mode == "open" else boundary
-        eval_device = "cpu" if boundary_mode == "open" else device
-        eval_enable_spectral = False if boundary_mode == "open" else enable_spectral
-        eval_enable_exact = True if boundary_mode == "open" else enable_exact
+        eval_boundary = "open" if boundary_mode == "open" else boundary_mode
+        eval_device = device
+        eval_enable_spectral = enable_spectral
+        eval_enable_exact = enable_exact
+
+        if boundary_mode == "open" and not open_path_logged:
+            logger.info(
+                "[GA][eval] boundary=open path | device=%s | spectral=%s | exact=%s | trace_mode=%s | hutch_s=%s",
+                eval_device, eval_enable_spectral, eval_enable_exact, trace_mode, hutch_s,
+            )
+            open_path_logged = True
 
         def _normalize_fit_fields(fit: Dict) -> Dict:
             f = {} if fit is None else dict(fit)
@@ -486,13 +495,13 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                             use_cache=use_cache)
             except Exception:
                 outs = None
-                if device == "cuda" and boundary_mode != "open":
+                if eval_device == "cuda":
                     logger.warning("evaluate_rules_batch failed on CUDA; retrying on CUDA once", exc_info=True)
                     try:
                         outs = evaluate_rules_batch(n, k, miss_bits,
                                                     sym_mode=sym_mode,
                                                     boundary=eval_boundary,
-                                                    device=device, use_lanczos=use_lanczos,
+                                                    device=eval_device, use_lanczos=use_lanczos,
                                                     r_vals=r_vals, power_iters=power_iters,
                                                     trace_mode=trace_mode, hutch_s=hutch_s,
                                                     lru_rows=rows_lru, max_streams=max_streams,
@@ -526,13 +535,13 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
             retry_bits = [bits_batch[i] for i, r in enumerate(results) if r is None]
             retry_pos  = [i for i, r in enumerate(results) if r is None]
             outs = None
-            if device == "cuda" and boundary_mode != "open":
+            if eval_device == "cuda":
                 logger.warning("found None fits on CUDA; retrying those on CUDA")
                 try:
                     outs = evaluate_rules_batch(n, k, retry_bits,
                                                 sym_mode=sym_mode,
                                                 boundary=eval_boundary,
-                                                device=device, use_lanczos=use_lanczos,
+                                                device=eval_device, use_lanczos=use_lanczos,
                                                 r_vals=r_vals, power_iters=power_iters,
                                                 trace_mode=trace_mode, hutch_s=hutch_s,
                                                 lru_rows=rows_lru, max_streams=max_streams,
