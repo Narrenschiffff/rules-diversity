@@ -522,6 +522,27 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
             for pos, fit in zip(retry_pos, outs):
                 key = keys[pos]
                 cache[key] = fit; results[pos] = fit
+
+        # 最后兜底：仍存在 None（例如上游异常未覆盖），统一用 CPU 重算对应个体，确保后续排序安全。
+        if any(r is None for r in results):
+            retry_bits = [bits_batch[i] for i, r in enumerate(results) if r is None]
+            retry_pos  = [i for i, r in enumerate(results) if r is None]
+            logger.warning("found None fits after retries; final CPU recompute for %d items", len(retry_bits))
+            outs = evaluate_rules_batch(n, k, retry_bits,
+                                        sym_mode=sym_mode,
+                                        boundary=boundary,
+                                        device="cpu", use_lanczos=use_lanczos,
+                                        r_vals=r_vals, power_iters=power_iters,
+                                        trace_mode=trace_mode, hutch_s=hutch_s,
+                                        lru_rows=rows_lru, max_streams=max_streams,
+                                        enable_exact=enable_exact,
+                                        enable_spectral=enable_spectral,
+                                        exact_threshold=exact_threshold,
+                                        cache_dir=cache_dir,
+                                        use_cache=use_cache)
+            for pos, fit in zip(retry_pos, outs):
+                key = keys[pos]
+                cache[key] = fit; results[pos] = fit
         if enable_exact and enable_spectral:
             try:
                 summarize_trace_comparison([r for r in results if isinstance(r, dict)], logger=logger)
