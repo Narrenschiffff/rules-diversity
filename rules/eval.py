@@ -14,7 +14,7 @@ rules/eval.py
 依赖：numpy, torch, matplotlib（仅个别函数用, 不在此文件画图）
 """
 
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Union
 from pathlib import Path
 import math
 import itertools
@@ -29,6 +29,7 @@ from .cache import (
     load_eval_cache,
     dump_eval_cache,
 )
+from .stage1_exact import enumerate_ring_rows, count_patterns_transfer_matrix
 
 # ------------------------------
 # 通用小工具
@@ -641,7 +642,7 @@ def evaluate_rules_batch(n: int,
                          enable_exact: bool = True,
                          enable_spectral: bool = True,
                          exact_threshold="nk<=12",
-                         cache_dir: Optional[str | Path] = None,
+                         cache_dir: Optional[Union[str, Path]] = None,
                          use_cache: bool = True,
                          ) -> List[Dict]:
     """
@@ -663,12 +664,75 @@ def evaluate_rules_batch(n: int,
         return base
 
     boundary = (boundary or "torus").lower()
-    if boundary not in {"torus"}:
-        raise ValueError(f"boundary={boundary} not supported in fast evaluator")
+    if boundary not in {"torus", "open"}:
+        raise ValueError(f"boundary={boundary} not supported")
 
     cache_root = ensure_eval_cache_dir(cache_dir) if use_cache else None
 
-    # ---------- CPU 路径 ----------
+    # ---------- open 边界：仅精确计数 ----------
+    if boundary == "open":
+        outs: List[Dict] = []
+        for idx, bits in enumerate(bits_list):
+            bits_sym, k_sym, raw_to_class, class_sizes = apply_rule_symmetry(bits, k, sym_mode)
+            R = rule_from_bits(k_sym, bits_sym)
+            rows = enumerate_ring_rows(n=n, k=k_sym, R=R, boundary="open")
+            m = len(rows)
+            active_classes = np.unique(rows) if m > 0 else np.array([], dtype=int)
+            used = np.zeros(k_sym, dtype=bool)
+            used[active_classes] = True
+            active_k = int(used.sum())
+            active_k_raw = int(sum(class_sizes[c] for c in active_classes)) if m > 0 else 0
+
+            cache_key = None
+            if cache_root is not None:
+                cache_key = make_eval_cache_key(bits_sym, active_k, boundary, sym_mode, n)
+                cached = load_eval_cache(cache_root, cache_key)
+                if cached is not None:
+                    outs.append(cached)
+                    continue
+
+            eval_note = ""
+            if m == 0:
+                Z_exact = 0.0
+                eval_note = "open_boundary_rows_m0"
+            else:
+                Z_exact = float(count_patterns_transfer_matrix(n=n, k=k_sym, R=R, boundary="open"))
+                eval_note = "open_boundary_exact"
+
+            fit = {
+                "rule_count": int(bits.sum()),
+                "lambda_max": 0.0,
+                "lambda_top2": (0.0, 0.0),
+                "spectral_gap": 0.0,
+                "sum_lambda_powers": Z_exact,
+                "rows_m": m,
+                "active_k": active_k,
+                "active_k_raw": active_k_raw,
+                "active_k_sym": active_k,
+                "k_raw": k,
+                "k_sym": k_sym,
+                "sym_mode": sym_mode,
+                "boundary": boundary,
+                "lower_bound": Z_exact, "upper_bound": Z_exact,
+                "lower_bound_raw": Z_exact, "upper_bound_raw": Z_exact,
+                "upper_bound_raw_gersh": Z_exact, "upper_bound_raw_maxdeg": Z_exact,
+                "archetype_hits": {}, "archetype_tags": "",
+                "trace_exact": Z_exact, "trace_estimate": Z_exact,
+                "trace_error": "", "trace_error_rel": "",
+                "eval_note": eval_note,
+            }
+            if cache_root is not None and cache_key is not None:
+                dump_eval_cache(cache_root, cache_key, fit, meta_extra={
+                    "boundary": boundary,
+                    "sym_mode": sym_mode,
+                    "active_k": active_k,
+                    "k_sym": k_sym,
+                    "n": n,
+                })
+            outs.append(fit)
+        return outs
+
+    # ---------- torus 边界：原有 CPU/GPU 分支 ----------
     if (device == "cpu") or (not torch.cuda.is_available()):
         outs: List[Dict] = []
         for idx, bits in enumerate(bits_list):

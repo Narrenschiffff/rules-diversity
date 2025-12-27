@@ -114,13 +114,16 @@ def _load_stage1_seeds(out_csv_dir: str, n: int, k: int, max_seeds: int) -> List
 
 # ---------- feasibility & parent alignment ----------
 def _ensure_minimal_feasible(bits: np.ndarray, k: int) -> np.ndarray:
-    R = rule_from_bits(k, bits)
+    # 若位长与期望的 k 不一致（例如 perm+swap 压缩后的 k_sym），动态推断 k_use
+    k_expected = _L_from_k(k)
+    k_use = k if bits.size == k_expected else _infer_k_from_bits(bits)
+    R = rule_from_bits(k_use, bits)
     if int(R.sum()) == 0:
-        if k == 1:
+        if k_use == 1:
             R[0,0] = True
         else:
             R[0,0] = True; R[1,1] = True
-    return canonical_bits(bits_from_rule(R), k)
+    return canonical_bits(bits_from_rule(R), k_use)
 
 def _stable_node_order(R: np.ndarray) -> List[int]:
     # degree desc, selfloop desc, adjacency row (as '1'/'0') desc
@@ -135,6 +138,31 @@ def _remap_bits(bits: np.ndarray, k: int, order: List[int]) -> np.ndarray:
     P = R[np.ix_(order, order)]
     return bits_from_rule(P)
 
+def _infer_k_from_bits(bits: np.ndarray) -> int:
+    """Infer k from symmetric bit-length L = k + k*(k-1)/2."""
+    L = int(bits.size)
+    disc = 1 + 8 * L
+    k = int((disc ** 0.5 - 1) // 2)
+    return k
+
+def _pad_to_len(bits: np.ndarray, L: int) -> np.ndarray:
+    if bits.size == L:
+        return bits
+    out = np.zeros(L, dtype=bits.dtype)
+    out[:min(L, bits.size)] = bits[:min(L, bits.size)]
+    return out
+
+def _canonical_auto(bits: np.ndarray) -> np.ndarray:
+    """Canonicalize using k inferred from bit-length."""
+    k_use = _infer_k_from_bits(bits)
+    return canonical_bits(bits, k_use)
+
+def _canonical_fixed_k(bits: np.ndarray, k: int) -> np.ndarray:
+    """Canonicalize after padding/truncating to match target k bit-length."""
+    L = _L_from_k(k)
+    bits = _pad_to_len(bits, L)[:L]
+    return canonical_bits(bits, k)
+
 # ---------- variation operators (with alignment) ----------
 def mutate(bits: np.ndarray, p_mut: float, k: int) -> np.ndarray:
     m = bits.copy()
@@ -143,16 +171,24 @@ def mutate(bits: np.ndarray, p_mut: float, k: int) -> np.ndarray:
     return _ensure_minimal_feasible(m, k)
 
 def crossover_aligned(a: np.ndarray, b: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    """均匀交叉，兼容 perm+swap 压缩后的 k_sym（自动从位长反推 k）。"""
+    k_a = _infer_k_from_bits(a); k_b = _infer_k_from_bits(b)
+    # 目标位长：覆盖原始 k、两个亲本的位长（含压缩的 k_sym）
+    L_target = max(a.size, b.size, _L_from_k(k_a), _L_from_k(k_b), _L_from_k(k))
+    a = _pad_to_len(a, L_target)
+    b = _pad_to_len(b, L_target)
+    k_use = _infer_k_from_bits(np.zeros(L_target, dtype=np.uint8))
+
     # 构造两亲本共同的稳定顺序，再做均匀交叉（更保留块结构）
-    Ra = rule_from_bits(k, a); Rb = rule_from_bits(k, b)
-    order = _stable_node_order(Ra)  # 用 A 的顺序即可（经验足够）
-    aa = _remap_bits(a, k, order); bb = _remap_bits(b, k, order)
+    Ra = rule_from_bits(k_use, a); Rb = rule_from_bits(k_use, b)
+    order = _stable_node_order(Ra)  # 用 A 的顺序即可
+    aa = _remap_bits(a, k_use, order); bb = _remap_bits(b, k_use, order)
     L = aa.size
     mask = np.random.rand(L) < 0.5
     c1 = np.where(mask, aa, bb).astype(np.uint8)
     c2 = np.where(mask, bb, aa).astype(np.uint8)
-    c1 = canonical_bits(c1, k); c2 = canonical_bits(c2, k)
-    c1 = _ensure_minimal_feasible(c1, k); c2 = _ensure_minimal_feasible(c2, k)
+    c1 = canonical_bits(c1, k_use); c2 = canonical_bits(c2, k_use)
+    c1 = _ensure_minimal_feasible(c1, k_use); c2 = _ensure_minimal_feasible(c2, k_use)
     return c1, c2
 
 def init_population(k: int, pop_size: int, bias_sparse: bool = True) -> List[np.ndarray]:
@@ -383,6 +419,10 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
         results = [None]*len(bits_batch)
         miss_bits, miss_pos = [], []
         for i, bb in enumerate(bits_batch):
+            # 防御：若个体位长与目标 k 不一致（perm+swap 压缩或历史遗留），先对齐再送入对称化
+            Lk = _L_from_k(k)
+            if bb.size != Lk:
+                bb = _pad_to_len(bb, Lk)[:Lk]
             sym_b, _, _, _ = apply_rule_symmetry(bb, k, sym_mode)
             normed.append(sym_b)
             key = sym_b.tobytes()
@@ -393,10 +433,105 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                 miss_bits.append(bb)
                 miss_pos.append(i)
         if miss_bits:
-            outs = evaluate_rules_batch(n, k, miss_bits,
+            # 先试主设备（如 CUDA），失败时重试一次主设备，最后才回退 CPU，尽量保持 GPU 路径以提高吞吐。
+            try:
+                outs = evaluate_rules_batch(n, k, miss_bits,
+                                            sym_mode=sym_mode,
+                                            boundary=boundary,
+                                            device=device, use_lanczos=use_lanczos,
+                                            r_vals=r_vals, power_iters=power_iters,
+                                            trace_mode=trace_mode, hutch_s=hutch_s,
+                                            lru_rows=rows_lru, max_streams=max_streams,
+                                            enable_exact=enable_exact,
+                                            enable_spectral=enable_spectral,
+                                            exact_threshold=exact_threshold,
+                                            cache_dir=cache_dir,
+                                            use_cache=use_cache)
+            except Exception:
+                outs = None
+                if device == "cuda":
+                    logger.warning("evaluate_rules_batch failed on CUDA; retrying on CUDA once", exc_info=True)
+                    try:
+                        outs = evaluate_rules_batch(n, k, miss_bits,
+                                                    sym_mode=sym_mode,
+                                                    boundary=boundary,
+                                                    device=device, use_lanczos=use_lanczos,
+                                                    r_vals=r_vals, power_iters=power_iters,
+                                                    trace_mode=trace_mode, hutch_s=hutch_s,
+                                                    lru_rows=rows_lru, max_streams=max_streams,
+                                                    enable_exact=enable_exact,
+                                                    enable_spectral=enable_spectral,
+                                                    exact_threshold=exact_threshold,
+                                                    cache_dir=cache_dir,
+                                                    use_cache=use_cache)
+                    except Exception:
+                        logger.warning("second CUDA attempt failed; fallback to CPU", exc_info=True)
+                if outs is None:
+                    outs = evaluate_rules_batch(n, k, miss_bits,
+                                                sym_mode=sym_mode,
+                                                boundary=boundary,
+                                                device="cpu", use_lanczos=use_lanczos,
+                                                r_vals=r_vals, power_iters=power_iters,
+                                                trace_mode=trace_mode, hutch_s=hutch_s,
+                                                lru_rows=rows_lru, max_streams=max_streams,
+                                                enable_exact=enable_exact,
+                                                enable_spectral=enable_spectral,
+                                                exact_threshold=exact_threshold,
+                                                cache_dir=cache_dir,
+                                                use_cache=use_cache)
+            for pos, fit in zip(miss_pos, outs):
+                key = keys[pos]
+                cache[key] = fit; results[pos] = fit
+
+        # CUDA 在少量环境下可能返回 None（如内核异常）。先尝试再跑一次 CUDA，仍为 None 时才回退 CPU。
+        if any(r is None for r in results):
+            retry_bits = [bits_batch[i] for i, r in enumerate(results) if r is None]
+            retry_pos  = [i for i, r in enumerate(results) if r is None]
+            outs = None
+            if device == "cuda":
+                logger.warning("found None fits on CUDA; retrying those on CUDA")
+                try:
+                    outs = evaluate_rules_batch(n, k, retry_bits,
+                                                sym_mode=sym_mode,
+                                                boundary=boundary,
+                                                device=device, use_lanczos=use_lanczos,
+                                                r_vals=r_vals, power_iters=power_iters,
+                                                trace_mode=trace_mode, hutch_s=hutch_s,
+                                                lru_rows=rows_lru, max_streams=max_streams,
+                                                enable_exact=enable_exact,
+                                                enable_spectral=enable_spectral,
+                                                exact_threshold=exact_threshold,
+                                                cache_dir=cache_dir,
+                                                use_cache=use_cache)
+                except Exception:
+                    logger.warning("CUDA retry for None fits failed; fallback to CPU", exc_info=True)
+            if outs is None:
+                logger.warning("fallback CPU eval for %d None fits", len(retry_bits))
+                outs = evaluate_rules_batch(n, k, retry_bits,
+                                            sym_mode=sym_mode,
+                                            boundary=boundary,
+                                            device="cpu", use_lanczos=use_lanczos,
+                                            r_vals=r_vals, power_iters=power_iters,
+                                            trace_mode=trace_mode, hutch_s=hutch_s,
+                                            lru_rows=rows_lru, max_streams=max_streams,
+                                            enable_exact=enable_exact,
+                                            enable_spectral=enable_spectral,
+                                            exact_threshold=exact_threshold,
+                                            cache_dir=cache_dir,
+                                            use_cache=use_cache)
+            for pos, fit in zip(retry_pos, outs):
+                key = keys[pos]
+                cache[key] = fit; results[pos] = fit
+
+        # 最后兜底：仍存在 None（例如上游异常未覆盖），统一用 CPU 重算对应个体，确保后续排序安全。
+        if any(r is None for r in results):
+            retry_bits = [bits_batch[i] for i, r in enumerate(results) if r is None]
+            retry_pos  = [i for i, r in enumerate(results) if r is None]
+            logger.warning("found None fits after retries; final CPU recompute for %d items", len(retry_bits))
+            outs = evaluate_rules_batch(n, k, retry_bits,
                                         sym_mode=sym_mode,
                                         boundary=boundary,
-                                        device=device, use_lanczos=use_lanczos,
+                                        device="cpu", use_lanczos=use_lanczos,
                                         r_vals=r_vals, power_iters=power_iters,
                                         trace_mode=trace_mode, hutch_s=hutch_s,
                                         lru_rows=rows_lru, max_streams=max_streams,
@@ -405,7 +540,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                         exact_threshold=exact_threshold,
                                         cache_dir=cache_dir,
                                         use_cache=use_cache)
-            for pos, fit in zip(miss_pos, outs):
+            for pos, fit in zip(retry_pos, outs):
                 key = keys[pos]
                 cache[key] = fit; results[pos] = fit
         if enable_exact and enable_spectral:
@@ -465,12 +600,12 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
             if random.random() < p_cx and len(new_pop)+1 < pop_size:
                 p1, p2 = tournament(), tournament()
                 c1, c2 = crossover_aligned(p1, p2, k)
-                c1 = canonical_bits(mutate(c1, p_mut, k), k)
-                c2 = canonical_bits(mutate(c2, p_mut, k), k)
+                c1 = _canonical_fixed_k(_canonical_auto(mutate(c1, p_mut, k)), k)
+                c2 = _canonical_fixed_k(_canonical_auto(mutate(c2, p_mut, k)), k)
                 new_pop += [c1, c2]
             else:
                 p = tournament()
-                c = canonical_bits(mutate(p, p_mut, k), k)
+                c = _canonical_fixed_k(_canonical_auto(mutate(p, p_mut, k)), k)
                 new_pop.append(c)
         pop = new_pop[:pop_size]
 
