@@ -10,15 +10,17 @@ NSGA-II (batch) with seeds / heartbeat / parent-aligned crossover (new).
 
 from __future__ import annotations
 import csv, logging, os, random, time, glob
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 import torch
 
 from . import config
+from .runtime import RunContext
 from .eval import (
     canonical_bits, bits_from_rule, rule_from_bits, apply_rule_symmetry,
     evaluate_rules_batch, RowsCacheLRU, summarize_trace_comparison,
-    objective_from_trace, _normalize_objective_mode,
+    objective_from_trace,
 )
 from .utils_io import make_run_tag
 
@@ -130,6 +132,10 @@ def _load_stage1_seeds(out_csv_dir: str, n: int, k: int, max_seeds: int) -> List
             break
 
     return seeds
+
+
+def _bits_to_str(bits: np.ndarray) -> str:
+    return "".join("1" if int(b) else "0" for b in bits.tolist())
 
 
 # ---------- feasibility & parent alignment ----------
@@ -274,6 +280,44 @@ def crowding_distance(front: List[int], pop_fits: List[Dict], obj_key: str = "su
             distances[vs[j][0]] += (next_v - prev_v) / rng
     return distances
 
+
+def _read_last_generation(csv_gen: str) -> Optional[int]:
+    if not os.path.exists(csv_gen):
+        return None
+    try:
+        with open(csv_gen, "r", encoding="utf-8") as f:
+            rd = csv.DictReader(f)
+            gens = [int(r.get("generation", -1)) for r in rd if r.get("generation") is not None]
+        return max(gens) if gens else None
+    except Exception:
+        return None
+
+
+def _read_population_from_front(csv_front: str, generation: int, k: int, pop_size: Optional[int]) -> Optional[List[np.ndarray]]:
+    if not os.path.exists(csv_front):
+        return None
+    try:
+        with open(csv_front, "r", encoding="utf-8") as f:
+            rd = csv.DictReader(f)
+            if "generation" not in (rd.fieldnames or []):
+                return None
+            pop: List[np.ndarray] = []
+            for row in rd:
+                try:
+                    if int(row.get("generation", -1)) != generation:
+                        continue
+                except Exception:
+                    continue
+                bits = _bits_from_str(row.get("rule_bits"))
+                if bits is None:
+                    continue
+                pop.append(_canonical_fixed_k(bits, k))
+            if pop and (pop_size is None or len(pop) == pop_size):
+                return pop
+    except Exception:
+        return None
+    return None
+
 class GAConfig:
     def __init__(self,
                  pop_size=32, generations=12,
@@ -294,6 +338,10 @@ class GAConfig:
                  objective_mode: str = config.OBJECTIVE_MODE,
                  objective_use_penalty: bool = config.OBJECTIVE_USE_PENALTY,
                  use_penalized_objective: bool = True,
+                 resume: bool = True,
+                 seed: Optional[int] = None,
+                 log_level: str = "INFO",
+                 run_dir=None,
                  ):
         self.pop_size = pop_size
         self.generations = generations
@@ -322,9 +370,13 @@ class GAConfig:
         self.objective_mode = objective_mode
         self.objective_use_penalty = objective_use_penalty
         self.use_penalized_objective = use_penalized_objective
+        self.resume = resume
+        self.seed = seed
+        self.log_level = log_level
+        self.run_dir = run_dir
 
 # ---------- CSV appenders ----------
-def _append_front_rows_csv(csv_path_front: str, tag: str, n: int, k: int,
+def _append_front_rows_csv(csv_path_front: str, tag: str, n: int, k: int, generation: int,
                            pop_bits: List[np.ndarray], fits: List[Dict], front0_idx: List[int]) -> None:
     front0_set = set(front0_idx)
     with open(csv_path_front, "a", newline="", encoding="utf-8") as f:
@@ -344,7 +396,7 @@ def _append_front_rows_csv(csv_path_front: str, tag: str, n: int, k: int,
             except Exception:
                 obj_pen = -1e300
             w.writerow([
-                tag, n, k,
+                tag, n, k, generation,
                 "".join(map(str, bits.tolist())),
                 int(fit.get("rule_count", 0)),
                 int(fit.get("rows_m", 0)),
@@ -385,27 +437,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
     tag = run_tag or make_run_tag(n, k, add_timestamp=False)
     csv_front = os.path.join(out_csv_dir, f"pareto_front_{tag}.csv")
     csv_gen   = os.path.join(out_csv_dir, f"gen_summary_{tag}.csv")
-    heartbeat = os.path.join(out_csv_dir, f"heartbeat_{tag}.txt")
-
-    # headers
-    with open(csv_front, "w", newline="", encoding="utf-8") as f:
-        w=csv.writer(f)
-        w.writerow(["run_tag","n","k","rule_bits","rule_count","rows_m",
-                    "lambda_max","lambda_top2","spectral_gap",
-                    "sum_lambda_powers","sum_lambda_powers_raw","sum_lambda_powers_penalized",
-                    "objective_raw","objective_penalized","objective_mode","penalty_factor",
-                    "is_front0",
-                    "active_k","active_k_raw","k_sym","sym_mode",
-                    "lower_bound","upper_bound",
-                    "lower_bound_raw","upper_bound_raw",
-                    "upper_bound_raw_gersh","upper_bound_raw_maxdeg",
-                    "archetype_tags","exact_Z",
-                    "trace_exact","trace_estimate","trace_estimate_raw","trace_error","trace_error_rel","eval_note"])
-    with open(csv_gen, "w", newline="", encoding="utf-8") as f:
-        w=csv.writer(f)
-        w.writerow(["run_tag","n","k","generation","front0_size",
-                    "best_sample_R","best_sample_sumlam",
-                    "pop_size","device","trace_mode","sym_mode","objective_field","objective_mode"])
+    resume_enabled = _bool_or(getattr(ga_conf, "resume", True), True)
 
     # normalize config
     device      = _device_or(getattr(ga_conf, "device", None))
@@ -425,20 +457,94 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
     fast_eval       = _bool_or(getattr(ga_conf, "fast_eval", False), False)
     seed_from_stage1= _bool_or(getattr(ga_conf, "seed_from_stage1", False), False)
     max_seeds       = _int_or(getattr(ga_conf, "max_stage1_seeds", 256), 256)
-    sym_mode        = getattr(ga_conf, "sym_mode", "perm") or "perm"
+    sym_mode        = config.normalize_sym_mode(getattr(ga_conf, "sym_mode", "perm") or "perm")
     enable_exact    = _bool_or(getattr(ga_conf, "enable_exact", True), True)
     enable_spectral = _bool_or(getattr(ga_conf, "enable_spectral", True), True)
     exact_threshold = getattr(ga_conf, "exact_threshold", "nk<=12")
-    boundary        = getattr(ga_conf, "boundary", config.BOUNDARY_MODE) or config.BOUNDARY_MODE
-    cache_dir       = getattr(ga_conf, "cache_dir", config.EVAL_CACHE_DIR)
+    boundary        = config.normalize_boundary(getattr(ga_conf, "boundary", config.BOUNDARY_MODE) or config.BOUNDARY_MODE)
+    cache_dir_val   = getattr(ga_conf, "cache_dir", config.EVAL_CACHE_DIR)
+    cache_dir       = Path(cache_dir_val)
     use_cache       = _bool_or(getattr(ga_conf, "use_cache", True), True)
-    objective_mode  = _normalize_objective_mode(getattr(ga_conf, "objective_mode", config.OBJECTIVE_MODE))
-    objective_use_penalty = _bool_or(getattr(ga_conf, "objective_use_penalty", None), config.OBJECTIVE_USE_PENALTY)
-    use_penalized_objective = _bool_or(getattr(ga_conf, "use_penalized_objective", True), True)
-    objective_key = "objective_penalized" if use_penalized_objective else "objective_raw"
+    prefer_penalized_objective = _bool_or(getattr(ga_conf, "use_penalized_objective", True), True)
+    obj_cfg = config.resolve_objective(
+        getattr(ga_conf, "objective_mode", config.OBJECTIVE_MODE),
+        getattr(ga_conf, "objective_use_penalty", None),
+        prefer_penalized_objective,
+    )
+    objective_mode = obj_cfg["objective_mode"]
+    objective_use_penalty = obj_cfg["objective_use_penalty"]
+    objective_key = obj_cfg["objective_field"]
 
     if fast_eval or device=="cpu":
         r_vals = min(r_vals, 2); power_iters = min(power_iters, 16); hutch_s = min(hutch_s, 8)
+
+    run_root = Path(getattr(ga_conf, "run_dir", None) or Path(out_csv_dir) / tag)
+    ctx = RunContext(
+        run_tag=tag,
+        run_dir=run_root,
+        log_name=f"ga.{tag}",
+        log_level=getattr(ga_conf, "log_level", "INFO"),
+        cache_dir=cache_dir,
+        seed=getattr(ga_conf, "seed", None),
+    )
+    logger = ctx.get_logger(__name__)
+
+    resume_state = None
+    if resume_enabled:
+        ckpt = ctx.load_checkpoint()
+        payload = ckpt.payload if ckpt else {}
+        resume_gen = _int_or(payload.get("generation"), None)
+        resume_bits = payload.get("population_bits") if isinstance(payload, dict) else None
+        pop_from_ckpt = None
+        if resume_bits:
+            pop_from_ckpt = []
+            for b in resume_bits:
+                arr = _bits_from_str(b)
+                if arr is None:
+                    arr = np.zeros(_L_from_k(k), dtype=np.uint8)
+                pop_from_ckpt.append(_canonical_fixed_k(arr, k))
+        if resume_gen is None:
+            resume_gen = _read_last_generation(csv_gen)
+        if resume_gen is not None:
+            pop_from_csv = pop_from_ckpt or _read_population_from_front(csv_front, resume_gen, k, pop_size)
+            if pop_from_csv:
+                resume_state = {
+                    "generation": resume_gen,
+                    "population": pop_from_csv,
+                    "rng_state": ckpt.rng_state if ckpt else None,
+                    "source": "checkpoint" if pop_from_ckpt else "csv",
+                }
+                logger.info("Resume GA from generation %s via %s", resume_gen, resume_state["source"])
+                if resume_state.get("rng_state"):
+                    ctx.restore_rng_state(resume_state["rng_state"])
+            elif ckpt:
+                logger.warning("Checkpoint found but population missing; falling back to fresh run")
+    elif resume_enabled and (os.path.exists(csv_front) or os.path.exists(csv_gen)):
+        logger.info("Resume requested but no usable checkpoint found; restarting run")
+
+    # headers
+    if not resume_state:
+        with open(csv_front, "w", newline="", encoding="utf-8") as f:
+            w=csv.writer(f)
+            w.writerow(["run_tag","n","k","generation","rule_bits","rule_count","rows_m",
+                        "lambda_max","lambda_top2","spectral_gap",
+                        "sum_lambda_powers","sum_lambda_powers_raw","sum_lambda_powers_penalized",
+                        "objective_raw","objective_penalized","objective_mode","penalty_factor",
+                        "is_front0",
+                        "active_k","active_k_raw","k_sym","sym_mode",
+                        "lower_bound","upper_bound",
+                        "lower_bound_raw","upper_bound_raw",
+                        "upper_bound_raw_gersh","upper_bound_raw_maxdeg",
+                        "archetype_tags","exact_Z",
+                        "trace_exact","trace_estimate","trace_estimate_raw","trace_error","trace_error_rel","eval_note"])
+        with open(csv_gen, "w", newline="", encoding="utf-8") as f:
+            w=csv.writer(f)
+            w.writerow(["run_tag","n","k","generation","front0_size",
+                        "best_sample_R","best_sample_sumlam",
+                        "pop_size","device","trace_mode","sym_mode","objective_field","objective_mode"])
+    else:
+        if not (os.path.exists(csv_front) and os.path.exists(csv_gen)):
+            raise RuntimeError("Resume requested but existing CSV files are missing.")
 
     logger.info(
         f"GA start | n={n}, k={k}, device={device}, sym={sym_mode}, pop={pop_size}, gens={generations}, "
@@ -448,14 +554,23 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
 
     # init population
     pop: List[np.ndarray] = []
-    if seed_from_stage1:
-        seeds = _load_stage1_seeds(out_csv_dir, n, k, max_seeds)
-        random.shuffle(seeds)
-        take = min(len(seeds), max(2, pop_size//2))
-        pop.extend(seeds[:take])
-        logger.info(f"Loaded {len(seeds)} stage1 seeds; take {take}.")
+    start_gen = 0
+    if resume_state and resume_state.get("population"):
+        pop = list(resume_state["population"])
+        start_gen = min(resume_state["generation"] + 1, generations)
+        logger.info("Resume GA with population size=%s, next_gen=%s", len(pop), start_gen)
+    else:
+        if seed_from_stage1:
+            seeds = _load_stage1_seeds(out_csv_dir, n, k, max_seeds)
+            random.shuffle(seeds)
+            take = min(len(seeds), max(2, pop_size//2))
+            pop.extend(seeds[:take])
+            logger.info(f"Loaded {len(seeds)} stage1 seeds; take {take}.")
+        if len(pop) < pop_size:
+            pop.extend(init_population(k, pop_size - len(pop), bias_sparse=True))
     if len(pop) < pop_size:
         pop.extend(init_population(k, pop_size - len(pop), bias_sparse=True))
+    pop = pop[:pop_size]
 
     # cache
     cache: Dict[bytes, Dict] = {}
@@ -464,8 +579,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
 
     def eval_batch(bits_batch: List[np.ndarray]):
         nonlocal open_path_logged
-        boundary_mode = (boundary or "torus").lower()
-        eval_boundary = "open" if boundary_mode == "open" else boundary_mode
+        boundary_mode = boundary
+        eval_boundary = boundary_mode
         eval_device = device
         eval_enable_spectral = enable_spectral
         eval_enable_exact = enable_exact
@@ -522,7 +637,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                 f["trace_estimate_raw"] = float(f.get("trace_estimate_raw", f["sum_lambda_powers_raw"]))
             except Exception:
                 f["trace_estimate_raw"] = float(f["sum_lambda_powers_raw"])
-            obj_mode = _normalize_objective_mode(f.get("objective_mode", objective_mode))
+            obj_mode = config.normalize_objective_mode(f.get("objective_mode", objective_mode))
             f["objective_mode"] = obj_mode
             f["objective_raw"] = objective_from_trace(f["sum_lambda_powers_raw"], rows_m_val, n, obj_mode)
             f["objective_penalized"] = objective_from_trace(f["sum_lambda_powers_penalized"], rows_m_val, n, obj_mode)
@@ -562,7 +677,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                             exact_threshold=exact_threshold,
                                             objective_mode=objective_mode,
                                             use_penalty=objective_use_penalty,
-                                            cache_dir=cache_dir,
+                                            cache_dir=str(cache_dir),
                                             use_cache=use_cache)
             except Exception:
                 outs = None
@@ -581,7 +696,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                                     exact_threshold=exact_threshold,
                                                     objective_mode=objective_mode,
                                                     use_penalty=objective_use_penalty,
-                                                    cache_dir=cache_dir,
+                                                    cache_dir=str(cache_dir),
                                                     use_cache=use_cache)
                     except Exception:
                         logger.warning("second CUDA attempt failed; fallback to CPU", exc_info=True)
@@ -598,7 +713,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                                 exact_threshold=exact_threshold,
                                                 objective_mode=objective_mode,
                                                 use_penalty=objective_use_penalty,
-                                                cache_dir=cache_dir,
+                                                cache_dir=str(cache_dir),
                                                 use_cache=use_cache)
             for pos, fit in zip(miss_pos, outs):
                 key = keys[pos]
@@ -625,7 +740,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                                 exact_threshold=exact_threshold,
                                                 objective_mode=objective_mode,
                                                 use_penalty=objective_use_penalty,
-                                                cache_dir=cache_dir,
+                                                cache_dir=str(cache_dir),
                                                 use_cache=use_cache)
                 except Exception:
                     logger.warning("CUDA retry for None fits failed; fallback to CPU", exc_info=True)
@@ -643,7 +758,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                             exact_threshold=exact_threshold,
                                             objective_mode=objective_mode,
                                             use_penalty=objective_use_penalty,
-                                            cache_dir=cache_dir,
+                                            cache_dir=str(cache_dir),
                                             use_cache=use_cache)
             for pos, fit in zip(retry_pos, outs):
                 key = keys[pos]
@@ -667,7 +782,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                         exact_threshold=exact_threshold,
                                         objective_mode=objective_mode,
                                         use_penalty=objective_use_penalty,
-                                        cache_dir=cache_dir,
+                                        cache_dir=str(cache_dir),
                                         use_cache=use_cache)
             for pos, fit in zip(retry_pos, outs):
                 key = keys[pos]
@@ -682,8 +797,11 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                 logger.debug("compare summary failed", exc_info=True)
         return results, normed
 
+    ctx.heartbeat(f"start gen={start_gen}")
+    last_completed_gen = start_gen - 1
+
     # generations
-    for gen in range(generations):
+    for gen in range(start_gen, generations):
         t0 = time.time()
         fits, pop = eval_batch(pop)
         fronts = nondominated_sort(fits, obj_key=objective_key)
@@ -697,17 +815,34 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
         best_sum = best_points[0][1] if best_points else None
         with open(csv_gen, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([tag, n, k, gen, len(front0), best_R, best_sum, pop_size, device, trace_mode, sym_mode, objective_key, objective_mode])
+        last_completed_gen = gen
 
         # append this generation to front csv
-        _append_front_rows_csv(csv_front, tag, n, k, pop_bits=pop, fits=fits, front0_idx=front0)
+        _append_front_rows_csv(csv_front, tag, n, k, gen, pop_bits=pop, fits=fits, front0_idx=front0)
+
+        ctx.save_checkpoint({
+            "type": "ga",
+            "n": n,
+            "k": k,
+            "generation": gen,
+            "pop_size": pop_size,
+            "population_bits": [_bits_to_str(b) for b in pop],
+            "objective_field": objective_key,
+            "objective_mode": objective_mode,
+            "sym_mode": sym_mode,
+            "boundary": boundary,
+            "csv_front": csv_front,
+            "csv_gen": csv_gen,
+            "target_generations": generations,
+        })
 
         # heartbeat
         if progress_every and (gen % progress_every == 0):
-            with open(heartbeat, "w", encoding="utf-8") as hb:
-                hb.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} GEN={gen}\n")
-            print(f"[GA] GEN {gen:02d} | sym={sym_mode} | front0={len(front0):3d} | best=({best_R},{best_sum:.3e}) | pop={pop_size} | dt={time.time()-t0:.2f}s", flush=True)
+            ctx.heartbeat(f"GEN={gen}")
+            best_sum_disp = best_sum if best_sum is not None else float("nan")
+            print(f"[GA] GEN {gen:02d} | sym={sym_mode} | front0={len(front0):3d} | best=({best_R},{best_sum_disp:.3e}) | pop={pop_size} | dt={time.time()-t0:.2f}s", flush=True)
         else:
-            logger.info(f"[GEN {gen:02d}] sym={sym_mode} front0={len(front0)} best=({best_R},{best_sum:.3e})")
+            logger.info(f"[GEN {gen:02d}] sym={sym_mode} front0={len(front0)} best=({best_R},{best_sum})")
 
         # selection -> offspring
         new_pop: List[np.ndarray] = []
@@ -753,4 +888,20 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
             f"[FINAL {i:02d}] |R|={ft['rule_count']:3d}, rows_m={ft['rows_m']:7d}, λ1≈{ft['lambda_max']:.3e}, "
             f"obj≈{_objective_value_from_fit(ft, objective_key):.3e} ({objective_key})"
         )
+    ctx.save_checkpoint({
+        "type": "ga",
+        "n": n,
+        "k": k,
+        "generation": last_completed_gen,
+        "pop_size": pop_size,
+        "population_bits": [_bits_to_str(b) for b in pop],
+        "objective_field": objective_key,
+        "objective_mode": objective_mode,
+        "sym_mode": sym_mode,
+        "boundary": boundary,
+        "csv_front": csv_front,
+        "csv_gen": csv_gen,
+        "target_generations": generations,
+    })
+    ctx.heartbeat("done")
     return pareto_sorted, csv_front, csv_gen

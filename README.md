@@ -136,6 +136,13 @@
   - 统一通过 `rules.logging_setup.setup_logging` 控制，CLI 默认 INFO 级别。
   - 运行中会输出对称模式、缓存命中率、行枚举规模、估计采样数、边界模式等关键信息。
 
+### 运行上下文与续算（GA / pipeline）
+- `rules.runtime.RunContext` 统一封装日志（stdout + 文件）、心跳与 checkpoint：每次运行会在对应 `run_dir` 下生成 `{run_tag}.log`、`heartbeat.txt` 与 `checkpoint.json`（内含 RNG 状态）。
+- `scripts/run_pipeline.py` 默认检测 `summary.jsonl/csv` 并跳过已写入的规则（可用 `--no-resume` 禁用）；同一 `run_tag` 会在 JSONL 中即时追加，再在结束时重写 CSV/JSONL 以去重。
+- `rules.ga.ga_search_with_batch` 现在在 CSV 中记录 `generation` 列，并写入 checkpoint。重复使用相同 `run_tag` 时会从最新一代继续（保留上一代种群）；若要重新开始，请更换 `run_tag` 或清理输出目录。
+- 缓存/输出目录复用：`cache_dir`（光谱缓存）与 `run_dir`（日志+checkpoint）均可在配置/CLI 中显式设置，避免跨实验混淆的同时减少重复计算。
+- 查看进度：运行时可直接 `tail -f run_dir/{run_tag}.log` 或检查 `heartbeat.txt`；中断后再次运行相同配置即可续写，无需手动拼接 CSV/JSONL。
+
 ### 可视化与数据诊断示例
 ```bash
 # 仅绘制 perm 对称模式的 GA 与阶段一结果，并输出三张图至 out_fig/
@@ -188,7 +195,7 @@ viz.plot_all(fronts, n=4, k=3, out_dir="results/fig_open_torus", sym_filter="per
 
 ### 调用方式索引
 - **最小样例/教学演示**：`scripts/run_stage1.py`（或安装后 `rules-stage1`），走精确枚举路径，便于理解规则-图案映射。
-- **批量评估 / 研究复现**：`scripts/run_pipeline.py`（或安装后 `rules-pipeline`），统一支持对称性、边界、精确/谱估计双开关与缓存，是推荐入口。
+- **批量评估 / 研究复现**：`scripts/run_pipeline.py`（或安装后 `rules-pipeline`），统一支持对称性、边界、精确/谱估计双开关与缓存，是推荐入口，默认按 `run_tag` 自动续算（如需从头运行可加 `--no-resume`，或指定 `--seed` 固定 RNG）。
 - **多目标遗传搜索**：`scripts/run_ga.py`（或安装后 `rules-run-ga`），适合同时探索多个 $(n,k)$ 组合的帕累托前沿。
 - **可视化与 knee 点分析**：`rules.viz.plot_pareto_from_csv` / `detect_knee`，可在 GA 输出或自定义 CSV 上复用。
 - **API 复用**：直接调用 `evaluate_rules_batch`、`make_rule_matrix`、`bits_from_rule` 等函数，灵活嵌入其他优化器或实验框架。
