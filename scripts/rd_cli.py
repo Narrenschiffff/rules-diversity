@@ -130,6 +130,7 @@ def cmd_ga(args):
     sym_modes = [s.strip() for s in str(getattr(args, "sym", "perm") or "perm").split(",") if s.strip()]
     if not sym_modes:
         sym_modes = ["perm"]
+    objective_key = "objective_raw" if args.objective_use_raw else "objective_penalized"
 
     if args.reuse:
         existed = expand_globs([os.path.join(args.out_csv, f"pareto_front_n{n}_k{k}_*.csv")])
@@ -153,6 +154,9 @@ def cmd_ga(args):
         boundary=args.boundary,
         cache_dir=args.cache_dir,
         use_cache=not args.no_cache,
+        objective_mode=args.objective_mode,
+        objective_use_penalty=not args.no_objective_penalty,
+        use_penalized_objective=not args.objective_use_raw,
     )
     pareto, csv_front, csv_gen = ga_search_with_batch(n, k, conf, out_csv_dir=args.out_csv)
     print("[GA] Front CSV:", csv_front)
@@ -175,14 +179,25 @@ def cmd_ga(args):
                     enable_exact=not args.no_exact,
                     enable_spectral=not args.no_spectral,
                     exact_threshold=args.exact_threshold,
+                    objective_mode=args.objective_mode,
+                    use_penalty=not args.no_objective_penalty,
                     cache_dir=args.cache_dir,
                     use_cache=not args.no_cache,
                 )
                 summarize_trace_comparison(reports, logger=logging.getLogger(__name__))
-                best = max((float(r.get("sum_lambda_powers", -1e300)) for r in reports), default=float("nan"))
+                def _extract_obj(r: dict) -> float:
+                    for key in (objective_key, "objective_penalized", "objective_raw", "sum_lambda_powers", "sum_lambda_powers_raw"):
+                        try:
+                            val = float(r.get(key, -1e300))
+                            if np.isfinite(val):
+                                return val
+                        except Exception:
+                            continue
+                    return float("nan")
+                best = max((_extract_obj(r) for r in reports), default=float("nan"))
                 mmin = min((int(r.get("rows_m", 0)) for r in reports), default=0)
                 mmax = max((int(r.get("rows_m", 0)) for r in reports), default=0)
-                print(f"[GA][sym={mode}] sum_lambda_powers_best={best:.3e}, rows_m_range=[{mmin},{mmax}], k_sym={reports[0].get('k_sym', k) if reports else k}")
+                print(f"[GA][sym={mode}] objective({objective_key})_best={best:.3e}, rows_m_range=[{mmin},{mmax}], k_sym={reports[0].get('k_sym', k) if reports else k}")
             except Exception:
                 logging.exception("[GA] symmetry compare failed for mode=%s", mode)
 
@@ -207,12 +222,13 @@ def cmd_viz_all(args):
     from rules.viz import apply_style, plot_all, plot_three_raw_canon_for_nk
     apply_style(args.style)
     front_paths = args.front or []
+    obj_field = "objective_raw" if getattr(args, "y_objective", "penalized") == "raw" else "objective_penalized"
     if (args.n is not None) and (args.k is not None):
         # 针对单一 (n,k)：raw vs canon 三图
         try:
             p_sc, p_gr, p_kg = plot_three_raw_canon_for_nk(
                 front_paths=front_paths, n=int(args.n), k=int(args.k),
-                out_dir=args.out_dir, y_log=bool(args.y_log), style=args.style
+                out_dir=args.out_dir, y_log=bool(args.y_log), style=args.style, objective_field=obj_field
             )
             print("[viz-all(nk)] saved:", p_sc, p_gr, p_kg)
         except Exception:
@@ -221,7 +237,7 @@ def cmd_viz_all(args):
         # 聚合所有 CSV：混合三图 + 可选熵曲线
         try:
             outs = plot_all(front_paths=front_paths, out_dir=args.out_dir,
-                            y_log=bool(args.y_log), style=args.style,
+                            y_log=bool(args.y_log), style=args.style, objective_field=obj_field,
                             entropy_bits=None if args.entropy_bits is None else
                                 np.array([1 if ch=='1' else 0 for ch in str(args.entropy_bits).strip()], dtype=np.uint8),
                             entropy_k=args.entropy_k,
@@ -437,6 +453,12 @@ def main():
                     help="精确计数阈值：如 nk<=12 或 rows<=500000")
     sp.add_argument("--cache-dir", default=str(_config.EVAL_CACHE_DIR), help="评估结果缓存目录")
     sp.add_argument("--no-cache", action="store_true", help="禁用评估缓存（始终重新计算）")
+    sp.add_argument("--objective-mode", default=_config.OBJECTIVE_MODE, choices=["logZ","logZ_per_nr","no_penalty"],
+                    help="目标字段变换：logZ / logZ/(n*r) / 不施加惩罚")
+    sp.add_argument("--objective-use-raw", action="store_true",
+                    help="排序与输出使用未加惩罚的 objective_raw（默认使用罚后字段）")
+    sp.add_argument("--no-objective-penalty", action="store_true",
+                    help="禁用惩罚因子（组件/零度）乘到目标值上；仍会记录罚后字段方便对照")
     # 新增
     sp.add_argument("--progress-every", type=int, default=2)
     sp.add_argument("--fast-eval", action="store_true")
@@ -462,6 +484,8 @@ def main():
     sp.add_argument("--front", nargs="+", required=True)
     sp.add_argument("--out-dir", default="out_fig")
     sp.add_argument("--y-log", action="store_true")
+    sp.add_argument("--y-objective", default="penalized", choices=["penalized","raw"],
+                    help="选择 y 轴目标：罚后 objective_penalized 或原始 objective_raw")
     sp.add_argument("--style", default="default", choices=["default","ieee","acm","nature"])
     # 针对 (n,k) 的 raw/canon 对比
     sp.add_argument("--n", type=int, default=None)

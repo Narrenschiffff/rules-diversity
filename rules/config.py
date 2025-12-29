@@ -39,6 +39,9 @@ TRACE_MODE = os.getenv("RULES_TRACE_MODE", "hutchpp")  # hutch|hutchpp|lanczos_s
 ENABLE_EXACT = os.getenv("RULES_ENABLE_EXACT", "1") != "0"
 ENABLE_SPECTRAL = os.getenv("RULES_ENABLE_SPECTRAL", "1") != "0"
 EXACT_THRESHOLD = os.getenv("RULES_EXACT_THRESHOLD", "nk<=12")
+# 目标函数：logZ（默认）、logZ/(n*r)、no_penalty（不施加惩罚因子）；可通过 CLI 或 GAConfig 覆盖
+OBJECTIVE_MODE = os.getenv("RULES_OBJECTIVE_MODE", "logZ")
+OBJECTIVE_USE_PENALTY = os.getenv("RULES_OBJECTIVE_USE_PENALTY", "1") != "0"
 
 # 对称性分析默认
 SYM_GEO_OPS = os.getenv("RULES_SYM_GEO_OPS", "rot,ref,trans")

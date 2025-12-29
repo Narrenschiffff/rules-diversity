@@ -120,9 +120,13 @@ def test_ga_respects_symmetry_modes(tmp_path: Path):
         with open(front_path, newline="", encoding="utf-8") as f:
             rows = list(csv.reader(f))
 
-        assert rows[0][0:4] == ["run_tag", "n", "k", "rule_bits"]
+        header = rows[0]
+        assert header[0:4] == ["run_tag", "n", "k", "rule_bits"]
+        sym_idx = header.index("sym_mode")
+        active_k_idx = header.index("active_k")
+        active_k_raw_idx = header.index("active_k_raw")
         # All data rows should carry the requested symmetry label and active_k columns.
         for data in rows[1:]:
-            assert data[14] == sym_mode
-            assert data[11] != ""  # active_k
-            assert data[12] != ""  # active_k_raw
+            assert data[sym_idx] == sym_mode
+            assert data[active_k_idx] != ""  # active_k
+            assert data[active_k_raw_idx] != ""  # active_k_raw

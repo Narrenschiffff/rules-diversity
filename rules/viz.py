@@ -102,7 +102,7 @@ def summarize_runs(csv_paths: Iterable[str], sym_filter: Optional[str] = None) -
 def _warn_trace_diff(rows: List[dict], label: str = "") -> None:
     errs = []
     for r in rows:
-        te = r.get("trace_estimate", r.get("sum_lambda_powers", ""))
+        te = r.get("trace_estimate_raw", r.get("trace_estimate", r.get("sum_lambda_powers", "")))
         tx = r.get("trace_exact", r.get("exact_Z", ""))
         try:
             te = float(te) if te not in ("", None) else float("nan")
@@ -125,15 +125,25 @@ def _warn_trace_diff(rows: List[dict], label: str = "") -> None:
     else:
         print(msg)
 
-def _y_metric(row: dict) -> float:
-    v = row.get("trace_estimate", row.get("sum_lambda_powers",""))
-    if v!="":
-        try: return float(v)
-        except: pass
-    v = row.get("trace_exact", row.get("Z_exact",""))
-    if v!="":
-        try: return float(v)
-        except: pass
+def _y_metric(row: dict, prefer_field: Optional[str] = None) -> float:
+    fields = []
+    if prefer_field:
+        fields.append(prefer_field)
+    fields.extend([
+        "objective_penalized",
+        "objective_raw",
+        "trace_estimate",
+        "sum_lambda_powers",
+        "trace_exact",
+        "Z_exact",
+    ])
+    for key in fields:
+        v = row.get(key, "")
+        if v != "":
+            try:
+                return float(v)
+            except Exception:
+                pass
     return float("nan")
 
 def _bounds(row: dict) -> Tuple[Optional[float], Optional[float]]:
@@ -264,7 +274,7 @@ def _unit_best_idx(xs, ys):
 # =========================
 # 绘制三图（指定 n,k）
 # =========================
-def _bucket_best_and_band(rows: List[dict], use_logy: bool) -> Tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray]:
+def _bucket_best_and_band(rows: List[dict], use_logy: bool, objective_field: Optional[str] = None) -> Tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray]:
     bucket: Dict[int, Dict[str, float]] = {}
     mins: Dict[int, float] = {}
     maxs: Dict[int, float] = {}
@@ -273,7 +283,7 @@ def _bucket_best_and_band(rows: List[dict], use_logy: bool) -> Tuple[np.ndarray,
             rc = int(r["rule_count"])
         except:
             continue
-        est = _y_metric(r)
+        est = _y_metric(r, prefer_field=objective_field)
         lo, hi = _bounds(r)
         cur = bucket.get(rc)
         if (cur is None) or (est > cur["est"]):
@@ -301,7 +311,8 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
                                 out_dir: str = "./out_fig",
                                 y_log: bool = False,
                                 style: str = "default",
-                                sym_filter: Optional[str] = None) -> Tuple[str,str,str]:
+                                sym_filter: Optional[str] = None,
+                                objective_field: Optional[str] = None) -> Tuple[str,str,str]:
     apply_style(style); os.makedirs(out_dir, exist_ok=True)
     series = _collect_by_series_for_nk(front_paths, n, k, sym_filter=sym_filter)
     order  = ["stage1_raw", "stage1_canon", "ga_canon"]
@@ -317,7 +328,7 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
         xs, ys = [], []
         for r in rows:
             try:
-                xs.append(int(r["rule_count"])); ys.append(_y_metric(r))
+                xs.append(int(r["rule_count"])); ys.append(_y_metric(r, prefer_field=objective_field))
             except: pass
         xs, ys = np.asarray(xs,float), np.asarray(ys,float)
         m = np.isfinite(ys) & (ys>0 if y_log else np.isfinite(ys))
@@ -336,7 +347,7 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
     fig2, ax2 = plt.subplots(); anyp=False
     for key in order:
         rows = series.get(key, [])
-        xs, est, lo, hi = _bucket_best_and_band(rows, use_logy=y_log)
+        xs, est, lo, hi = _bucket_best_and_band(rows, use_logy=y_log, objective_field=objective_field)
         if xs.size==0: continue
         xj = xs + jitter[key]
         ax2.plot(xj, est, marker=markers[key], linestyle=linest[key], alpha=0.95, label=labels[key])
@@ -365,13 +376,13 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
     painted_gap=False; painted_trace=False
     for key in order:
         rows = series.get(key, [])
-        xs, est, _, _ = _bucket_best_and_band(rows, use_logy=y_log)
+        xs, est, _, _ = _bucket_best_and_band(rows, use_logy=y_log, objective_field=objective_field)
         if xs.size==0: continue
         # 同 |R| 选择 best-y 的 gap
         bucket_gap = {}
         for r in rows:
             try:
-                rc = int(r["rule_count"]); y = _y_metric(r)
+                rc = int(r["rule_count"]); y = _y_metric(r, prefer_field=objective_field)
                 if not np.isfinite(y): continue
                 cur = bucket_gap.get(rc)
                 if (cur is None) or (y>cur["y"]): bucket_gap[rc] = {"y":y, "gap":_gap_12(r)}
@@ -416,7 +427,8 @@ def plot_all(front_paths: List[str],
              out_dir: str="./out_fig",
              y_log: bool=False,
              style: str="default",
-             sym_filter: Optional[str] = None)->List[str]:
+             sym_filter: Optional[str] = None,
+             objective_field: Optional[str] = None)->List[str]:
     """
     兼容 rd_cli.py:
       - 若给定 n,k：仅绘制该 (n,k) 的三张图；
@@ -426,11 +438,11 @@ def plot_all(front_paths: List[str],
     apply_style(style); os.makedirs(out_dir, exist_ok=True)
     outs=[]
     if (n is not None) and (k is not None):
-        outs += list(plot_three_raw_canon_for_nk(front_paths, n, k, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter))
+        outs += list(plot_three_raw_canon_for_nk(front_paths, n, k, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter, objective_field=objective_field))
         return outs
     # 自动发现
     for n0,k0 in _discover_all_nk(front_paths):
-        outs += list(plot_three_raw_canon_for_nk(front_paths, n0, k0, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter))
+        outs += list(plot_three_raw_canon_for_nk(front_paths, n0, k0, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter, objective_field=objective_field))
     return outs
 
 # =========================
