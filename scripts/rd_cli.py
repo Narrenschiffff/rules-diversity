@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Unified CLI for rules-diversity (final, refactored).
-Commands: stage1, ga, viz, entropy, viz-all, motifs, motifs-explain, archetypes, symmetry.
+Commands: stage1, ga, viz, entropy, viz-all, viz-frontier, motifs, motifs-explain, archetypes, symmetry.
 """
 from __future__ import annotations
 import sys, argparse, logging, glob, os, numpy as np
@@ -263,6 +263,31 @@ def cmd_viz_all(args):
         except Exception:
             import sys, logging; logging.exception("[viz-all] failed"); sys.exit(1)
 
+def cmd_viz_frontier(args):
+    from rules.viz import apply_style, plot_frontier_surfaces
+    apply_style(args.style)
+    try:
+        ks = [int(k) for k in args.k]
+        outs, data = plot_frontier_surfaces(
+            front_csvs=args.front,
+            ks=ks,
+            boundary=args.boundary,
+            sym_mode=args.sym,
+            metric=args.metric,
+            plot_types=args.plot_type,
+            out_dir=args.out_dir,
+            style=args.style,
+            contour_levels=args.contour_levels,
+            wireframe_stride=args.wireframe_stride,
+        )
+        for p in outs:
+            print("[viz-frontier] saved:", os.path.abspath(p))
+        for d in data:
+            pts = "; ".join(f"{p.kind} (n={p.n}, |R|={p.rule_count}, z={p.metric:.3g})" for p in d.key_points) or "none"
+            print(f"[viz-frontier] k={d.k} boundary={d.boundary} sym={d.sym_mode} metric={d.metric_field} key-points: {pts}")
+    except Exception:
+        logging.exception("[viz-frontier] failed"); sys.exit(1)
+
 def cmd_motifs(args):
     from rules.motifs import analyze_fronts_for_knees, analyze_fronts_for_mur
     paths = expand_globs(args.front)
@@ -521,6 +546,20 @@ def main():
     sp.add_argument("--n-max", type=int, default=10)
     sp.add_argument("--device", default="cpu", choices=["cpu","cuda"])
     sp.set_defaults(func=cmd_viz_all)
+
+    # --- viz-frontier ---
+    sp = subparsers.add_parser("viz-frontier", help="多 k 叠加的前沿曲面/等高线可视化（含膝点/MUR/极值标注）")
+    sp.add_argument("--front", nargs="+", required=True, help="前沿 CSV（支持通配）")
+    sp.add_argument("--k", nargs="+", required=True, help="要叠加的 k 值（可多个）")
+    sp.add_argument("--boundary", default=_config.BOUNDARY_MODE, help="边界条件过滤；缺省取 CSV 中唯一值或配置默认值")
+    sp.add_argument("--sym", default=None, help="对称模式过滤；缺省尝试从 CSV 推断，否则不做过滤")
+    sp.add_argument("--metric", default="objective_penalized", help="目标字段（如 objective_penalized/objective_raw/sum_lambda_powers 等）")
+    sp.add_argument("--plot-type", nargs="+", default=["surface"], choices=["surface","wireframe","contour"])
+    sp.add_argument("--contour-levels", type=int, default=10)
+    sp.add_argument("--wireframe-stride", type=int, default=1)
+    sp.add_argument("--out-dir", default="out_fig")
+    sp.add_argument("--style", default="default", choices=["default","ieee","acm","nature"])
+    sp.set_defaults(func=cmd_viz_frontier)
 
     # --- motifs ---
     sp = subparsers.add_parser("motifs", help="膝点关键结构识别与跨(n,k)归纳")

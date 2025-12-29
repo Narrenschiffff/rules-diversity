@@ -196,6 +196,29 @@ class EntropySeries:
     sources: List[str]
 
 
+@dataclass
+class KeyPoint:
+    kind: str
+    n: float
+    rule_count: float
+    metric: float
+    label: str
+
+
+@dataclass
+class FrontierSurfaceData:
+    k: int
+    boundary: str
+    sym_mode: str
+    metric_field: str
+    ns: np.ndarray
+    rule_counts: np.ndarray
+    grid: np.ndarray
+    best_curve_metric: np.ndarray
+    best_curve_n: np.ndarray
+    key_points: List[KeyPoint]
+
+
 def _prepare_entropy_series(rule_bits: Optional[str],
                             k: Optional[int],
                             n_min: int,
@@ -492,6 +515,145 @@ def _collect_by_series_for_nk(csv_paths: Iterable[str], n:int, k:int, sym_filter
     return out
 
 # =========================
+# 前沿曲面/等高线
+# =========================
+def _extract_key_points(rule_counts: np.ndarray,
+                        metrics: np.ndarray,
+                        ns_for_rule: np.ndarray) -> List[KeyPoint]:
+    xs = np.asarray(rule_counts, float)
+    ys = np.asarray(metrics, float)
+    ns = np.asarray(ns_for_rule, float)
+    m = np.isfinite(xs) & np.isfinite(ys) & np.isfinite(ns)
+    if not m.any():
+        return []
+    xs = xs[m]; ys = ys[m]; ns = ns[m]
+    points: List[KeyPoint] = []
+    i2 = _knee_second(xs, ys, logy=True)
+    if i2 is not None:
+        points.append(KeyPoint("knee-2Δ", ns[i2], xs[i2], ys[i2], f"knee-2Δ |R|={int(xs[i2])}"))
+    il = _knee_l(xs, ys, logxy=True)
+    if il is not None:
+        points.append(KeyPoint("knee-L", ns[il], xs[il], ys[il], f"knee-L |R|={int(xs[il])}"))
+    iu = _unit_best_idx(xs, ys)
+    if iu is not None:
+        points.append(KeyPoint("unit-best", ns[iu], xs[iu], ys[iu], f"unit-best |R|={int(xs[iu])}"))
+    try:
+        imax = int(np.nanargmax(ys))
+        points.append(KeyPoint("max", ns[imax], xs[imax], ys[imax], f"max |R|={int(xs[imax])}"))
+    except Exception:
+        pass
+    points.sort(key=lambda p: (p.rule_count, p.kind))
+    return points
+
+
+def _prepare_surface_data(front_csvs: Iterable[str],
+                          ks: Sequence[int],
+                          boundary: Optional[str],
+                          sym_mode: Optional[str],
+                          metric_field: Optional[str]) -> List[FrontierSurfaceData]:
+    paths = _expand_globs(front_csvs)
+    rows_by_file = _load_rows(paths)
+    all_rows: List[dict] = []
+    for rr in rows_by_file.values():
+        all_rows.extend(rr)
+
+    outs: List[FrontierSurfaceData] = []
+    for k in ks:
+        selected: List[dict] = []
+        for r in all_rows:
+            try:
+                if int(r.get("k", -1)) != int(k):
+                    continue
+                _ = int(r.get("n", -1))
+                _ = int(r.get("rule_count", -1))
+            except Exception:
+                continue
+            selected.append(r)
+
+        if not selected:
+            continue
+
+        try:
+            k_boundary = boundary or _unique_field(selected, "boundary") or config.BOUNDARY_MODE
+        except ValueError:
+            k_boundary = boundary or config.BOUNDARY_MODE
+        try:
+            k_sym_mode = sym_mode or _unique_field(selected, "sym_mode") or "perm"
+        except ValueError:
+            k_sym_mode = sym_mode or "perm"
+        filtered: List[dict] = []
+        for r in selected:
+            b = str(r.get("boundary", "")).strip()
+            s = str(r.get("sym_mode", "")).strip()
+            if k_boundary and b and (b != k_boundary):
+                continue
+            if k_sym_mode and s and (s != k_sym_mode):
+                continue
+            filtered.append(r)
+
+        ns_set: set[int] = set()
+        rc_set: set[int] = set()
+        z_map: Dict[Tuple[int, int], float] = {}
+
+        for r in filtered:
+            try:
+                n_val = int(r.get("n"))
+                rc_val = int(r.get("rule_count"))
+            except Exception:
+                continue
+            z = _y_metric(r, prefer_field=metric_field)
+            if not np.isfinite(z):
+                continue
+            key = (n_val, rc_val)
+            prev = z_map.get(key, -np.inf)
+            if z > prev:
+                z_map[key] = z
+                ns_set.add(n_val)
+                rc_set.add(rc_val)
+
+        ns = np.array(sorted(ns_set), dtype=float)
+        rcs = np.array(sorted(rc_set), dtype=float)
+        if ns.size == 0 or rcs.size == 0:
+            continue
+
+        grid = np.full((rcs.size, ns.size), np.nan, dtype=float)
+        rc_idx = {rc: i for i, rc in enumerate(rcs)}
+        n_idx = {n: j for j, n in enumerate(ns)}
+        for (n_val, rc_val), z in z_map.items():
+            i = rc_idx.get(rc_val)
+            j = n_idx.get(n_val)
+            if i is None or j is None:
+                continue
+            grid[i, j] = z
+
+        best_z = np.full(rcs.shape, np.nan, dtype=float)
+        best_n = np.full(rcs.shape, np.nan, dtype=float)
+        for i in range(rcs.size):
+            row = grid[i]
+            if np.isfinite(row).any():
+                j = int(np.nanargmax(row))
+                best_z[i] = row[j]
+                best_n[i] = ns[j]
+
+        key_points = _extract_key_points(rule_counts=rcs, metrics=best_z, ns_for_rule=best_n)
+        outs.append(FrontierSurfaceData(
+            k=int(k),
+            boundary=str(k_boundary),
+            sym_mode=str(k_sym_mode),
+            metric_field=str(metric_field or "objective_penalized"),
+            ns=ns,
+            rule_counts=rcs,
+            grid=grid,
+            best_curve_metric=best_z,
+            best_curve_n=best_n,
+            key_points=key_points,
+        ))
+    if not outs:
+        raise ValueError("no rows matched the requested ks/boundary/sym_mode")
+    return outs
+
+
+# =========================
 # 膝点/单位复杂度（离散）
 # =========================
 def _knee_second(xs, ys, logy=True):
@@ -524,6 +686,94 @@ def _unit_best_idx(xs, ys):
     mur = dy / np.maximum(dx, 1e-9)
     j = int(np.nanargmax(mur))
     return j + 1  # 与差分对齐到右端点
+
+
+def plot_frontier_surfaces(front_csvs: Iterable[str],
+                           ks: Sequence[int],
+                           boundary: Optional[str] = None,
+                           sym_mode: Optional[str] = None,
+                           metric: Optional[str] = "objective_penalized",
+                           plot_types: Sequence[str] | str = ("surface",),
+                           out_dir: str = "./out_fig",
+                           style: str = "default",
+                           contour_levels: int = 10,
+                           wireframe_stride: int = 1) -> Tuple[List[str], List[FrontierSurfaceData]]:
+    """绘制 (n, |R|, 目标值) 的前沿曲面/等高线，并标注膝点/MUR/极值。
+
+    返回：(输出图片路径列表, 对每个 k 的关键点数据)。
+    """
+    apply_style(style); os.makedirs(out_dir, exist_ok=True)
+    types = [plot_types] if isinstance(plot_types, str) else list(plot_types)
+    types = [str(t).lower() for t in types]
+    for t in types:
+        if t not in ("surface", "wireframe", "contour"):
+            raise ValueError("plot_types must be surface, wireframe, or contour")
+
+    data = _prepare_surface_data(front_csvs, ks=ks, boundary=boundary, sym_mode=sym_mode, metric_field=metric)
+    cmap = plt.get_cmap("tab10")
+    outs: List[str] = []
+
+    for t in types:
+        if t in ("surface", "wireframe"):
+            fig = plt.figure()
+            ax = fig.add_subplot(111, projection="3d")
+            proxies: List[mpl.lines.Line2D] = []
+            labels: List[str] = []
+            for idx, d in enumerate(data):
+                color = cmap(idx % cmap.N)
+                X, Y = np.meshgrid(d.ns, d.rule_counts)
+                Z = np.ma.array(d.grid, mask=~np.isfinite(d.grid))
+                if t == "surface":
+                    ax.plot_surface(X, Y, Z, color=color, alpha=0.65, linewidth=0.3, antialiased=True)
+                else:
+                    ax.plot_wireframe(X, Y, Z, color=color, rstride=max(1, wireframe_stride),
+                                      cstride=max(1, wireframe_stride), linewidth=0.8, alpha=0.9)
+                kp_sorted = sorted(d.key_points, key=lambda p: p.rule_count)
+                if kp_sorted:
+                    xs = [p.n for p in kp_sorted]; ys = [p.rule_count for p in kp_sorted]; zs = [p.metric for p in kp_sorted]
+                    ax.plot(xs, ys, zs, color=color, linestyle="--", marker="o", alpha=0.95, label=f"k={d.k} key pts")
+                    for p in kp_sorted:
+                        ax.scatter([p.n], [p.rule_count], [p.metric], color=color, s=55, marker="D")
+                        ax.text(p.n, p.rule_count, p.metric, f"{p.kind} (k={d.k})", color=color, fontsize=8)
+                proxies.append(mpl.lines.Line2D([0], [0], color=color, lw=2))
+                labels.append(f"k={d.k}")
+            ax.set_xlabel("n"); ax.set_ylabel("|R|"); ax.set_zlabel(metric or "objective")
+            ax.set_title(f"Frontier surface ({t}) — boundary={data[0].boundary}, sym={data[0].sym_mode}")
+            ax.legend(proxies, labels, loc="best")
+            fig.tight_layout()
+            fname = f"frontier_{t}_k{'-'.join(str(k) for k in ks)}_{_shorten(metric or 'objective', 20)}.png"
+            out_path = os.path.join(out_dir, fname)
+            fig.savefig(out_path, dpi=220)
+            plt.close(fig)
+            outs.append(out_path)
+        elif t == "contour":
+            fig, ax = plt.subplots()
+            for idx, d in enumerate(data):
+                color = cmap(idx % cmap.N)
+                X, Y = np.meshgrid(d.ns, d.rule_counts)
+                Z = np.ma.array(d.grid, mask=~np.isfinite(d.grid))
+                if np.isfinite(Z).any():
+                    cs = ax.contour(X, Y, Z, levels=contour_levels, colors=[color], linewidths=1.0, alpha=0.85)
+                    ax.clabel(cs, inline=True, fmt=lambda v: f"{v:.2g}", fontsize=8)
+                kp_sorted = sorted(d.key_points, key=lambda p: p.rule_count)
+                if kp_sorted:
+                    xs = [p.n for p in kp_sorted]; ys = [p.rule_count for p in kp_sorted]
+                    ax.plot(xs, ys, color=color, linestyle="--", marker="o", label=f"k={d.k} key pts")
+                    for p in kp_sorted:
+                        ax.text(p.n, p.rule_count, f"{p.kind}\n{p.metric:.2g}", color=color, fontsize=8,
+                                ha="left", va="bottom")
+            ax.set_xlabel("n"); ax.set_ylabel("|R|")
+            ax.set_title(f"Frontier contours — boundary={data[0].boundary}, sym={data[0].sym_mode}, metric={metric}")
+            if any(d.key_points for d in data):
+                ax.legend(loc="best")
+            fig.tight_layout()
+            fname = f"frontier_contour_k{'-'.join(str(k) for k in ks)}_{_shorten(metric or 'objective', 20)}.png"
+            out_path = os.path.join(out_dir, fname)
+            fig.savefig(out_path, dpi=220)
+            plt.close(fig)
+            outs.append(out_path)
+
+    return outs, data
 
 # =========================
 # 绘制三图（指定 n,k）

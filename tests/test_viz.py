@@ -205,3 +205,58 @@ def test_entropy_requires_bits_or_rows(tmp_path: Path):
             read_existing_exact=True,
             read_existing_estimate=True,
         )
+
+
+def test_frontier_surface_keypoints_and_contour(tmp_path: Path):
+    front_k2 = tmp_path / "front_k2.csv"
+    _write_csv(
+        front_k2,
+        [
+            {"n": 2, "k": 2, "rule_count": 1, "objective_penalized": 1.2, "boundary": "torus", "sym_mode": "perm"},
+            {"n": 2, "k": 2, "rule_count": 2, "objective_penalized": 2.8, "boundary": "torus", "sym_mode": "perm"},
+            {"n": 2, "k": 2, "rule_count": 3, "objective_penalized": 2.9, "boundary": "torus", "sym_mode": "perm"},
+            {"n": 3, "k": 2, "rule_count": 1, "objective_penalized": 1.3, "boundary": "torus", "sym_mode": "perm"},
+            {"n": 3, "k": 2, "rule_count": 2, "objective_penalized": 3.0, "boundary": "torus", "sym_mode": "perm"},
+            {"n": 3, "k": 2, "rule_count": 3, "objective_penalized": 3.4, "boundary": "torus", "sym_mode": "perm"},
+        ],
+    )
+    front_k3 = tmp_path / "front_k3.csv"
+    _write_csv(
+        front_k3,
+        [
+            {"n": 2, "k": 3, "rule_count": 1, "objective_penalized": 0.8, "boundary": "torus", "sym_mode": "perm"},
+            {"n": 2, "k": 3, "rule_count": 2, "objective_penalized": 1.1, "boundary": "torus", "sym_mode": "perm"},
+            {"n": 2, "k": 3, "rule_count": 3, "objective_penalized": 1.4, "boundary": "torus", "sym_mode": "perm"},
+            {"n": 3, "k": 3, "rule_count": 1, "objective_penalized": 0.9, "boundary": "torus", "sym_mode": "perm"},
+            {"n": 3, "k": 3, "rule_count": 2, "objective_penalized": 1.6, "boundary": "torus", "sym_mode": "perm"},
+            {"n": 3, "k": 3, "rule_count": 3, "objective_penalized": 1.9, "boundary": "torus", "sym_mode": "perm"},
+        ],
+    )
+
+    out_dir = tmp_path / "figs"
+    figs, data = viz.plot_frontier_surfaces(
+        front_csvs=[str(front_k2), str(front_k3)],
+        ks=[2, 3],
+        boundary="torus",
+        sym_mode="perm",
+        metric="objective_penalized",
+        plot_types=["contour"],
+        out_dir=str(out_dir),
+        style="default",
+        contour_levels=4,
+    )
+    assert len(figs) == 1
+    assert Path(figs[0]).exists()
+
+    by_k = {d.k: d for d in data}
+    assert set(by_k.keys()) == {2, 3}
+
+    k2_points = {p.kind: p for p in by_k[2].key_points}
+    assert k2_points["max"].rule_count == pytest.approx(3)
+    assert k2_points["max"].n == pytest.approx(3)
+    assert k2_points["knee-2Δ"].rule_count == pytest.approx(2)
+    assert by_k[2].best_curve_metric[np.nanargmax(by_k[2].best_curve_metric)] == pytest.approx(3.4)
+
+    k3_points = {p.kind: p for p in by_k[3].key_points}
+    assert k3_points["knee-2Δ"].rule_count == pytest.approx(2)
+    assert k3_points["max"].metric == pytest.approx(1.9)
