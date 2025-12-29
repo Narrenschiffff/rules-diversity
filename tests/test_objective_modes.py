@@ -58,6 +58,39 @@ def test_objective_mode_normalizes_by_rows_and_n():
     assert math.isclose(fit["objective_penalized"], expected_pen, rel_tol=1e-6, abs_tol=1e-9)
 
 
+def test_penalty_modes_n_and_rule_count():
+    bits = _three_state_diag_bits()
+    fit_n = evaluate_rules_batch(
+        n=2,
+        k=3,
+        bits_list=[bits],
+        device="cpu",
+        use_lanczos=False,
+        enable_exact=True,
+        penalty_mode="n",
+        use_penalty=False,
+    )[0]
+    assert fit_n["penalty_factor"] == pytest.approx(2.0)
+    assert fit_n["sum_lambda_powers_penalized"] == pytest.approx(
+        fit_n["sum_lambda_powers_raw"] / fit_n["penalty_factor"]
+    )
+
+    fit_rc = evaluate_rules_batch(
+        n=2,
+        k=3,
+        bits_list=[bits],
+        device="cpu",
+        use_lanczos=False,
+        enable_exact=True,
+        penalty_mode="n_times_rule_count",
+        use_penalty=False,
+    )[0]
+    assert fit_rc["penalty_factor"] == pytest.approx(2.0 * fit_rc["rule_count"])
+    assert fit_rc["sum_lambda_powers_penalized"] == pytest.approx(
+        fit_rc["sum_lambda_powers_raw"] / fit_rc["penalty_factor"]
+    )
+
+
 def test_ga_sorting_respects_objective_choice():
     fits = [
         {"rule_count": 1, "objective_penalized": 0.5, "objective_raw": 1.0, "sum_lambda_powers": 0.5},
