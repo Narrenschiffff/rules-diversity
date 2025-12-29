@@ -27,12 +27,15 @@ def test_evaluate_records_raw_and_penalized_fields():
     fit = reports[0]
 
     assert "sum_lambda_powers_raw" in fit and "sum_lambda_powers_penalized" in fit
-    assert fit["penalty_factor"] < 1.0
+    assert fit["penalty_factor"] == pytest.approx(2 * fit["rows_m"])
     assert fit["sum_lambda_powers"] == pytest.approx(fit["sum_lambda_powers_raw"])
     assert fit["sum_lambda_powers_penalized"] == pytest.approx(
-        fit["sum_lambda_powers_raw"] * fit["penalty_factor"]
+        fit["sum_lambda_powers_raw"] / fit["penalty_factor"]
     )
-    assert fit["objective_raw"] >= fit["objective_penalized"]
+    expected_penalized = math.log(max(fit["sum_lambda_powers_raw"], 1e-300)) / (
+        2 * max(1, fit["rows_m"])
+    )
+    assert fit["objective_penalized"] == pytest.approx(expected_penalized)
 
 
 def test_objective_mode_normalizes_by_rows_and_n():
@@ -49,8 +52,10 @@ def test_objective_mode_normalizes_by_rows_and_n():
     )
     fit = reports[0]
     denom = 2 * max(1, fit["rows_m"])
-    expected = math.log(max(fit["sum_lambda_powers_raw"], 1e-300)) / denom
+    expected = math.log(max(fit["sum_lambda_powers_raw"], 1e-300))
     assert math.isclose(fit["objective_raw"], expected, rel_tol=1e-6, abs_tol=1e-9)
+    expected_pen = expected / denom
+    assert math.isclose(fit["objective_penalized"], expected_pen, rel_tol=1e-6, abs_tol=1e-9)
 
 
 def test_ga_sorting_respects_objective_choice():

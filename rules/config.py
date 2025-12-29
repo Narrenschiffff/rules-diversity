@@ -41,9 +41,12 @@ TRACE_MODE = os.getenv("RULES_TRACE_MODE", "hutchpp")  # hutch|hutchpp|lanczos_s
 ENABLE_EXACT = os.getenv("RULES_ENABLE_EXACT", "1") != "0"
 ENABLE_SPECTRAL = os.getenv("RULES_ENABLE_SPECTRAL", "1") != "0"
 EXACT_THRESHOLD = os.getenv("RULES_EXACT_THRESHOLD", "nk<=12")
-# 目标函数：logZ（默认）、logZ/(n*r)、no_penalty（不施加惩罚因子）；可通过 CLI 或 GAConfig 覆盖
-OBJECTIVE_MODE = os.getenv("RULES_OBJECTIVE_MODE", "logZ")
+
+# 目标函数 / 惩罚：logZ（raw）与 logZ/(n*r)（penalized）可切换；可通过 CLI 或 GAConfig 覆盖
+OBJECTIVE_MODE = os.getenv("RULES_OBJECTIVE_MODE", "logZ_per_nr")
 OBJECTIVE_USE_PENALTY = os.getenv("RULES_OBJECTIVE_USE_PENALTY", "1") != "0"
+# 惩罚模式：当前仅支持 n*r（r=rows_m）；便于后续扩展
+PENALTY_MODE = os.getenv("RULES_PENALTY_MODE", "n_times_r")
 
 # 对称性分析默认
 SYM_GEO_OPS = os.getenv("RULES_SYM_GEO_OPS", "rot,ref,trans")
@@ -82,7 +85,7 @@ def normalize_objective_mode(mode: Optional[str]) -> str:
     if m in ("logz_per_nr", "logz_per_mr", "logz_norm", "logz_per_nk"):
         return "logZ_per_nr"
     if m in ("no_penalty", "raw", "unpenalized", "nop"):
-        return "no_penalty"
+        return "logZ"
     return "logZ"
 
 
@@ -100,6 +103,18 @@ def resolve_objective(mode: Optional[str], use_penalty: Optional[bool], prefer_p
         "objective_use_penalty": penalty,
         "objective_field": field,
     }
+
+
+def penalty_factor_from_shape(n: int, rows_m: int, mode: Optional[str] = None) -> float:
+    """
+    统一的惩罚因子定义。
+    当前模式：n_times_r -> penalty = n * rows_m（至少为 1，避免除零）。
+    """
+    m = (mode or PENALTY_MODE).strip().lower()
+    if m not in ("n_times_r",):
+        raise ValueError(f"penalty mode '{mode}' not supported")
+    factor = max(1.0, float(n) * max(1.0, float(rows_m)))
+    return factor
 
 
 __all__ = [
@@ -121,6 +136,7 @@ __all__ = [
     "EXACT_THRESHOLD",
     "OBJECTIVE_MODE",
     "OBJECTIVE_USE_PENALTY",
+    "PENALTY_MODE",
     "SYM_GEO_OPS",
     "SYM_ENUM_LIMIT",
     "SYM_SAMPLES",
@@ -128,4 +144,5 @@ __all__ = [
     "normalize_sym_mode",
     "normalize_objective_mode",
     "resolve_objective",
+    "penalty_factor_from_shape",
 ]

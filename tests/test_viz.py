@@ -133,8 +133,8 @@ def test_entropy_convergence_aggregates_csv(tmp_path: Path):
                 "boundary": "torus",
                 "sym_mode": "perm",
                 "rule_bits": "1111",
-                "trace_exact": 8.0,
-                "penalty_factor": 0.5,
+                "sum_lambda_powers_penalized": 8.0 / 3.0,
+                "penalty_factor": 3.0,
             }
         ],
     )
@@ -147,8 +147,8 @@ def test_entropy_convergence_aggregates_csv(tmp_path: Path):
                 "boundary": "torus",
                 "sym_mode": "perm",
                 "rule_bits": "1111",
-                "trace_estimate_raw": 16.0,
-                "penalty_factor": 2.0,
+                "sum_lambda_powers_penalized": 4.0,
+                "penalty_factor": 4.0,
             }
         ],
     )
@@ -170,7 +170,7 @@ def test_entropy_convergence_aggregates_csv(tmp_path: Path):
     assert series.k == 2
     assert series.boundary == "torus"
     np.testing.assert_allclose(series.n_vals, [3, 4])
-    expected = [math.log(8.0 * 0.5) / 3.0, math.log(16.0 * 2.0) / 4.0]
+    expected = [math.log(8.0 / 3.0) / 3.0, math.log(4.0) / 4.0]
     np.testing.assert_allclose(series.log_vals, expected)
 
     out_figs = viz.plot_entropy_convergence(
@@ -260,3 +260,35 @@ def test_frontier_surface_keypoints_and_contour(tmp_path: Path):
     k3_points = {p.kind: p for p in by_k[3].key_points}
     assert k3_points["knee-2Δ"].rule_count == pytest.approx(2)
     assert k3_points["max"].metric == pytest.approx(1.9)
+
+
+def test_bucket_band_penalty_alignment():
+    rows = [
+        {
+            "rule_count": 1,
+            "sum_lambda_powers_raw": 10.0,
+            "sum_lambda_powers_penalized": 2.0,
+            "lower_bound_raw": 8.0,
+            "upper_bound_raw": 12.0,
+            "penalty_factor": 5.0,
+        },
+        {
+            "rule_count": 2,
+            "sum_lambda_powers_raw": 6.0,
+            "sum_lambda_powers_penalized": 3.0,
+            "lower_bound": 2.0,
+            "upper_bound": 4.0,
+            "penalty_factor": 2.0,
+        },
+    ]
+
+    xs_pen, est_pen, lo_pen, hi_pen = viz._bucket_best_and_band(rows, use_logy=False, use_penalty=True)
+    xs_raw, est_raw, lo_raw, hi_raw = viz._bucket_best_and_band(rows, use_logy=False, use_penalty=False)
+
+    assert est_pen.tolist() == pytest.approx([2.0, 3.0])
+    assert lo_pen.tolist() == pytest.approx([8.0 / 5.0, 2.0])
+    assert hi_pen.tolist() == pytest.approx([12.0 / 5.0, 4.0])
+
+    assert est_raw.tolist() == pytest.approx([10.0, 6.0])
+    assert lo_raw.tolist() == pytest.approx([8.0, 2.0])
+    assert hi_raw.tolist() == pytest.approx([12.0, 4.0])
