@@ -353,7 +353,7 @@ def _y_metric(row: dict) -> float:
     - 优先 Z_exact（精确解）
     - 若无，则取 Z_est / sum_lambda_powers / objective 等近似
     """
-    for key in ("Z_exact", "Z_est", "sum_lambda_powers", "objective", "y"):
+    for key in ("Z_exact", "Z_est", "objective_penalized", "objective_raw", "sum_lambda_powers", "objective", "y"):
         val = row.get(key, "")
         if val not in ("", None, "nan", "NaN"):
             try:
@@ -891,4 +891,3 @@ def analyze_fronts_for_mur(csv_paths: List[str],
         pass
 
     return str(ex_path), str(sum_path), str(glob_path), []
-

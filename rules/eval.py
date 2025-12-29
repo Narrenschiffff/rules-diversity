@@ -36,7 +36,7 @@ from .stage1_exact import enumerate_ring_rows, count_patterns_transfer_matrix
 # ------------------------------
 
 def _bool_or(a: Optional[bool], b: bool) -> bool:
-    return b if a is None else (a or b)
+    return b if a is None else bool(a)
 
 # ------------------------------
 # 规则矩阵编解码
@@ -669,6 +669,33 @@ def _upper_bound_raw(R_np: np.ndarray, n: int) -> Dict[str, float]:
     return {"rho_gersh": rho_gersh, "rho_maxdeg": rho_maxdeg}
 
 
+def _normalize_objective_mode(mode: Optional[str]) -> str:
+    m = (mode or "logZ").strip().lower()
+    if m in ("logz", "log_z", "log", "logz_penalized"):
+        return "logZ"
+    if m in ("logz_per_nr", "logz_per_mr", "logz_norm", "logz_per_nk"):
+        return "logZ_per_nr"
+    if m in ("no_penalty", "raw", "unpenalized", "nop"):
+        return "no_penalty"
+    return "logZ"
+
+
+def objective_from_trace(trace_val: float, rows_m: int, n: int, mode: Optional[str] = None) -> float:
+    """Convert trace/Z estimate into objective scalar with log / normalization."""
+    m = _normalize_objective_mode(mode)
+    try:
+        v = float(trace_val)
+    except Exception:
+        return -1e300
+    if not np.isfinite(v) or v <= 0:
+        return -1e300
+    obj = math.log(max(v, 1e-300))
+    if m == "logZ_per_nr":
+        denom = float(n) * max(float(rows_m), 1.0)
+        obj = obj / denom if denom > 0 else obj
+    return obj
+
+
 def _parse_exact_threshold(threshold) -> Tuple[str, Optional[float]]:
     """
     返回 (mode, limit):
@@ -715,11 +742,16 @@ def summarize_trace_comparison(fits: List[Dict], warn_rel: float = 0.05, logger=
     """输出精确值 vs 估计值摘要，用于 CLI 日志或调试。"""
     rel_errs = []
     for f in fits:
-        if "trace_exact" not in f or "trace_estimate" not in f:
+        if "trace_exact" not in f:
             continue
         try:
             exact = float(f.get("trace_exact", float("nan")))
-            est = float(f.get("trace_estimate", float("nan")))
+            est = float(
+                f.get(
+                    "trace_estimate_raw",
+                    f.get("trace_estimate", f.get("sum_lambda_powers_raw", float("nan")))
+                )
+            )
         except Exception:
             continue
         if not (np.isfinite(exact) and np.isfinite(est)):
@@ -759,6 +791,8 @@ def evaluate_rules_batch(n: int,
                          enable_exact: bool = True,
                          enable_spectral: bool = True,
                          exact_threshold="nk<=12",
+                         objective_mode: str = config.OBJECTIVE_MODE,
+                         use_penalty: Optional[bool] = None,
                          cache_dir: Optional[Union[str, Path]] = None,
                          use_cache: bool = True,
                          ) -> List[Dict]:
@@ -768,6 +802,7 @@ def evaluate_rules_batch(n: int,
       - active_k（压缩后）、active_k_raw（压缩前）、k_sym/k_raw、sym_mode
       - lower_bound / upper_bound（raw 与惩罚后）
       - 结构上界：upper_bound_raw_gersh / upper_bound_raw_maxdeg
+      - 目标字段：sum_lambda_powers_raw / sum_lambda_powers_penalized、objective_raw / objective_penalized、penalty_factor、objective_mode
       - archetype_tags（若 rules.structures 存在）
       - exact_Z（启用且阈值允许时）
       - trace_exact / trace_estimate / trace_error（若同时有精确值与估计值）
@@ -780,9 +815,60 @@ def evaluate_rules_batch(n: int,
             return min(64, base * 2)
         return base
 
+    objective_mode = _normalize_objective_mode(objective_mode)
+    apply_penalty = _bool_or(use_penalty, config.OBJECTIVE_USE_PENALTY)
     boundary = (boundary or "torus").lower()
     if boundary not in {"torus", "open"}:
         raise ValueError(f"boundary={boundary} not supported")
+
+    def _align_objective_fields(fit: Dict, rows_m: int) -> Dict:
+        f = dict(fit) if fit is not None else {}
+        try:
+            penalty_factor = float(f.get("penalty_factor", 1.0))
+        except Exception:
+            penalty_factor = 1.0
+        try:
+            raw = float(f.get("sum_lambda_powers_raw", f.get("trace_estimate_raw", f.get("sum_lambda_powers", -1e300))))
+        except Exception:
+            raw = -1e300
+        try:
+            penalized = float(f.get("sum_lambda_powers_penalized", f.get("sum_lambda_powers", raw * penalty_factor)))
+        except Exception:
+            penalized = -1e300
+        if not np.isfinite(raw):
+            raw = -1e300
+        if not np.isfinite(penalized):
+            penalized = raw if np.isfinite(raw) else -1e300
+        main_val = penalized if apply_penalty else raw
+        f["sum_lambda_powers_raw"] = raw
+        f["sum_lambda_powers_penalized"] = penalized
+        f["sum_lambda_powers"] = main_val
+        f["penalty_factor"] = penalty_factor
+        try:
+            f["trace_estimate_raw"] = float(f.get("trace_estimate_raw", raw))
+        except Exception:
+            f["trace_estimate_raw"] = raw
+        try:
+            f["trace_estimate"] = float(f.get("trace_estimate", main_val))
+        except Exception:
+            f["trace_estimate"] = main_val
+        try:
+            lb_raw = float(f.get("lower_bound_raw", f.get("lower_bound", 0.0)))
+        except Exception:
+            lb_raw = 0.0
+        try:
+            ub_raw = float(f.get("upper_bound_raw", f.get("upper_bound", 0.0)))
+        except Exception:
+            ub_raw = 0.0
+        penalty_apply = penalty_factor if apply_penalty else 1.0
+        f["lower_bound_raw"] = lb_raw
+        f["upper_bound_raw"] = ub_raw
+        f["lower_bound"] = lb_raw * penalty_apply
+        f["upper_bound"] = ub_raw * penalty_apply
+        f["objective_mode"] = objective_mode
+        f["objective_raw"] = objective_from_trace(raw, rows_m, n, objective_mode)
+        f["objective_penalized"] = objective_from_trace(penalized, rows_m, n, objective_mode)
+        return f
 
     cache_root = ensure_eval_cache_dir(cache_dir) if use_cache else None
 
@@ -806,13 +892,18 @@ def evaluate_rules_batch(n: int,
             used[active_classes] = True
             active_k = int(used.sum())
             active_k_raw = int(sum(class_sizes[c] for c in active_classes)) if m > 0 else 0
+            penalty_factor = 1.0
+            if comps > 1:
+                penalty_factor *= (0.5 ** (comps - 1))
+            if np.any(deg == 0):
+                penalty_factor *= (active_k / k) ** PENALTY_ALPHA
 
             cache_key = None
             if cache_root is not None:
                 cache_key = make_eval_cache_key(bits_sym, active_k, boundary, sym_mode, n)
                 cached = load_eval_cache(cache_root, cache_key)
                 if cached is not None:
-                    outs.append(cached)
+                    outs.append(_align_objective_fields(cached, int(cached.get("rows_m", m))))
                     continue
 
             trace_exact: Optional[float] = None
@@ -834,6 +925,8 @@ def evaluate_rules_batch(n: int,
                     "lambda_top2": (0.0, 0.0),
                     "spectral_gap": 0.0,
                     "sum_lambda_powers": -1e300,
+                    "sum_lambda_powers_raw": -1e300,
+                    "sum_lambda_powers_penalized": -1e300,
                     "rows_m": 0,
                     "active_k": active_k,
                     "active_k_raw": active_k_raw,
@@ -863,6 +956,8 @@ def evaluate_rules_batch(n: int,
                         "active_k": active_k,
                         "k_sym": k_sym,
                         "n": n,
+                        "objective_mode": objective_mode,
+                        "apply_penalty": apply_penalty,
                     })
                 outs.append(fit)
                 continue
@@ -872,7 +967,9 @@ def evaluate_rules_batch(n: int,
             lb_raw = lb = 0.0
             ub_raw = ub = 0.0
             spectral_gap = 0.0
-            sum_lp = -1e300
+            sum_lp_raw = -1e300
+            sum_lp_penalized = -1e300
+            trace_estimate_raw: Optional[float] = None
 
             if spectral_allowed:
                 op = TransferOp(
@@ -910,18 +1007,20 @@ def evaluate_rules_batch(n: int,
                 ub_raw = float(m) * (lam_pos ** n)
                 spectral_gap = max(0.0, lambda1 - lambda2)
 
-                penal = 1.0
-                if comps > 1:
-                    penal *= (0.5 ** (comps - 1))
-                if np.any(deg == 0):
-                    penal *= (active_k / k) ** PENALTY_ALPHA
-
-                sum_lp = est * penal
-                lb = lb_raw * penal
-                ub = ub_raw * penal
-                trace_estimate = sum_lp
+                trace_estimate_raw = float(est)
+                sum_lp_raw = trace_estimate_raw
+                sum_lp_penalized = trace_estimate_raw * penalty_factor
+                lb = lb_raw * (penalty_factor if apply_penalty else 1.0)
+                ub = ub_raw * (penalty_factor if apply_penalty else 1.0)
             else:
-                sum_lp = float(trace_exact) if trace_exact is not None else -1e300
+                trace_estimate_raw = float(trace_exact) if trace_exact is not None else -1e300
+                sum_lp_raw = trace_estimate_raw
+                sum_lp_penalized = trace_estimate_raw * penalty_factor
+                if trace_exact is not None:
+                    lb_raw = float(trace_exact)
+                    ub_raw = float(trace_exact)
+                    lb = lb_raw * (penalty_factor if apply_penalty else 1.0)
+                    ub = ub_raw * (penalty_factor if apply_penalty else 1.0)
 
             # 结构上界（与 m 结合）
             ub_rhos = _upper_bound_raw(R, n)
@@ -944,19 +1043,28 @@ def evaluate_rules_batch(n: int,
                 except Exception as exc:
                     exact_reason = f"exact failed: {exc.__class__.__name__}"
                     eval_notes.append(f"exact:{exact_reason}")
-            # 当谱估计被禁用但 exact 已成功时，沿用精确值作为 sum_lambda_powers，避免 NA。
+            # 当谱估计被禁用但 exact 已成功时，沿用精确值作为基准（raw），仍计算罚后版本
             if (not spectral_allowed) and (trace_exact is not None):
-                sum_lp = trace_exact
-                lb = lb_raw = trace_exact
-                ub = ub_raw = trace_exact
-                trace_estimate = trace_exact
+                trace_estimate_raw = float(trace_exact)
+                sum_lp_raw = trace_estimate_raw
+                sum_lp_penalized = trace_estimate_raw * penalty_factor
+                lb_raw = float(trace_exact)
+                ub_raw = float(trace_exact)
+                lb = lb_raw * (penalty_factor if apply_penalty else 1.0)
+                ub = ub_raw * (penalty_factor if apply_penalty else 1.0)
 
-            if trace_estimate is None:
-                trace_estimate = sum_lp
-            if (trace_exact is not None) and (trace_estimate is not None) and np.isfinite(trace_exact) and np.isfinite(trace_estimate):
-                trace_error = trace_estimate - trace_exact
+            sum_lp_raw = float(sum_lp_raw if np.isfinite(sum_lp_raw) else -1e300)
+            sum_lp_penalized = float(sum_lp_penalized if np.isfinite(sum_lp_penalized) else -1e300)
+            sum_lp = sum_lp_penalized if apply_penalty else sum_lp_raw
+            trace_estimate = sum_lp if trace_estimate is None else trace_estimate
+            trace_estimate_raw = sum_lp_raw if trace_estimate_raw is None else trace_estimate_raw
+            if (trace_exact is not None) and (trace_estimate_raw is not None) and np.isfinite(trace_exact) and np.isfinite(trace_estimate_raw):
+                trace_error = trace_estimate_raw - trace_exact
                 if trace_exact != 0:
                     trace_error_rel = trace_error / trace_exact
+
+            objective_penalized = objective_from_trace(sum_lp_penalized, m, n, objective_mode)
+            objective_raw = objective_from_trace(sum_lp_raw, m, n, objective_mode)
 
             fit = {
                 "rule_count": int(bits.sum()),
@@ -964,6 +1072,8 @@ def evaluate_rules_batch(n: int,
                 "lambda_top2": (lambda1, lambda2),
                 "spectral_gap": spectral_gap,
                 "sum_lambda_powers": sum_lp,
+                "sum_lambda_powers_raw": sum_lp_raw,
+                "sum_lambda_powers_penalized": sum_lp_penalized,
                 "rows_m": m,
                 "active_k": active_k,
                 "active_k_raw": active_k_raw,
@@ -975,6 +1085,10 @@ def evaluate_rules_batch(n: int,
                 "lower_bound": lb, "upper_bound": ub,
                 "lower_bound_raw": lb_raw, "upper_bound_raw": ub_raw,
                 "upper_bound_raw_gersh": ub_raw_gersh, "upper_bound_raw_maxdeg": ub_raw_maxdeg,
+                "objective_penalized": objective_penalized,
+                "objective_raw": objective_raw,
+                "objective_mode": objective_mode,
+                "penalty_factor": penalty_factor,
                 "archetype_hits": archetype_hits,
                 "archetype_tags": archetype_tags,
                 **graph_stats,
@@ -985,6 +1099,8 @@ def evaluate_rules_batch(n: int,
                 fit["trace_exact"] = trace_exact
             if trace_estimate is not None:
                 fit["trace_estimate"] = trace_estimate
+            if trace_estimate_raw is not None:
+                fit["trace_estimate_raw"] = trace_estimate_raw
             if trace_error is not None:
                 fit["trace_error"] = trace_error
                 if trace_error_rel is not None:
@@ -998,6 +1114,8 @@ def evaluate_rules_batch(n: int,
                     "active_k": active_k,
                     "k_sym": k_sym,
                     "n": n,
+                    "objective_mode": objective_mode,
+                    "apply_penalty": apply_penalty,
                 })
             outs.append(fit)
         return outs
@@ -1030,13 +1148,18 @@ def evaluate_rules_batch(n: int,
         used[active_classes] = True
         active_k = int(used.sum())
         active_k_raw = int(sum(class_sizes[c] for c in active_classes)) if m > 0 else 0
+        penalty_factor = 1.0
+        if comps > 1:
+            penalty_factor *= (0.5 ** (comps - 1))
+        if np.any(deg == 0):
+            penalty_factor *= (active_k / k) ** PENALTY_ALPHA
 
         cache_key = None
         if cache_root is not None:
             cache_key = make_eval_cache_key(bits_sym, active_k, boundary, sym_mode, n)
             cached = load_eval_cache(cache_root, cache_key)
             if cached is not None:
-                outputs[idx] = cached
+                outputs[idx] = _align_objective_fields(cached, int(cached.get("rows_m", m)))
                 continue
 
         trace_exact: Optional[float] = None
@@ -1057,6 +1180,8 @@ def evaluate_rules_batch(n: int,
                 "lambda_top2": (0.0, 0.0),
                 "spectral_gap": 0.0,
                 "sum_lambda_powers": -1e300,
+                "sum_lambda_powers_raw": -1e300,
+                "sum_lambda_powers_penalized": -1e300,
                 "rows_m": 0,
                 "active_k": active_k,
                 "active_k_raw": active_k_raw,
@@ -1070,8 +1195,13 @@ def evaluate_rules_batch(n: int,
                 "upper_bound_raw_gersh": 0.0, "upper_bound_raw_maxdeg": 0.0,
                 "archetype_hits": {},
                 "archetype_tags": "",
+                "objective_penalized": -1e300,
+                "objective_raw": -1e300,
+                "objective_mode": objective_mode,
+                "penalty_factor": penalty_factor,
                 "trace_exact": trace_exact if trace_exact is not None else "",
                 "trace_estimate": trace_estimate if trace_estimate is not None else -1e300,
+                "trace_estimate_raw": trace_estimate if trace_estimate is not None else -1e300,
                 "trace_error": trace_error if trace_error is not None else "",
                 "trace_error_rel": trace_error_rel if trace_error_rel is not None else "",
                 "eval_note": "; ".join(eval_notes) if eval_notes else "",
@@ -1084,6 +1214,8 @@ def evaluate_rules_batch(n: int,
                     "active_k": active_k,
                     "k_sym": k_sym,
                     "n": n,
+                    "objective_mode": objective_mode,
+                    "apply_penalty": apply_penalty,
                 })
             continue
 
@@ -1094,7 +1226,9 @@ def evaluate_rules_batch(n: int,
         lb_raw = lb = 0.0
         ub_raw = ub = 0.0
         spectral_gap = 0.0
-        sum_lp = -1e300
+        sum_lp_raw = -1e300
+        sum_lp_penalized = -1e300
+        trace_estimate_raw: Optional[float] = None
 
         if spectral_allowed:
             with torch.cuda.stream(st):
@@ -1133,18 +1267,20 @@ def evaluate_rules_batch(n: int,
                 ub_raw = float(m) * (lam_pos ** n)
                 spectral_gap = max(0.0, lambda1 - lambda2)
 
-                penal = 1.0
-                if comps > 1:
-                    penal *= (0.5 ** (comps - 1))
-                if np.any(deg == 0):
-                    penal *= (active_k / k) ** PENALTY_ALPHA
-
-                sum_lp = est * penal
-                lb = lb_raw * penal
-                ub = ub_raw * penal
-                trace_estimate = sum_lp
+                trace_estimate_raw = float(est)
+                sum_lp_raw = trace_estimate_raw
+                sum_lp_penalized = trace_estimate_raw * penalty_factor
+                lb = lb_raw * (penalty_factor if apply_penalty else 1.0)
+                ub = ub_raw * (penalty_factor if apply_penalty else 1.0)
         else:
-            sum_lp = float(trace_exact) if trace_exact is not None else -1e300
+            trace_estimate_raw = float(trace_exact) if trace_exact is not None else -1e300
+            sum_lp_raw = trace_estimate_raw
+            sum_lp_penalized = trace_estimate_raw * penalty_factor
+            if trace_exact is not None:
+                lb_raw = float(trace_exact)
+                ub_raw = float(trace_exact)
+                lb = lb_raw * (penalty_factor if apply_penalty else 1.0)
+                ub = ub_raw * (penalty_factor if apply_penalty else 1.0)
 
         ub_rhos = _upper_bound_raw(R, n)
         ub_raw_gersh = float(m) * (ub_rhos["rho_gersh"] ** n)
@@ -1166,17 +1302,26 @@ def evaluate_rules_batch(n: int,
                 exact_reason = f"exact failed: {exc.__class__.__name__}"
                 eval_notes.append(f"exact:{exact_reason}")
         if (not spectral_allowed) and (trace_exact is not None):
-            sum_lp = trace_exact
-            lb = lb_raw = trace_exact
-            ub = ub_raw = trace_exact
-            trace_estimate = trace_exact
+            trace_estimate_raw = float(trace_exact)
+            sum_lp_raw = trace_estimate_raw
+            sum_lp_penalized = trace_estimate_raw * penalty_factor
+            lb_raw = float(trace_exact)
+            ub_raw = float(trace_exact)
+            lb = lb_raw * (penalty_factor if apply_penalty else 1.0)
+            ub = ub_raw * (penalty_factor if apply_penalty else 1.0)
 
-        if trace_estimate is None:
-            trace_estimate = sum_lp
-        if (trace_exact is not None) and (trace_estimate is not None) and np.isfinite(trace_exact) and np.isfinite(trace_estimate):
-            trace_error = trace_estimate - trace_exact
+        sum_lp_raw = float(sum_lp_raw if np.isfinite(sum_lp_raw) else -1e300)
+        sum_lp_penalized = float(sum_lp_penalized if np.isfinite(sum_lp_penalized) else -1e300)
+        sum_lp = sum_lp_penalized if apply_penalty else sum_lp_raw
+        trace_estimate = sum_lp if trace_estimate is None else trace_estimate
+        trace_estimate_raw = sum_lp_raw if trace_estimate_raw is None else trace_estimate_raw
+        if (trace_exact is not None) and (trace_estimate_raw is not None) and np.isfinite(trace_exact) and np.isfinite(trace_estimate_raw):
+            trace_error = trace_estimate_raw - trace_exact
             if trace_exact != 0:
                 trace_error_rel = trace_error / trace_exact
+
+        objective_penalized = objective_from_trace(sum_lp_penalized, m, n, objective_mode)
+        objective_raw = objective_from_trace(sum_lp_raw, m, n, objective_mode)
 
         fit = {
             "rule_count": int(bits.sum()),
@@ -1184,6 +1329,8 @@ def evaluate_rules_batch(n: int,
             "lambda_top2": (lambda1, lambda2),
             "spectral_gap": spectral_gap,
             "sum_lambda_powers": sum_lp,
+            "sum_lambda_powers_raw": sum_lp_raw,
+            "sum_lambda_powers_penalized": sum_lp_penalized,
             "rows_m": m,
             "active_k": active_k,
             "active_k_raw": active_k_raw,
@@ -1195,6 +1342,10 @@ def evaluate_rules_batch(n: int,
             "lower_bound": lb, "upper_bound": ub,
             "lower_bound_raw": lb_raw, "upper_bound_raw": ub_raw,
             "upper_bound_raw_gersh": ub_raw_gersh, "upper_bound_raw_maxdeg": ub_raw_maxdeg,
+            "objective_penalized": objective_penalized,
+            "objective_raw": objective_raw,
+            "objective_mode": objective_mode,
+            "penalty_factor": penalty_factor,
             "archetype_hits": archetype_hits,
             "archetype_tags": archetype_tags,
             **graph_stats,
@@ -1205,6 +1356,8 @@ def evaluate_rules_batch(n: int,
             fit["trace_exact"] = trace_exact
         if trace_estimate is not None:
             fit["trace_estimate"] = trace_estimate
+        if trace_estimate_raw is not None:
+            fit["trace_estimate_raw"] = trace_estimate_raw
         if trace_error is not None:
             fit["trace_error"] = trace_error
             if trace_error_rel is not None:
@@ -1219,6 +1372,8 @@ def evaluate_rules_batch(n: int,
                 "active_k": active_k,
                 "k_sym": k_sym,
                 "n": n,
+                "objective_mode": objective_mode,
+                "apply_penalty": apply_penalty,
             })
 
         outputs[idx] = fit

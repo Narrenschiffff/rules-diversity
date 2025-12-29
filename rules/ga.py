@@ -17,7 +17,8 @@ import torch
 from . import config
 from .eval import (
     canonical_bits, bits_from_rule, rule_from_bits, apply_rule_symmetry,
-    evaluate_rules_batch, RowsCacheLRU, summarize_trace_comparison
+    evaluate_rules_batch, RowsCacheLRU, summarize_trace_comparison,
+    objective_from_trace, _normalize_objective_mode,
 )
 from .utils_io import make_run_tag
 
@@ -60,6 +61,25 @@ def _bits_from_str(s: Optional[str]) -> Optional[np.ndarray]:
         return np.fromiter((1 if ch == "1" else 0 for ch in s), dtype=np.uint8)
     except Exception:
         return None
+
+def _objective_value_from_fit(fit: Dict, key: str) -> float:
+    candidates = [
+        key,
+        "objective_penalized",
+        "objective_raw",
+        "sum_lambda_powers",
+        "trace_estimate",
+        "sum_lambda_powers_raw",
+        "trace_estimate_raw",
+    ]
+    for k in candidates:
+        try:
+            v = float(fit.get(k, -1e300))
+            if np.isfinite(v):
+                return v
+        except Exception:
+            continue
+    return -1e300
 
 # ---------- stage1 seeds (single source) ----------
 def _load_stage1_seeds(out_csv_dir: str, n: int, k: int, max_seeds: int) -> List[np.ndarray]:
@@ -211,12 +231,12 @@ def init_population(k: int, pop_size: int, bias_sparse: bool = True) -> List[np.
     return pop
 
 # ---------- NSGA-II essentials ----------
-def dominates(a, b):
-    f1a, f2a = a["rule_count"], -a["sum_lambda_powers"]
-    f1b, f2b = b["rule_count"], -b["sum_lambda_powers"]
+def dominates(a, b, obj_key: str = "sum_lambda_powers"):
+    f1a, f2a = a["rule_count"], -_objective_value_from_fit(a, obj_key)
+    f1b, f2b = b["rule_count"], -_objective_value_from_fit(b, obj_key)
     return (f1a <= f1b and f2a <= f2b) and (f1a < f1b or f2a < f2b)
 
-def nondominated_sort(pop_fits: List[Dict]) -> List[List[int]]:
+def nondominated_sort(pop_fits: List[Dict], obj_key: str = "sum_lambda_powers") -> List[List[int]]:
     N = len(pop_fits)
     S = [set() for _ in range(N)]
     n_dom = [0]*N
@@ -224,8 +244,8 @@ def nondominated_sort(pop_fits: List[Dict]) -> List[List[int]]:
     for p in range(N):
         for q in range(N):
             if p==q: continue
-            if dominates(pop_fits[p], pop_fits[q]): S[p].add(q)
-            elif dominates(pop_fits[q], pop_fits[p]): n_dom[p] += 1
+            if dominates(pop_fits[p], pop_fits[q], obj_key=obj_key): S[p].add(q)
+            elif dominates(pop_fits[q], pop_fits[p], obj_key=obj_key): n_dom[p] += 1
         if n_dom[p]==0: fronts[0].append(p)
     i=0
     while fronts[i]:
@@ -239,11 +259,11 @@ def nondominated_sort(pop_fits: List[Dict]) -> List[List[int]]:
     fronts.pop()
     return fronts
 
-def crowding_distance(front: List[int], pop_fits: List[Dict]) -> Dict[int, float]:
+def crowding_distance(front: List[int], pop_fits: List[Dict], obj_key: str = "sum_lambda_powers") -> Dict[int, float]:
     if not front: return {}
     distances = {i:0.0 for i in front}
     vals1 = [(i, pop_fits[i]["rule_count"]) for i in front]        # smaller better
-    vals2 = [(i, pop_fits[i]["sum_lambda_powers"]) for i in front] # larger better
+    vals2 = [(i, _objective_value_from_fit(pop_fits[i], obj_key)) for i in front] # larger better
     for vals, reverse in [(vals1, False), (vals2, True)]:
         vs = sorted(vals, key=lambda x: x[1], reverse=reverse)
         distances[vs[0][0]] = float("inf"); distances[vs[-1][0]] = float("inf")
@@ -271,6 +291,9 @@ class GAConfig:
                  boundary: str | None = None,
                  cache_dir=None,
                  use_cache: bool = True,
+                 objective_mode: str = config.OBJECTIVE_MODE,
+                 objective_use_penalty: bool = config.OBJECTIVE_USE_PENALTY,
+                 use_penalized_objective: bool = True,
                  ):
         self.pop_size = pop_size
         self.generations = generations
@@ -296,6 +319,9 @@ class GAConfig:
         self.boundary = (boundary or config.BOUNDARY_MODE)
         self.cache_dir = cache_dir if cache_dir is not None else config.EVAL_CACHE_DIR
         self.use_cache = use_cache
+        self.objective_mode = objective_mode
+        self.objective_use_penalty = objective_use_penalty
+        self.use_penalized_objective = use_penalized_objective
 
 # ---------- CSV appenders ----------
 def _append_front_rows_csv(csv_path_front: str, tag: str, n: int, k: int,
@@ -309,6 +335,14 @@ def _append_front_rows_csv(csv_path_front: str, tag: str, n: int, k: int,
                 lam_top2_str = f"({float(lam_top2[0]):.6e},{float(lam_top2[1]):.6e})"
             except Exception:
                 lam_top2_str = "(0.000000e+00,0.000000e+00)"
+            try:
+                obj_raw = float(fit.get("objective_raw", fit.get("sum_lambda_powers_raw", -1e300)))
+            except Exception:
+                obj_raw = -1e300
+            try:
+                obj_pen = float(fit.get("objective_penalized", fit.get("sum_lambda_powers", -1e300)))
+            except Exception:
+                obj_pen = -1e300
             w.writerow([
                 tag, n, k,
                 "".join(map(str, bits.tolist())),
@@ -318,6 +352,12 @@ def _append_front_rows_csv(csv_path_front: str, tag: str, n: int, k: int,
                 lam_top2_str,
                 f"{float(fit.get('spectral_gap', 0.0)):.6e}",
                 f"{float(fit.get('sum_lambda_powers', -1e300)):.6e}",
+                f"{float(fit.get('sum_lambda_powers_raw', fit.get('sum_lambda_powers', -1e300))):.6e}",
+                f"{float(fit.get('sum_lambda_powers_penalized', fit.get('sum_lambda_powers', -1e300))):.6e}",
+                f"{obj_raw:.6e}",
+                f"{obj_pen:.6e}",
+                str(fit.get("objective_mode", "")),
+                f"{float(fit.get('penalty_factor', 1.0)):.6e}",
                 1 if i in front0_set else 0,
                 int(fit.get("active_k", 0)),
                 int(fit.get("active_k_raw", fit.get("active_k", 0))),
@@ -333,6 +373,7 @@ def _append_front_rows_csv(csv_path_front: str, tag: str, n: int, k: int,
                 ("" if (fit.get("exact_Z","")== "") else str(int(fit.get("exact_Z")))),
                 fit.get("trace_exact", ""),
                 fit.get("trace_estimate", ""),
+                fit.get("trace_estimate_raw", fit.get("trace_estimate", "")),
                 fit.get("trace_error", ""),
                 fit.get("trace_error_rel", ""),
                 fit.get("eval_note", ""),
@@ -351,18 +392,20 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
         w=csv.writer(f)
         w.writerow(["run_tag","n","k","rule_bits","rule_count","rows_m",
                     "lambda_max","lambda_top2","spectral_gap",
-                    "sum_lambda_powers","is_front0",
+                    "sum_lambda_powers","sum_lambda_powers_raw","sum_lambda_powers_penalized",
+                    "objective_raw","objective_penalized","objective_mode","penalty_factor",
+                    "is_front0",
                     "active_k","active_k_raw","k_sym","sym_mode",
                     "lower_bound","upper_bound",
                     "lower_bound_raw","upper_bound_raw",
                     "upper_bound_raw_gersh","upper_bound_raw_maxdeg",
                     "archetype_tags","exact_Z",
-                    "trace_exact","trace_estimate","trace_error","trace_error_rel","eval_note"])
+                    "trace_exact","trace_estimate","trace_estimate_raw","trace_error","trace_error_rel","eval_note"])
     with open(csv_gen, "w", newline="", encoding="utf-8") as f:
         w=csv.writer(f)
         w.writerow(["run_tag","n","k","generation","front0_size",
                     "best_sample_R","best_sample_sumlam",
-                    "pop_size","device","trace_mode","sym_mode"])
+                    "pop_size","device","trace_mode","sym_mode","objective_field","objective_mode"])
 
     # normalize config
     device      = _device_or(getattr(ga_conf, "device", None))
@@ -389,6 +432,10 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
     boundary        = getattr(ga_conf, "boundary", config.BOUNDARY_MODE) or config.BOUNDARY_MODE
     cache_dir       = getattr(ga_conf, "cache_dir", config.EVAL_CACHE_DIR)
     use_cache       = _bool_or(getattr(ga_conf, "use_cache", True), True)
+    objective_mode  = _normalize_objective_mode(getattr(ga_conf, "objective_mode", config.OBJECTIVE_MODE))
+    objective_use_penalty = _bool_or(getattr(ga_conf, "objective_use_penalty", None), config.OBJECTIVE_USE_PENALTY)
+    use_penalized_objective = _bool_or(getattr(ga_conf, "use_penalized_objective", True), True)
+    objective_key = "objective_penalized" if use_penalized_objective else "objective_raw"
 
     if fast_eval or device=="cpu":
         r_vals = min(r_vals, 2); power_iters = min(power_iters, 16); hutch_s = min(hutch_s, 8)
@@ -396,7 +443,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
     logger.info(
         f"GA start | n={n}, k={k}, device={device}, sym={sym_mode}, pop={pop_size}, gens={generations}, "
         f"fast_eval={fast_eval}, seed_from_stage1={seed_from_stage1}, exact={enable_exact}, spectral={enable_spectral}, "
-        f"exact_th={exact_threshold}, boundary={boundary}, cache_dir={cache_dir}, cache={'on' if use_cache else 'off'}")
+        f"exact_th={exact_threshold}, boundary={boundary}, cache_dir={cache_dir}, cache={'on' if use_cache else 'off'}, "
+        f"objective_mode={objective_mode}, objective_field={objective_key}, objective_penalty={objective_use_penalty}")
 
     # init population
     pop: List[np.ndarray] = []
@@ -431,19 +479,32 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
 
         def _normalize_fit_fields(fit: Dict) -> Dict:
             f = {} if fit is None else dict(fit)
-            slp = f.get("sum_lambda_powers")
-            if slp is None or not np.isfinite(_float_or(slp, np.inf)):
-                candidates = [f.get("trace_estimate"), f.get("trace_exact")]
-                slp = -1e300
-                for c in candidates:
-                    try:
-                        val = float(c)
-                        if np.isfinite(val):
-                            slp = val
-                            break
-                    except Exception:
-                        continue
-            f["sum_lambda_powers"] = float(slp)
+            rows_m_val = _int_or(f.get("rows_m", 0), 0)
+            f["rows_m"] = rows_m_val
+            try:
+                penalty_factor = float(f.get("penalty_factor", 1.0))
+            except Exception:
+                penalty_factor = 1.0
+            f["penalty_factor"] = penalty_factor
+
+            try:
+                slp_pen = float(f.get("sum_lambda_powers_penalized", f.get("sum_lambda_powers", -1e300)))
+            except Exception:
+                slp_pen = -1e300
+            try:
+                slp_raw = float(f.get("sum_lambda_powers_raw", f.get("trace_estimate_raw", f.get("sum_lambda_powers", -1e300))))
+            except Exception:
+                slp_raw = -1e300
+            if not np.isfinite(slp_raw):
+                slp_raw = -1e300
+            if not np.isfinite(slp_pen):
+                slp_pen = slp_raw if np.isfinite(slp_raw) else -1e300
+            f["sum_lambda_powers_raw"] = slp_raw
+            f["sum_lambda_powers_penalized"] = slp_pen
+            try:
+                f["sum_lambda_powers"] = float(f.get("sum_lambda_powers", slp_pen))
+            except Exception:
+                f["sum_lambda_powers"] = slp_pen
 
             for key in ("lower_bound", "upper_bound", "lower_bound_raw", "upper_bound_raw", "upper_bound_raw_gersh", "upper_bound_raw_maxdeg"):
                 try:
@@ -457,6 +518,14 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                 f["trace_estimate"] = float(f.get("trace_estimate", f["sum_lambda_powers"]))
             except Exception:
                 f["trace_estimate"] = float(f["sum_lambda_powers"])
+            try:
+                f["trace_estimate_raw"] = float(f.get("trace_estimate_raw", f["sum_lambda_powers_raw"]))
+            except Exception:
+                f["trace_estimate_raw"] = float(f["sum_lambda_powers_raw"])
+            obj_mode = _normalize_objective_mode(f.get("objective_mode", objective_mode))
+            f["objective_mode"] = obj_mode
+            f["objective_raw"] = objective_from_trace(f["sum_lambda_powers_raw"], rows_m_val, n, obj_mode)
+            f["objective_penalized"] = objective_from_trace(f["sum_lambda_powers_penalized"], rows_m_val, n, obj_mode)
             if f.get("eval_note") is None:
                 f["eval_note"] = ""
             return f
@@ -491,6 +560,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                             enable_exact=eval_enable_exact,
                                             enable_spectral=eval_enable_spectral,
                                             exact_threshold=exact_threshold,
+                                            objective_mode=objective_mode,
+                                            use_penalty=objective_use_penalty,
                                             cache_dir=cache_dir,
                                             use_cache=use_cache)
             except Exception:
@@ -508,6 +579,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                                     enable_exact=eval_enable_exact,
                                                     enable_spectral=eval_enable_spectral,
                                                     exact_threshold=exact_threshold,
+                                                    objective_mode=objective_mode,
+                                                    use_penalty=objective_use_penalty,
                                                     cache_dir=cache_dir,
                                                     use_cache=use_cache)
                     except Exception:
@@ -523,6 +596,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                                 enable_exact=eval_enable_exact,
                                                 enable_spectral=eval_enable_spectral,
                                                 exact_threshold=exact_threshold,
+                                                objective_mode=objective_mode,
+                                                use_penalty=objective_use_penalty,
                                                 cache_dir=cache_dir,
                                                 use_cache=use_cache)
             for pos, fit in zip(miss_pos, outs):
@@ -548,6 +623,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                                 enable_exact=eval_enable_exact,
                                                 enable_spectral=eval_enable_spectral,
                                                 exact_threshold=exact_threshold,
+                                                objective_mode=objective_mode,
+                                                use_penalty=objective_use_penalty,
                                                 cache_dir=cache_dir,
                                                 use_cache=use_cache)
                 except Exception:
@@ -564,6 +641,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                             enable_exact=eval_enable_exact,
                                             enable_spectral=eval_enable_spectral,
                                             exact_threshold=exact_threshold,
+                                            objective_mode=objective_mode,
+                                            use_penalty=objective_use_penalty,
                                             cache_dir=cache_dir,
                                             use_cache=use_cache)
             for pos, fit in zip(retry_pos, outs):
@@ -586,6 +665,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                         enable_exact=eval_enable_exact,
                                         enable_spectral=eval_enable_spectral,
                                         exact_threshold=exact_threshold,
+                                        objective_mode=objective_mode,
+                                        use_penalty=objective_use_penalty,
                                         cache_dir=cache_dir,
                                         use_cache=use_cache)
             for pos, fit in zip(retry_pos, outs):
@@ -605,17 +686,17 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
     for gen in range(generations):
         t0 = time.time()
         fits, pop = eval_batch(pop)
-        fronts = nondominated_sort(fits)
+        fronts = nondominated_sort(fits, obj_key=objective_key)
         front0 = fronts[0] if fronts else []
-        dists  = crowding_distance(front0, fits)
+        dists  = crowding_distance(front0, fits, obj_key=objective_key)
 
         # gen summary
-        best_points = [(fits[i]["rule_count"], fits[i]["sum_lambda_powers"]) for i in front0] if front0 else []
+        best_points = [(fits[i]["rule_count"], _objective_value_from_fit(fits[i], objective_key)) for i in front0] if front0 else []
         best_points.sort(key=lambda x: (x[0], -x[1]))
         best_R = best_points[0][0] if best_points else None
         best_sum = best_points[0][1] if best_points else None
         with open(csv_gen, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([tag, n, k, gen, len(front0), best_R, best_sum, pop_size, device, trace_mode, sym_mode])
+            csv.writer(f).writerow([tag, n, k, gen, len(front0), best_R, best_sum, pop_size, device, trace_mode, sym_mode, objective_key, objective_mode])
 
         # append this generation to front csv
         _append_front_rows_csv(csv_front, tag, n, k, pop_bits=pop, fits=fits, front0_idx=front0)
@@ -638,7 +719,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
         for rank, fr in enumerate(fronts):
             for idx in fr: layer_of[idx] = rank
         d_map = {}
-        for fr in fronts: d_map.update(crowding_distance(fr, fits))
+        for fr in fronts: d_map.update(crowding_distance(fr, fits, obj_key=objective_key))
 
         def tournament():
             a, b = random.sample(range(len(pop)), 2)
@@ -662,11 +743,14 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
 
     # final eval
     fits, pop = eval_batch(pop)
-    fronts = nondominated_sort(fits)
+    fronts = nondominated_sort(fits, obj_key=objective_key)
     pareto_idx = fronts[0] if fronts else []
     pareto = [(pop[i], fits[i]) for i in pareto_idx]
-    pareto_sorted = sorted(pareto, key=lambda x: (x[1]["rule_count"], -x[1]["sum_lambda_powers"]))
+    pareto_sorted = sorted(pareto, key=lambda x: (x[1]["rule_count"], -_objective_value_from_fit(x[1], objective_key)))
     logger.info("=== Final Pareto (top10) ===")
     for i, (b, ft) in enumerate(pareto_sorted[:10]):
-        logger.info(f"[FINAL {i:02d}] |R|={ft['rule_count']:3d}, rows_m={ft['rows_m']:7d}, λ1≈{ft['lambda_max']:.3e}, tr≈{ft['sum_lambda_powers']:.3e}")
+        logger.info(
+            f"[FINAL {i:02d}] |R|={ft['rule_count']:3d}, rows_m={ft['rows_m']:7d}, λ1≈{ft['lambda_max']:.3e}, "
+            f"obj≈{_objective_value_from_fit(ft, objective_key):.3e} ({objective_key})"
+        )
     return pareto_sorted, csv_front, csv_gen

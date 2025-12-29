@@ -211,6 +211,8 @@ def run_pipeline(args: argparse.Namespace) -> List[Dict[str, Any]]:
     use_exact = not args.no_exact if args.no_exact is not None else cfg.get("use_exact", rules_config.ENABLE_EXACT)
     use_spectral = not args.no_spectral if args.no_spectral is not None else cfg.get("use_spectral", rules_config.ENABLE_SPECTRAL)
     use_cache = not args.no_cache if args.no_cache is not None else cfg.get("use_cache", True)
+    objective_mode = args.objective_mode or cfg.get("objective_mode") or rules_config.OBJECTIVE_MODE
+    objective_use_penalty = (not args.no_objective_penalty) if args.no_objective_penalty is not None else cfg.get("objective_use_penalty", rules_config.OBJECTIVE_USE_PENALTY)
     rows_cap = args.exact_rows_cap if args.exact_rows_cap is not None else cfg.get("exact_rows_cap", 200_000)
     out_dir = Path(args.out_dir or cfg.get("out_dir") or DEFAULT_OUT_ROOT)
     cache_dir = Path(args.cache_dir or cfg.get("cache_dir") or rules_config.EVAL_CACHE_DIR)
@@ -281,6 +283,8 @@ def run_pipeline(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     enable_exact=use_exact,
                     enable_spectral=True,
                     exact_threshold=cfg.get("exact_threshold", rules_config.EXACT_THRESHOLD),
+                    objective_mode=objective_mode,
+                    use_penalty=objective_use_penalty,
                     cache_dir=str(cache_dir),
                     use_cache=use_cache,
                 )
@@ -345,6 +349,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hutch-s", type=int, dest="hutch_s", help="samples for Hutch/Hutch++", default=None)
     parser.add_argument("--power-iters", type=int, dest="power_iters", help="power iterations for eigen", default=None)
     parser.add_argument("--lanczos-r", type=int, dest="lanczos_r", help="Lanczos r (top eigenvalues)", default=None)
+    parser.add_argument("--objective-mode", type=str, dest="objective_mode", default=None,
+                        choices=["logZ", "logZ_per_nr", "no_penalty"],
+                        help="objective transform for spectral path/logZ 记录")
+    parser.add_argument("--no-objective-penalty", action="store_true", help="disable penalty factor on objectives")
     parser.add_argument("--max-streams", type=int, dest="max_streams", help="max CUDA streams (spectral)", default=None)
     parser.add_argument("--run-tag", type=str, help="run tag for output dir", default=None)
     parser.add_argument("--out-dir", type=str, help="output root directory", default=None)
