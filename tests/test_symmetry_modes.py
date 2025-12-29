@@ -121,7 +121,7 @@ def test_ga_respects_symmetry_modes(tmp_path: Path):
             rows = list(csv.reader(f))
 
         header = rows[0]
-        assert header[0:4] == ["run_tag", "n", "k", "rule_bits"]
+        assert header[0:5] == ["run_tag", "n", "k", "generation", "rule_bits"]
         sym_idx = header.index("sym_mode")
         active_k_idx = header.index("active_k")
         active_k_raw_idx = header.index("active_k_raw")

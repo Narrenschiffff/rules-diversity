@@ -8,6 +8,8 @@ from __future__ import annotations
 from pathlib import Path
 import os
 
+from typing import Optional
+
 # 视觉风格（viz.apply_style 支持的枚举）
 DEFAULT_STYLE = os.getenv("RULES_STYLE", "ieee")
 
@@ -47,3 +49,83 @@ OBJECTIVE_USE_PENALTY = os.getenv("RULES_OBJECTIVE_USE_PENALTY", "1") != "0"
 SYM_GEO_OPS = os.getenv("RULES_SYM_GEO_OPS", "rot,ref,trans")
 SYM_ENUM_LIMIT = int(os.getenv("RULES_SYM_ENUM_LIMIT", "1000000"))
 SYM_SAMPLES = int(os.getenv("RULES_SYM_SAMPLES", "6"))
+
+# -------------------------
+# 参数规范化 / 校验
+# -------------------------
+
+_BOUNDARY_CHOICES = {"torus", "open"}
+_SYM_CHOICES = {"perm", "perm+swap", "none"}
+_OBJECTIVE_FIELD_CHOICES = {"objective_penalized", "objective_raw"}
+
+
+def normalize_boundary(boundary: Optional[str]) -> str:
+    b = (boundary or BOUNDARY_MODE).strip().lower()
+    if b not in _BOUNDARY_CHOICES:
+        raise ValueError(f"boundary must be one of {sorted(_BOUNDARY_CHOICES)}, got '{boundary}'")
+    return b
+
+
+def normalize_sym_mode(sym_mode: Optional[str]) -> str:
+    s = (sym_mode or "perm").strip().lower().replace("permswap", "perm+swap")
+    if s == "swap":
+        s = "perm+swap"
+    if s not in _SYM_CHOICES:
+        raise ValueError(f"sym_mode must be one of {sorted(_SYM_CHOICES)}, got '{sym_mode}'")
+    return s
+
+
+def normalize_objective_mode(mode: Optional[str]) -> str:
+    m = (mode or "logZ").strip().lower()
+    if m in ("logz", "log_z", "log", "logz_penalized"):
+        return "logZ"
+    if m in ("logz_per_nr", "logz_per_mr", "logz_norm", "logz_per_nk"):
+        return "logZ_per_nr"
+    if m in ("no_penalty", "raw", "unpenalized", "nop"):
+        return "no_penalty"
+    return "logZ"
+
+
+def resolve_objective(mode: Optional[str], use_penalty: Optional[bool], prefer_penalized_field: bool = True):
+    mode_norm = normalize_objective_mode(mode)
+    penalty = OBJECTIVE_USE_PENALTY if use_penalty is None else bool(use_penalty)
+    if prefer_penalized_field and penalty:
+        field = "objective_penalized"
+    else:
+        field = "objective_raw"
+    if field not in _OBJECTIVE_FIELD_CHOICES:
+        raise ValueError(f"objective_field must be one of {sorted(_OBJECTIVE_FIELD_CHOICES)}, got '{field}'")
+    return {
+        "objective_mode": mode_norm,
+        "objective_use_penalty": penalty,
+        "objective_field": field,
+    }
+
+
+__all__ = [
+    "DEFAULT_STYLE",
+    "DEFAULT_DEVICE",
+    "BOUNDARY_MODE",
+    "RESULTS_ROOT",
+    "OUT_CSV_DEFAULT",
+    "OUT_FIG_DEFAULT",
+    "EVAL_CACHE_DIR",
+    "EVAL_CACHE_VERSION",
+    "ROWS_LRU_CAPACITY",
+    "LANCZOS_R",
+    "POWER_ITERS",
+    "HUTCH_S",
+    "TRACE_MODE",
+    "ENABLE_EXACT",
+    "ENABLE_SPECTRAL",
+    "EXACT_THRESHOLD",
+    "OBJECTIVE_MODE",
+    "OBJECTIVE_USE_PENALTY",
+    "SYM_GEO_OPS",
+    "SYM_ENUM_LIMIT",
+    "SYM_SAMPLES",
+    "normalize_boundary",
+    "normalize_sym_mode",
+    "normalize_objective_mode",
+    "resolve_objective",
+]

@@ -669,20 +669,11 @@ def _upper_bound_raw(R_np: np.ndarray, n: int) -> Dict[str, float]:
     return {"rho_gersh": rho_gersh, "rho_maxdeg": rho_maxdeg}
 
 
-def _normalize_objective_mode(mode: Optional[str]) -> str:
-    m = (mode or "logZ").strip().lower()
-    if m in ("logz", "log_z", "log", "logz_penalized"):
-        return "logZ"
-    if m in ("logz_per_nr", "logz_per_mr", "logz_norm", "logz_per_nk"):
-        return "logZ_per_nr"
-    if m in ("no_penalty", "raw", "unpenalized", "nop"):
-        return "no_penalty"
-    return "logZ"
-
-
 def objective_from_trace(trace_val: float, rows_m: int, n: int, mode: Optional[str] = None) -> float:
     """Convert trace/Z estimate into objective scalar with log / normalization."""
-    m = _normalize_objective_mode(mode)
+    from .config import normalize_objective_mode
+
+    m = normalize_objective_mode(mode)
     try:
         v = float(trace_val)
     except Exception:
@@ -815,11 +806,10 @@ def evaluate_rules_batch(n: int,
             return min(64, base * 2)
         return base
 
-    objective_mode = _normalize_objective_mode(objective_mode)
-    apply_penalty = _bool_or(use_penalty, config.OBJECTIVE_USE_PENALTY)
-    boundary = (boundary or "torus").lower()
-    if boundary not in {"torus", "open"}:
-        raise ValueError(f"boundary={boundary} not supported")
+    obj_cfg = config.resolve_objective(objective_mode, use_penalty, prefer_penalized_field=True)
+    objective_mode = obj_cfg["objective_mode"]
+    apply_penalty = obj_cfg["objective_use_penalty"]
+    boundary = config.normalize_boundary(boundary)
 
     def _align_objective_fields(fit: Dict, rows_m: int) -> Dict:
         f = dict(fit) if fit is not None else {}

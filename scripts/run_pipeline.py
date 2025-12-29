@@ -18,6 +18,7 @@ from pathlib import Path
 import sys
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+import csv
 
 import numpy as np
 
@@ -37,6 +38,7 @@ from rules.eval import (
     make_rule_matrix,
     rule_from_bits,
 )
+from rules.runtime import RunContext
 from rules.stage1_exact import count_patterns_transfer_matrix, enumerate_ring_rows
 from rules.utils_io import ensure_dir, make_run_tag, slugify
 
@@ -90,6 +92,44 @@ def _bits_from_any(rule_cfg: Dict[str, Any], k: int) -> np.ndarray:
 
 def _bits_to_str(bits: np.ndarray) -> str:
     return "".join("1" if int(b) else "0" for b in bits.tolist())
+
+
+def _resume_key(name: str, bits_canon: str) -> str:
+    return f"{name}|{bits_canon}"
+
+
+def _load_existing_results(run_dir: Path) -> Tuple[List[Dict[str, Any]], set[str]]:
+    rows: List[Dict[str, Any]] = []
+    processed: set[str] = set()
+    jsonl_path = run_dir / "summary.jsonl"
+    csv_path = run_dir / "summary.csv"
+    source = None
+    try:
+        if jsonl_path.exists():
+            source = jsonl_path
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    rows.append(row)
+        elif csv_path.exists():
+            source = csv_path
+            with open(csv_path, "r", encoding="utf-8") as f:
+                rd = csv.DictReader(f)
+                for row in rd:
+                    rows.append(dict(row))
+    except Exception:
+        rows = []
+        processed = set()
+        source = None
+    if rows:
+        for r in rows:
+            key = _resume_key(r.get("name", ""), r.get("rule_bits_canon") or r.get("rule_bits_raw") or "")
+            processed.add(key)
+    if source:
+        LOGGER.info("Loaded %s existing rows from %s", len(rows), source)
+    return rows, processed
 
 
 def _load_config(path: Optional[str]) -> Dict[str, Any]:
@@ -198,11 +238,13 @@ def _prepare_rules(args: argparse.Namespace, cfg: Dict[str, Any]) -> Tuple[int, 
 def run_pipeline(args: argparse.Namespace) -> List[Dict[str, Any]]:
     ensure_repo_on_path()
     cfg = _load_config(args.config)
-    logging_setup.setup_logging(level=args.log_level or cfg.get("log_level", "INFO"))
+    log_level = args.log_level or cfg.get("log_level", "INFO")
+    logging_setup.setup_logging(level=log_level)
 
+    resume_enabled = (not args.no_resume) if args.no_resume is not None else cfg.get("resume", True)
     n, k, rule_specs = _prepare_rules(args, cfg)
-    boundary = (args.boundary or cfg.get("boundary") or rules_config.BOUNDARY_MODE).lower()
-    sym_mode = args.sym_mode or cfg.get("sym_mode") or "perm"
+    boundary = rules_config.normalize_boundary(args.boundary or cfg.get("boundary", rules_config.BOUNDARY_MODE))
+    sym_mode = rules_config.normalize_sym_mode(args.sym_mode or cfg.get("sym_mode"))
     device = args.device or cfg.get("device") or rules_config.DEFAULT_DEVICE
     trace_mode = args.trace_mode or cfg.get("trace_mode") or rules_config.TRACE_MODE
     hutch_s = args.hutch_s or cfg.get("hutch_s") or rules_config.HUTCH_S
@@ -211,18 +253,26 @@ def run_pipeline(args: argparse.Namespace) -> List[Dict[str, Any]]:
     use_exact = not args.no_exact if args.no_exact is not None else cfg.get("use_exact", rules_config.ENABLE_EXACT)
     use_spectral = not args.no_spectral if args.no_spectral is not None else cfg.get("use_spectral", rules_config.ENABLE_SPECTRAL)
     use_cache = not args.no_cache if args.no_cache is not None else cfg.get("use_cache", True)
-    objective_mode = args.objective_mode or cfg.get("objective_mode") or rules_config.OBJECTIVE_MODE
-    objective_use_penalty = (not args.no_objective_penalty) if args.no_objective_penalty is not None else cfg.get("objective_use_penalty", rules_config.OBJECTIVE_USE_PENALTY)
+    objective_penalty_flag = (not args.no_objective_penalty) if args.no_objective_penalty is not None else cfg.get("objective_use_penalty", rules_config.OBJECTIVE_USE_PENALTY)
+    obj_cfg = rules_config.resolve_objective(args.objective_mode or cfg.get("objective_mode"), objective_penalty_flag, prefer_penalized_field=True)
+    objective_mode = obj_cfg["objective_mode"]
+    objective_use_penalty = obj_cfg["objective_use_penalty"]
     rows_cap = args.exact_rows_cap if args.exact_rows_cap is not None else cfg.get("exact_rows_cap", 200_000)
     out_dir = Path(args.out_dir or cfg.get("out_dir") or DEFAULT_OUT_ROOT)
     cache_dir = Path(args.cache_dir or cfg.get("cache_dir") or rules_config.EVAL_CACHE_DIR)
     cache_dir.mkdir(parents=True, exist_ok=True)
+    seed = args.seed if args.seed is not None else cfg.get("seed")
 
     run_tag = args.run_tag or cfg.get("run_tag") or make_run_tag(n, k)
     run_dir = ensure_dir(out_dir / slugify(run_tag))
-    LOGGER.info("pipeline start | n=%s k=%s boundary=%s rules=%s", n, k, boundary, len(rule_specs))
+    ctx = RunContext(run_tag=run_tag, run_dir=run_dir, log_name="pipeline", log_level=log_level, cache_dir=cache_dir, seed=seed)
+    cache_dir = ctx.cache_dir
+    global LOGGER
+    LOGGER = ctx.get_logger("run_pipeline")
+    LOGGER.info("pipeline start | n=%s k=%s boundary=%s sym=%s rules=%s resume=%s", n, k, boundary, sym_mode, len(rule_specs), resume_enabled)
 
-    results: List[Dict[str, Any]] = []
+    existing_rows, processed_keys = _load_existing_results(run_dir) if resume_enabled else ([], set())
+    results: List[Dict[str, Any]] = list(existing_rows)
     iterator: Iterable[Dict[str, Any]]
     if tqdm is not None:
         iterator = tqdm(rule_specs, desc="rules", unit="rule")
@@ -230,26 +280,36 @@ def run_pipeline(args: argparse.Namespace) -> List[Dict[str, Any]]:
         iterator = rule_specs
     last_log = time.time()
     heartbeat = float(args.heartbeat or cfg.get("heartbeat", 10.0))
+    jsonl_path = run_dir / "summary.jsonl"
+    jsonl_mode = "a" if (resume_enabled and jsonl_path.exists()) else "w"
 
-    for idx, spec in enumerate(iterator, start=1):
-        last_log = _heartbeat_logger(idx, len(rule_specs), last_log, heartbeat) if tqdm is None else last_log
-        label = spec.get("name") or spec.get("label") or f"rule_{idx}"
-        try:
-            bits_raw = _bits_from_any(spec, k)
-        except Exception as exc:
-            LOGGER.exception("failed to parse rule %s", label)
-            raise exc
-        bits_canon = canonical_bits(bits_raw, k) if spec.get("canonicalize", True) else bits_raw
-        base_row: Dict[str, Any] = {
-            "run_tag": run_tag,
-            "name": label,
-            "n": n,
-            "k": k,
-            "boundary": boundary,
-            "sym_mode": sym_mode,
-            "rule_bits_raw": _bits_to_str(bits_raw),
-            "rule_bits_canon": _bits_to_str(bits_canon),
-        }
+    ctx.heartbeat("start")
+    with open(jsonl_path, jsonl_mode, encoding="utf-8") as jsonl_fp:
+        for idx, spec in enumerate(iterator, start=1):
+            last_log = _heartbeat_logger(idx, len(rule_specs), last_log, heartbeat) if tqdm is None else last_log
+            label = spec.get("name") or spec.get("label") or f"rule_{idx}"
+            try:
+                bits_raw = _bits_from_any(spec, k)
+            except Exception as exc:
+                LOGGER.exception("failed to parse rule %s", label)
+                raise exc
+            bits_canon = canonical_bits(bits_raw, k) if spec.get("canonicalize", True) else bits_raw
+            bits_raw_str = _bits_to_str(bits_raw)
+            bits_canon_str = _bits_to_str(bits_canon)
+            key = _resume_key(label, bits_canon_str)
+            if resume_enabled and key in processed_keys:
+                LOGGER.info("skip %s (resume hit)", label)
+                continue
+            base_row: Dict[str, Any] = {
+                "run_tag": run_tag,
+                "name": label,
+                "n": n,
+                "k": k,
+                "boundary": boundary,
+                "sym_mode": sym_mode,
+                "rule_bits_raw": bits_raw_str,
+                "rule_bits_canon": bits_canon_str,
+            }
 
         # exact path
         exact_info: Dict[str, Any] = {}
@@ -305,6 +365,19 @@ def run_pipeline(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
         row = {**base_row, **exact_info, **spectral_info}
         results.append(row)
+        processed_keys.add(key)
+        jsonl_fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+        jsonl_fp.flush()
+        ctx.save_checkpoint({
+            "type": "pipeline",
+            "run_tag": run_tag,
+            "n": n,
+            "k": k,
+            "completed": len(results),
+            "last_rule": label,
+            "last_key": key,
+        })
+        ctx.heartbeat(f"{idx}/{len(rule_specs)} {label}")
 
     # persist outputs
     csv_path = run_dir / "summary.csv"
@@ -314,6 +387,15 @@ def run_pipeline(args: argparse.Namespace) -> List[Dict[str, Any]]:
     if args.save_jsonl or cfg.get("save_jsonl", True):
         _write_jsonl(jsonl_path, results)
 
+    ctx.save_checkpoint({
+        "type": "pipeline",
+        "run_tag": run_tag,
+        "n": n,
+        "k": k,
+        "completed": len(results),
+        "done": True,
+    })
+    ctx.heartbeat("done")
     LOGGER.info("pipeline finished -> %s entries (csv=%s, jsonl=%s)", len(results), csv_path, jsonl_path)
     return results
 
@@ -357,12 +439,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-tag", type=str, help="run tag for output dir", default=None)
     parser.add_argument("--out-dir", type=str, help="output root directory", default=None)
     parser.add_argument("--cache-dir", type=str, help="shared eval cache directory", default=None)
+    parser.add_argument("--seed", type=int, help="random seed for reproducibility", default=None)
     parser.add_argument("--heartbeat", type=float, help="seconds between progress heartbeats", default=None)
     parser.add_argument("--log-level", type=str, help="logging level (INFO/DEBUG)", default=None)
     parser.add_argument("--rule-bits", action="append", help="rule bits (0/1) string; can be repeated", default=None)
     parser.add_argument("--no-exact", action="store_true", help="disable exact counting", default=None)
     parser.add_argument("--no-spectral", action="store_true", help="disable spectral eval", default=None)
     parser.add_argument("--no-cache", action="store_true", help="disable spectral cache reuse", default=None)
+    parser.add_argument("--no-resume", action="store_true", help="disable resume from existing outputs", default=None)
     parser.add_argument("--exact-rows-cap", type=int, dest="exact_rows_cap", default=None, help="skip exact when rows exceed cap")
     parser.add_argument("--save-csv", action="store_true", help="force write CSV summary", default=None)
     parser.add_argument("--save-jsonl", action="store_true", help="force write JSONL summary", default=None)
