@@ -125,6 +125,8 @@ def test_ga_respects_symmetry_modes(tmp_path: Path):
         sym_idx = header.index("sym_mode")
         active_k_idx = header.index("active_k")
         active_k_raw_idx = header.index("active_k_raw")
+        assert "archetype_tags_merged" in header
+        assert "archetype_hits_merged" in header
         # All data rows should carry the requested symmetry label and active_k columns.
         for data in rows[1:]:
             assert data[sym_idx] == sym_mode

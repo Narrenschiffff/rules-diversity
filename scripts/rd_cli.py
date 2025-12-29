@@ -154,6 +154,7 @@ def cmd_ga(args):
         boundary=args.boundary,
         cache_dir=args.cache_dir,
         use_cache=not args.no_cache,
+        refresh_cache=bool(args.refresh_cache),
         objective_mode=args.objective_mode,
         objective_use_penalty=not args.no_objective_penalty,
         use_penalized_objective=not args.objective_use_raw,
@@ -183,6 +184,7 @@ def cmd_ga(args):
                     use_penalty=not args.no_objective_penalty,
                     cache_dir=args.cache_dir,
                     use_cache=not args.no_cache,
+                    refresh_cache=bool(args.refresh_cache),
                 )
                 summarize_trace_comparison(reports, logger=logging.getLogger(__name__))
                 def _extract_obj(r: dict) -> float:
@@ -524,6 +526,7 @@ def main():
                     help="精确计数阈值：如 nk<=12 或 rows<=500000")
     sp.add_argument("--cache-dir", default=str(_config.EVAL_CACHE_DIR), help="评估结果缓存目录")
     sp.add_argument("--no-cache", action="store_true", help="禁用评估缓存（始终重新计算）")
+    sp.add_argument("--refresh-cache", action="store_true", help="忽略已有缓存并强制重写（补写 archetype 标签等）")
     sp.add_argument("--objective-mode", default=_config.OBJECTIVE_MODE, choices=["logZ","logZ_per_nr","no_penalty"],
                     help="目标字段变换：logZ / logZ/(n*r) / 不施加惩罚")
     sp.add_argument("--objective-use-raw", action="store_true",
