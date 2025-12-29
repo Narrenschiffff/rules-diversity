@@ -338,6 +338,7 @@ class GAConfig:
                  objective_mode: str = config.OBJECTIVE_MODE,
                  objective_use_penalty: bool = config.OBJECTIVE_USE_PENALTY,
                  use_penalized_objective: bool = True,
+                 penalty_mode: str = config.PENALTY_MODE,
                  resume: bool = True,
                  seed: Optional[int] = None,
                  log_level: str = "INFO",
@@ -370,6 +371,7 @@ class GAConfig:
         self.objective_mode = objective_mode
         self.objective_use_penalty = objective_use_penalty
         self.use_penalized_objective = use_penalized_objective
+        self.penalty_mode = penalty_mode
         self.resume = resume
         self.seed = seed
         self.log_level = log_level
@@ -410,6 +412,7 @@ def _append_front_rows_csv(csv_path_front: str, tag: str, n: int, k: int, genera
                 f"{obj_pen:.6e}",
                 str(fit.get("objective_mode", "")),
                 f"{float(fit.get('penalty_factor', 1.0)):.6e}",
+                fit.get("penalty_mode",""),
                 1 if i in front0_set else 0,
                 int(fit.get("active_k", 0)),
                 int(fit.get("active_k_raw", fit.get("active_k", 0))),
@@ -422,6 +425,8 @@ def _append_front_rows_csv(csv_path_front: str, tag: str, n: int, k: int, genera
                 f"{float(fit.get('upper_bound_raw_gersh', 0.0)):.6e}",
                 f"{float(fit.get('upper_bound_raw_maxdeg', 0.0)):.6e}",
                 fit.get("archetype_tags",""),
+                fit.get("archetype_tags_merged",""),
+                fit.get("archetype_hits_merged",""),
                 ("" if (fit.get("exact_Z","")== "") else str(int(fit.get("exact_Z")))),
                 fit.get("trace_exact", ""),
                 fit.get("trace_estimate", ""),
@@ -466,6 +471,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
     cache_dir       = Path(cache_dir_val)
     use_cache       = _bool_or(getattr(ga_conf, "use_cache", True), True)
     prefer_penalized_objective = _bool_or(getattr(ga_conf, "use_penalized_objective", True), True)
+    penalty_mode    = config.normalize_penalty_mode(getattr(ga_conf, "penalty_mode", config.PENALTY_MODE))
     obj_cfg = config.resolve_objective(
         getattr(ga_conf, "objective_mode", config.OBJECTIVE_MODE),
         getattr(ga_conf, "objective_use_penalty", None),
@@ -529,13 +535,13 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
             w.writerow(["run_tag","n","k","generation","rule_bits","rule_count","rows_m",
                         "lambda_max","lambda_top2","spectral_gap",
                         "sum_lambda_powers","sum_lambda_powers_raw","sum_lambda_powers_penalized",
-                        "objective_raw","objective_penalized","objective_mode","penalty_factor",
+                        "objective_raw","objective_penalized","objective_mode","penalty_factor","penalty_mode",
                         "is_front0",
                         "active_k","active_k_raw","k_sym","sym_mode",
                         "lower_bound","upper_bound",
                         "lower_bound_raw","upper_bound_raw",
                         "upper_bound_raw_gersh","upper_bound_raw_maxdeg",
-                        "archetype_tags","exact_Z",
+                        "archetype_tags","archetype_tags_merged","archetype_hits_merged","exact_Z",
                         "trace_exact","trace_estimate","trace_estimate_raw","trace_error","trace_error_rel","eval_note"])
         with open(csv_gen, "w", newline="", encoding="utf-8") as f:
             w=csv.writer(f)
@@ -596,24 +602,17 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
             f = {} if fit is None else dict(fit)
             rows_m_val = _int_or(f.get("rows_m", 0), 0)
             f["rows_m"] = rows_m_val
-            try:
-                penalty_factor = float(f.get("penalty_factor", 1.0))
-            except Exception:
-                penalty_factor = 1.0
+            penalty_factor = config.penalty_factor_from_shape(n, rows_m_val, f.get("rule_count", None), penalty_mode)
             f["penalty_factor"] = penalty_factor
+            f["penalty_mode"] = penalty_mode
 
-            try:
-                slp_pen = float(f.get("sum_lambda_powers_penalized", f.get("sum_lambda_powers", -1e300)))
-            except Exception:
-                slp_pen = -1e300
             try:
                 slp_raw = float(f.get("sum_lambda_powers_raw", f.get("trace_estimate_raw", f.get("sum_lambda_powers", -1e300))))
             except Exception:
                 slp_raw = -1e300
             if not np.isfinite(slp_raw):
                 slp_raw = -1e300
-            if not np.isfinite(slp_pen):
-                slp_pen = slp_raw if np.isfinite(slp_raw) else -1e300
+            slp_pen = slp_raw / penalty_factor if np.isfinite(slp_raw) else -1e300
             f["sum_lambda_powers_raw"] = slp_raw
             f["sum_lambda_powers_penalized"] = slp_pen
             try:
@@ -639,10 +638,14 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                 f["trace_estimate_raw"] = float(f["sum_lambda_powers_raw"])
             obj_mode = config.normalize_objective_mode(f.get("objective_mode", objective_mode))
             f["objective_mode"] = obj_mode
-            f["objective_raw"] = objective_from_trace(f["sum_lambda_powers_raw"], rows_m_val, n, obj_mode)
-            f["objective_penalized"] = objective_from_trace(f["sum_lambda_powers_penalized"], rows_m_val, n, obj_mode)
+            f["objective_raw"] = objective_from_trace(f["sum_lambda_powers_raw"], penalty_factor, "logZ")
+            f["objective_penalized"] = objective_from_trace(f["sum_lambda_powers_raw"], penalty_factor, obj_mode)
             if f.get("eval_note") is None:
                 f["eval_note"] = ""
+            if "archetype_tags_merged" not in f:
+                f["archetype_tags_merged"] = ""
+            if "archetype_hits_merged" not in f:
+                f["archetype_hits_merged"] = f.get("archetype_hits_merged", "")
             return f
         normed = []
         keys = []
@@ -676,6 +679,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                             enable_spectral=eval_enable_spectral,
                                             exact_threshold=exact_threshold,
                                             objective_mode=objective_mode,
+                                            penalty_mode=penalty_mode,
                                             use_penalty=objective_use_penalty,
                                             cache_dir=str(cache_dir),
                                             use_cache=use_cache)
@@ -695,6 +699,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                                     enable_spectral=eval_enable_spectral,
                                                     exact_threshold=exact_threshold,
                                                     objective_mode=objective_mode,
+                                                    penalty_mode=penalty_mode,
                                                     use_penalty=objective_use_penalty,
                                                     cache_dir=str(cache_dir),
                                                     use_cache=use_cache)
@@ -712,6 +717,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                                 enable_spectral=eval_enable_spectral,
                                                 exact_threshold=exact_threshold,
                                                 objective_mode=objective_mode,
+                                                penalty_mode=penalty_mode,
                                                 use_penalty=objective_use_penalty,
                                                 cache_dir=str(cache_dir),
                                                 use_cache=use_cache)
@@ -739,6 +745,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                                 enable_spectral=eval_enable_spectral,
                                                 exact_threshold=exact_threshold,
                                                 objective_mode=objective_mode,
+                                                penalty_mode=penalty_mode,
                                                 use_penalty=objective_use_penalty,
                                                 cache_dir=str(cache_dir),
                                                 use_cache=use_cache)
@@ -757,6 +764,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                             enable_spectral=eval_enable_spectral,
                                             exact_threshold=exact_threshold,
                                             objective_mode=objective_mode,
+                                            penalty_mode=penalty_mode,
                                             use_penalty=objective_use_penalty,
                                             cache_dir=str(cache_dir),
                                             use_cache=use_cache)
@@ -781,6 +789,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                         enable_spectral=eval_enable_spectral,
                                         exact_threshold=exact_threshold,
                                         objective_mode=objective_mode,
+                                        penalty_mode=penalty_mode,
                                         use_penalty=objective_use_penalty,
                                         cache_dir=str(cache_dir),
                                         use_cache=use_cache)

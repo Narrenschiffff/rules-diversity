@@ -41,9 +41,12 @@ TRACE_MODE = os.getenv("RULES_TRACE_MODE", "hutchpp")  # hutch|hutchpp|lanczos_s
 ENABLE_EXACT = os.getenv("RULES_ENABLE_EXACT", "1") != "0"
 ENABLE_SPECTRAL = os.getenv("RULES_ENABLE_SPECTRAL", "1") != "0"
 EXACT_THRESHOLD = os.getenv("RULES_EXACT_THRESHOLD", "nk<=12")
-# 目标函数：logZ（默认）、logZ/(n*r)、no_penalty（不施加惩罚因子）；可通过 CLI 或 GAConfig 覆盖
-OBJECTIVE_MODE = os.getenv("RULES_OBJECTIVE_MODE", "logZ")
+
+# 目标函数 / 惩罚：logZ（raw）与 logZ/(penalty_factor)（penalized）可切换；可通过 CLI 或 GAConfig 覆盖
+OBJECTIVE_MODE = os.getenv("RULES_OBJECTIVE_MODE", "logZ_per_penalty")
 OBJECTIVE_USE_PENALTY = os.getenv("RULES_OBJECTIVE_USE_PENALTY", "1") != "0"
+# 惩罚模式：n、n*rule_count、n*rows_m
+PENALTY_MODE = os.getenv("RULES_PENALTY_MODE", "n_times_rows_m")
 
 # 对称性分析默认
 SYM_GEO_OPS = os.getenv("RULES_SYM_GEO_OPS", "rot,ref,trans")
@@ -57,6 +60,7 @@ SYM_SAMPLES = int(os.getenv("RULES_SYM_SAMPLES", "6"))
 _BOUNDARY_CHOICES = {"torus", "open"}
 _SYM_CHOICES = {"perm", "perm+swap", "none"}
 _OBJECTIVE_FIELD_CHOICES = {"objective_penalized", "objective_raw"}
+_PENALTY_MODE_CHOICES = {"n", "n_times_rule_count", "n_times_rows_m"}
 
 
 def normalize_boundary(boundary: Optional[str]) -> str:
@@ -75,15 +79,26 @@ def normalize_sym_mode(sym_mode: Optional[str]) -> str:
     return s
 
 
+def normalize_penalty_mode(mode: Optional[str]) -> str:
+    m = (mode or PENALTY_MODE).strip().lower().replace("n*r", "n_times_rows_m")
+    if m in ("n_times_r", "n_times_rows", "n_times_rows_m"):
+        m = "n_times_rows_m"
+    elif m in ("n_times_rc", "n_times_rulecount"):
+        m = "n_times_rule_count"
+    elif m in ("n_only", "n"):
+        m = "n"
+    if m not in _PENALTY_MODE_CHOICES:
+        raise ValueError(f"penalty_mode must be one of {sorted(_PENALTY_MODE_CHOICES)}, got '{mode}'")
+    return m
+
+
 def normalize_objective_mode(mode: Optional[str]) -> str:
-    m = (mode or "logZ").strip().lower()
-    if m in ("logz", "log_z", "log", "logz_penalized"):
+    m = (mode or "logZ_per_penalty").strip().lower()
+    if m in ("logz", "log_z", "log", "raw", "no_penalty", "unpenalized", "nop"):
         return "logZ"
-    if m in ("logz_per_nr", "logz_per_mr", "logz_norm", "logz_per_nk"):
-        return "logZ_per_nr"
-    if m in ("no_penalty", "raw", "unpenalized", "nop"):
-        return "no_penalty"
-    return "logZ"
+    if m in ("logz_per_nr", "logz_per_n", "logz_per_penalty", "logz_norm", "logz_per_nk"):
+        return "logZ_per_penalty"
+    return "logZ_per_penalty"
 
 
 def resolve_objective(mode: Optional[str], use_penalty: Optional[bool], prefer_penalized_field: bool = True):
@@ -100,6 +115,25 @@ def resolve_objective(mode: Optional[str], use_penalty: Optional[bool], prefer_p
         "objective_use_penalty": penalty,
         "objective_field": field,
     }
+
+
+def penalty_factor_from_shape(n: int, rows_m: int, rule_count: Optional[int] = None, mode: Optional[str] = None) -> float:
+    """
+    统一的惩罚因子定义。
+    支持：
+      - n                     -> penalty = n
+      - n_times_rule_count    -> penalty = n * rule_count
+      - n_times_rows_m        -> penalty = n * rows_m
+    """
+    pmode = normalize_penalty_mode(mode)
+    n_val = max(1.0, float(n))
+    rows_val = max(1.0, float(rows_m))
+    if pmode == "n":
+        return n_val
+    if pmode == "n_times_rule_count":
+        rc = max(1.0, float(rule_count) if rule_count is not None else 1.0)
+        return n_val * rc
+    return n_val * rows_val
 
 
 __all__ = [
@@ -121,11 +155,14 @@ __all__ = [
     "EXACT_THRESHOLD",
     "OBJECTIVE_MODE",
     "OBJECTIVE_USE_PENALTY",
+    "PENALTY_MODE",
     "SYM_GEO_OPS",
     "SYM_ENUM_LIMIT",
     "SYM_SAMPLES",
     "normalize_boundary",
     "normalize_sym_mode",
+    "normalize_penalty_mode",
     "normalize_objective_mode",
     "resolve_objective",
+    "penalty_factor_from_shape",
 ]

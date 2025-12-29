@@ -669,8 +669,8 @@ def _upper_bound_raw(R_np: np.ndarray, n: int) -> Dict[str, float]:
     return {"rho_gersh": rho_gersh, "rho_maxdeg": rho_maxdeg}
 
 
-def objective_from_trace(trace_val: float, rows_m: int, n: int, mode: Optional[str] = None) -> float:
-    """Convert trace/Z estimate into objective scalar with log / normalization."""
+def objective_from_trace(trace_val: float, penalty_factor: float, mode: Optional[str] = None) -> float:
+    """Convert trace/Z estimate into objective scalar with optional penalty normalization."""
     from .config import normalize_objective_mode
 
     m = normalize_objective_mode(mode)
@@ -681,9 +681,9 @@ def objective_from_trace(trace_val: float, rows_m: int, n: int, mode: Optional[s
     if not np.isfinite(v) or v <= 0:
         return -1e300
     obj = math.log(max(v, 1e-300))
-    if m == "logZ_per_nr":
-        denom = float(n) * max(float(rows_m), 1.0)
-        obj = obj / denom if denom > 0 else obj
+    if m == "logZ_per_penalty":
+        denom = max(1.0, float(penalty_factor))
+        obj = obj / denom
     return obj
 
 
@@ -783,6 +783,7 @@ def evaluate_rules_batch(n: int,
                          enable_spectral: bool = True,
                          exact_threshold="nk<=12",
                          objective_mode: str = config.OBJECTIVE_MODE,
+                         penalty_mode: str = config.PENALTY_MODE,
                          use_penalty: Optional[bool] = None,
                          cache_dir: Optional[Union[str, Path]] = None,
                          use_cache: bool = True,
@@ -798,7 +799,6 @@ def evaluate_rules_batch(n: int,
       - exact_Z（启用且阈值允许时）
       - trace_exact / trace_estimate / trace_error（若同时有精确值与估计值）
     """
-    PENALTY_ALPHA = 1.5
     def _adaptive_samples(m: int, base: int) -> int:
         if m < 2_000:
             return max(12, base // 2)
@@ -810,25 +810,28 @@ def evaluate_rules_batch(n: int,
     objective_mode = obj_cfg["objective_mode"]
     apply_penalty = obj_cfg["objective_use_penalty"]
     boundary = config.normalize_boundary(boundary)
+    penalty_mode = config.normalize_penalty_mode(penalty_mode)
 
-    def _align_objective_fields(fit: Dict, rows_m: int) -> Dict:
+    def _align_objective_fields(fit: Dict, rows_m: int, rule_count_val: int, penalty_mode_val: str) -> Dict:
         f = dict(fit) if fit is not None else {}
+        rows_m_val = rows_m
         try:
-            penalty_factor = float(f.get("penalty_factor", 1.0))
+            rows_m_val = int(f.get("rows_m", rows_m_val))
         except Exception:
-            penalty_factor = 1.0
+            pass
+        rc_val = rule_count_val
+        try:
+            rc_val = int(f.get("rule_count", rc_val))
+        except Exception:
+            pass
+        penalty_factor = config.penalty_factor_from_shape(n, rows_m_val, rc_val, penalty_mode_val)
         try:
             raw = float(f.get("sum_lambda_powers_raw", f.get("trace_estimate_raw", f.get("sum_lambda_powers", -1e300))))
         except Exception:
             raw = -1e300
-        try:
-            penalized = float(f.get("sum_lambda_powers_penalized", f.get("sum_lambda_powers", raw * penalty_factor)))
-        except Exception:
-            penalized = -1e300
         if not np.isfinite(raw):
             raw = -1e300
-        if not np.isfinite(penalized):
-            penalized = raw if np.isfinite(raw) else -1e300
+        penalized = raw / penalty_factor if np.isfinite(raw) else -1e300
         main_val = penalized if apply_penalty else raw
         f["sum_lambda_powers_raw"] = raw
         f["sum_lambda_powers_penalized"] = penalized
@@ -850,15 +853,43 @@ def evaluate_rules_batch(n: int,
             ub_raw = float(f.get("upper_bound_raw", f.get("upper_bound", 0.0)))
         except Exception:
             ub_raw = 0.0
-        penalty_apply = penalty_factor if apply_penalty else 1.0
+        penalty_apply = (1.0 / penalty_factor) if apply_penalty else 1.0
         f["lower_bound_raw"] = lb_raw
         f["upper_bound_raw"] = ub_raw
         f["lower_bound"] = lb_raw * penalty_apply
         f["upper_bound"] = ub_raw * penalty_apply
         f["objective_mode"] = objective_mode
-        f["objective_raw"] = objective_from_trace(raw, rows_m, n, objective_mode)
-        f["objective_penalized"] = objective_from_trace(penalized, rows_m, n, objective_mode)
+        f["penalty_mode"] = penalty_mode_val
+        f["objective_raw"] = objective_from_trace(raw, penalty_factor, "logZ")
+        f["objective_penalized"] = objective_from_trace(raw, penalty_factor, objective_mode)
+        f.setdefault("archetype_tags_merged", "")
+        f.setdefault("archetype_hits_merged", {})
         return f
+
+    def _extract_archetype_info(bits_raw: np.ndarray, bits_sym: np.ndarray, class_sizes: List[int]) -> Dict[str, object]:
+        out = {
+            "archetype_hits": {},
+            "archetype_tags": "",
+            "archetype_hits_merged": {},
+            "archetype_tags_merged": "",
+        }
+        try:
+            from .structures import recognize_archetypes
+        except Exception:
+            return out
+        try:
+            bits_perm = canonical_bits(bits_raw, k)
+            arc_perm = recognize_archetypes(bits_perm)
+            out["archetype_hits"] = {kk: bool(v) for kk, v in arc_perm.items()}
+            out["archetype_tags"] = ";".join([kk for kk, v in arc_perm.items() if v])
+            merged_needed = ("swap" in sym_mode) and any(cs > 1 for cs in class_sizes)
+            if merged_needed:
+                arc_merge = recognize_archetypes(bits_sym)
+                out["archetype_hits_merged"] = {kk: bool(v) for kk, v in arc_merge.items()}
+                out["archetype_tags_merged"] = ";".join([kk for kk, v in arc_merge.items() if v])
+        except Exception:
+            return out
+        return out
 
     cache_root = ensure_eval_cache_dir(cache_dir) if use_cache else None
 
@@ -882,18 +913,15 @@ def evaluate_rules_batch(n: int,
             used[active_classes] = True
             active_k = int(used.sum())
             active_k_raw = int(sum(class_sizes[c] for c in active_classes)) if m > 0 else 0
-            penalty_factor = 1.0
-            if comps > 1:
-                penalty_factor *= (0.5 ** (comps - 1))
-            if np.any(deg == 0):
-                penalty_factor *= (active_k / k) ** PENALTY_ALPHA
+            rule_count_val = int(bits.sum())
+            penalty_factor = config.penalty_factor_from_shape(n, m, rule_count_val, penalty_mode)
 
             cache_key = None
             if cache_root is not None:
                 cache_key = make_eval_cache_key(bits_sym, active_k, boundary, sym_mode, n)
                 cached = load_eval_cache(cache_root, cache_key)
                 if cached is not None:
-                    outs.append(_align_objective_fields(cached, int(cached.get("rows_m", m))))
+                    outs.append(_align_objective_fields(cached, int(cached.get("rows_m", m)), int(bits.sum()), penalty_mode))
                     continue
 
             trace_exact: Optional[float] = None
@@ -930,6 +958,9 @@ def evaluate_rules_batch(n: int,
                     "upper_bound_raw_gersh": 0.0, "upper_bound_raw_maxdeg": 0.0,
                     "archetype_hits": {},
                     "archetype_tags": "",
+                    "archetype_hits_merged": {},
+                    "archetype_tags_merged": "",
+                    "penalty_mode": penalty_mode,
                     **graph_stats,
                 }
                 fit.update({
@@ -947,6 +978,7 @@ def evaluate_rules_batch(n: int,
                         "k_sym": k_sym,
                         "n": n,
                         "objective_mode": objective_mode,
+                        "penalty_mode": penalty_mode,
                         "apply_penalty": apply_penalty,
                     })
                 outs.append(fit)
@@ -999,18 +1031,18 @@ def evaluate_rules_batch(n: int,
 
                 trace_estimate_raw = float(est)
                 sum_lp_raw = trace_estimate_raw
-                sum_lp_penalized = trace_estimate_raw * penalty_factor
-                lb = lb_raw * (penalty_factor if apply_penalty else 1.0)
-                ub = ub_raw * (penalty_factor if apply_penalty else 1.0)
+                sum_lp_penalized = trace_estimate_raw / penalty_factor
+                lb = lb_raw / penalty_factor if apply_penalty else lb_raw
+                ub = ub_raw / penalty_factor if apply_penalty else ub_raw
             else:
                 trace_estimate_raw = float(trace_exact) if trace_exact is not None else -1e300
                 sum_lp_raw = trace_estimate_raw
-                sum_lp_penalized = trace_estimate_raw * penalty_factor
+                sum_lp_penalized = trace_estimate_raw / penalty_factor
                 if trace_exact is not None:
                     lb_raw = float(trace_exact)
                     ub_raw = float(trace_exact)
-                    lb = lb_raw * (penalty_factor if apply_penalty else 1.0)
-                    ub = ub_raw * (penalty_factor if apply_penalty else 1.0)
+                    lb = lb_raw / penalty_factor if apply_penalty else lb_raw
+                    ub = ub_raw / penalty_factor if apply_penalty else ub_raw
 
             # 结构上界（与 m 结合）
             ub_rhos = _upper_bound_raw(R, n)
@@ -1018,14 +1050,11 @@ def evaluate_rules_batch(n: int,
             ub_raw_maxdeg = float(m) * (ub_rhos["rho_maxdeg"] ** n)
 
             # 原型识别（可选）
-            try:
-                from .structures import recognize_archetypes
-                arc = recognize_archetypes(bits)
-                archetype_tags = ";".join([kk for kk,v in arc.items() if v])
-                archetype_hits = {k: bool(v) for k, v in arc.items()}
-            except Exception:
-                archetype_tags = ""
-                archetype_hits = {}
+            arc_info = _extract_archetype_info(bits, bits_sym, class_sizes)
+            archetype_hits = arc_info["archetype_hits"]
+            archetype_tags = arc_info["archetype_tags"]
+            archetype_hits_merged = arc_info["archetype_hits_merged"]
+            archetype_tags_merged = arc_info["archetype_tags_merged"]
 
             if exact_allowed:
                 try:
@@ -1037,11 +1066,11 @@ def evaluate_rules_batch(n: int,
             if (not spectral_allowed) and (trace_exact is not None):
                 trace_estimate_raw = float(trace_exact)
                 sum_lp_raw = trace_estimate_raw
-                sum_lp_penalized = trace_estimate_raw * penalty_factor
+                sum_lp_penalized = trace_estimate_raw / penalty_factor
                 lb_raw = float(trace_exact)
                 ub_raw = float(trace_exact)
-                lb = lb_raw * (penalty_factor if apply_penalty else 1.0)
-                ub = ub_raw * (penalty_factor if apply_penalty else 1.0)
+                lb = lb_raw / penalty_factor if apply_penalty else lb_raw
+                ub = ub_raw / penalty_factor if apply_penalty else ub_raw
 
             sum_lp_raw = float(sum_lp_raw if np.isfinite(sum_lp_raw) else -1e300)
             sum_lp_penalized = float(sum_lp_penalized if np.isfinite(sum_lp_penalized) else -1e300)
@@ -1053,8 +1082,8 @@ def evaluate_rules_batch(n: int,
                 if trace_exact != 0:
                     trace_error_rel = trace_error / trace_exact
 
-            objective_penalized = objective_from_trace(sum_lp_penalized, m, n, objective_mode)
-            objective_raw = objective_from_trace(sum_lp_raw, m, n, objective_mode)
+            objective_penalized = objective_from_trace(sum_lp_raw, penalty_factor, "logZ_per_penalty")
+            objective_raw = objective_from_trace(sum_lp_raw, penalty_factor, "logZ")
 
             fit = {
                 "rule_count": int(bits.sum()),
@@ -1079,8 +1108,11 @@ def evaluate_rules_batch(n: int,
                 "objective_raw": objective_raw,
                 "objective_mode": objective_mode,
                 "penalty_factor": penalty_factor,
+                "penalty_mode": penalty_mode,
                 "archetype_hits": archetype_hits,
                 "archetype_tags": archetype_tags,
+                "archetype_hits_merged": archetype_hits_merged,
+                "archetype_tags_merged": archetype_tags_merged,
                 **graph_stats,
             }
 
@@ -1105,6 +1137,7 @@ def evaluate_rules_batch(n: int,
                     "k_sym": k_sym,
                     "n": n,
                     "objective_mode": objective_mode,
+                    "penalty_mode": penalty_mode,
                     "apply_penalty": apply_penalty,
                 })
             outs.append(fit)
@@ -1138,18 +1171,15 @@ def evaluate_rules_batch(n: int,
         used[active_classes] = True
         active_k = int(used.sum())
         active_k_raw = int(sum(class_sizes[c] for c in active_classes)) if m > 0 else 0
-        penalty_factor = 1.0
-        if comps > 1:
-            penalty_factor *= (0.5 ** (comps - 1))
-        if np.any(deg == 0):
-            penalty_factor *= (active_k / k) ** PENALTY_ALPHA
+        rule_count_val = int(bits.sum())
+        penalty_factor = config.penalty_factor_from_shape(n, m, rule_count_val, penalty_mode)
 
         cache_key = None
         if cache_root is not None:
             cache_key = make_eval_cache_key(bits_sym, active_k, boundary, sym_mode, n)
             cached = load_eval_cache(cache_root, cache_key)
             if cached is not None:
-                outputs[idx] = _align_objective_fields(cached, int(cached.get("rows_m", m)))
+                outputs[idx] = _align_objective_fields(cached, int(cached.get("rows_m", m)), int(bits.sum()), penalty_mode)
                 continue
 
         trace_exact: Optional[float] = None
@@ -1189,6 +1219,7 @@ def evaluate_rules_batch(n: int,
                 "objective_raw": -1e300,
                 "objective_mode": objective_mode,
                 "penalty_factor": penalty_factor,
+                "penalty_mode": penalty_mode,
                 "trace_exact": trace_exact if trace_exact is not None else "",
                 "trace_estimate": trace_estimate if trace_estimate is not None else -1e300,
                 "trace_estimate_raw": trace_estimate if trace_estimate is not None else -1e300,
@@ -1205,6 +1236,7 @@ def evaluate_rules_batch(n: int,
                     "k_sym": k_sym,
                     "n": n,
                     "objective_mode": objective_mode,
+                    "penalty_mode": penalty_mode,
                     "apply_penalty": apply_penalty,
                 })
             continue
@@ -1259,31 +1291,28 @@ def evaluate_rules_batch(n: int,
 
                 trace_estimate_raw = float(est)
                 sum_lp_raw = trace_estimate_raw
-                sum_lp_penalized = trace_estimate_raw * penalty_factor
-                lb = lb_raw * (penalty_factor if apply_penalty else 1.0)
-                ub = ub_raw * (penalty_factor if apply_penalty else 1.0)
+                sum_lp_penalized = trace_estimate_raw / penalty_factor
+                lb = lb_raw / penalty_factor if apply_penalty else lb_raw
+                ub = ub_raw / penalty_factor if apply_penalty else ub_raw
         else:
             trace_estimate_raw = float(trace_exact) if trace_exact is not None else -1e300
             sum_lp_raw = trace_estimate_raw
-            sum_lp_penalized = trace_estimate_raw * penalty_factor
+            sum_lp_penalized = trace_estimate_raw / penalty_factor
             if trace_exact is not None:
                 lb_raw = float(trace_exact)
                 ub_raw = float(trace_exact)
-                lb = lb_raw * (penalty_factor if apply_penalty else 1.0)
-                ub = ub_raw * (penalty_factor if apply_penalty else 1.0)
+                lb = lb_raw / penalty_factor if apply_penalty else lb_raw
+                ub = ub_raw / penalty_factor if apply_penalty else ub_raw
 
         ub_rhos = _upper_bound_raw(R, n)
         ub_raw_gersh = float(m) * (ub_rhos["rho_gersh"] ** n)
         ub_raw_maxdeg = float(m) * (ub_rhos["rho_maxdeg"] ** n)
 
-        try:
-            from .structures import recognize_archetypes
-            arc = recognize_archetypes(bits)
-            archetype_tags = ";".join([kk for kk,v in arc.items() if v])
-            archetype_hits = {k: bool(v) for k, v in arc.items()}
-        except Exception:
-            archetype_tags = ""
-            archetype_hits = {}
+        arc_info = _extract_archetype_info(bits, bits_sym, class_sizes)
+        archetype_hits = arc_info["archetype_hits"]
+        archetype_tags = arc_info["archetype_tags"]
+        archetype_hits_merged = arc_info["archetype_hits_merged"]
+        archetype_tags_merged = arc_info["archetype_tags_merged"]
 
         if exact_allowed:
             try:
@@ -1294,11 +1323,11 @@ def evaluate_rules_batch(n: int,
         if (not spectral_allowed) and (trace_exact is not None):
             trace_estimate_raw = float(trace_exact)
             sum_lp_raw = trace_estimate_raw
-            sum_lp_penalized = trace_estimate_raw * penalty_factor
+            sum_lp_penalized = trace_estimate_raw / penalty_factor
             lb_raw = float(trace_exact)
             ub_raw = float(trace_exact)
-            lb = lb_raw * (penalty_factor if apply_penalty else 1.0)
-            ub = ub_raw * (penalty_factor if apply_penalty else 1.0)
+            lb = lb_raw / penalty_factor if apply_penalty else lb_raw
+            ub = ub_raw / penalty_factor if apply_penalty else ub_raw
 
         sum_lp_raw = float(sum_lp_raw if np.isfinite(sum_lp_raw) else -1e300)
         sum_lp_penalized = float(sum_lp_penalized if np.isfinite(sum_lp_penalized) else -1e300)
@@ -1310,8 +1339,8 @@ def evaluate_rules_batch(n: int,
             if trace_exact != 0:
                 trace_error_rel = trace_error / trace_exact
 
-        objective_penalized = objective_from_trace(sum_lp_penalized, m, n, objective_mode)
-        objective_raw = objective_from_trace(sum_lp_raw, m, n, objective_mode)
+        objective_penalized = objective_from_trace(sum_lp_raw, penalty_factor, "logZ_per_penalty")
+        objective_raw = objective_from_trace(sum_lp_raw, penalty_factor, "logZ")
 
         fit = {
             "rule_count": int(bits.sum()),
@@ -1336,8 +1365,11 @@ def evaluate_rules_batch(n: int,
             "objective_raw": objective_raw,
             "objective_mode": objective_mode,
             "penalty_factor": penalty_factor,
+            "penalty_mode": penalty_mode,
             "archetype_hits": archetype_hits,
             "archetype_tags": archetype_tags,
+            "archetype_hits_merged": archetype_hits_merged,
+            "archetype_tags_merged": archetype_tags_merged,
             **graph_stats,
         }
 
@@ -1363,6 +1395,7 @@ def evaluate_rules_batch(n: int,
                 "k_sym": k_sym,
                 "n": n,
                 "objective_mode": objective_mode,
+                "penalty_mode": penalty_mode,
                 "apply_penalty": apply_penalty,
             })
 

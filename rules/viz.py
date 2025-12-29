@@ -139,34 +139,47 @@ def _row_bits(row: dict) -> str:
     return ""
 
 
+def _safe_float(val, default: float = float("nan")) -> float:
+    try:
+        return float(val)
+    except Exception:
+        return default
+
+
+def _resolve_value_with_penalty(raw_val: float, penalized_val: float, penalty_factor: float, use_penalty: bool) -> Tuple[float, float, float]:
+    raw = _safe_float(raw_val, default=float("nan"))
+    pen = _safe_float(penalized_val, default=float("nan"))
+    if not np.isfinite(pen) and np.isfinite(raw):
+        pf = _safe_float(penalty_factor, default=1.0)
+        if not np.isfinite(pf) or pf == 0.0:
+            pf = 1.0
+        pen = raw / pf
+    if not np.isfinite(raw) and np.isfinite(pen):
+        raw = pen * _safe_float(penalty_factor, default=1.0)
+    main = pen if use_penalty else raw
+    return main, raw, pen
+
+
 def _entropy_value_from_row(row: Optional[dict], n: int, use_penalty: bool, normalize: bool,
                             read_exact: bool, read_estimate: bool) -> float:
     if not row:
         return float("nan")
-    def _safe_float(val):
-        try:
-            return float(val)
-        except Exception:
-            return float("nan")
-    penalty = _safe_float(row.get("penalty_factor", 1.0))
-    if not np.isfinite(penalty):
+    penalty = _safe_float(row.get("penalty_factor", 1.0), default=1.0)
+    if not np.isfinite(penalty) or penalty <= 0:
         penalty = 1.0
-    if not use_penalty:
-        penalty = 1.0
-
-    def _apply_penalty(v: float, is_penalized: bool) -> float:
-        if not use_penalty and is_penalized and penalty not in (0.0, 1.0):
-            return v / penalty
-        if use_penalty and (not is_penalized):
-            return v * penalty
-        return v
 
     def _with_norm(v: float, is_penalized: bool) -> float:
         if not (np.isfinite(v) and v > 0):
             return float("nan")
-        v = _apply_penalty(v, is_penalized=is_penalized)
-        v = math.log(max(v, 1e-300))
-        return v / float(n) if normalize else v
+        _, raw_val, pen_val = _resolve_value_with_penalty(
+            raw_val=v if not is_penalized else float("nan"),
+            penalized_val=v if is_penalized else float("nan"),
+            penalty_factor=penalty,
+            use_penalty=use_penalty,
+        )
+        chosen = pen_val if use_penalty else raw_val
+        chosen = math.log(max(chosen, 1e-300))
+        return chosen / float(n) if normalize else chosen
 
     if read_exact:
         for key in ("trace_exact", "Z_exact", "exact_Z"):
@@ -402,34 +415,41 @@ def _warn_trace_diff(rows: List[dict], label: str = "") -> None:
     else:
         print(msg)
 
-def _y_metric(row: dict, prefer_field: Optional[str] = None) -> float:
-    fields = []
+def _y_metric(row: dict, prefer_field: Optional[str] = None, use_penalty: bool = True) -> float:
+    pf = _safe_float(row.get("penalty_factor", 1.0), default=1.0)
     if prefer_field:
-        fields.append(prefer_field)
-    fields.extend([
-        "objective_penalized",
+        try:
+            v = float(row.get(prefer_field, ""))
+            if np.isfinite(v):
+                return v
+        except Exception:
+            pass
+    raw_candidates = [
         "objective_raw",
+        "sum_lambda_powers_raw",
+        "trace_estimate_raw",
+        "trace_exact",
+    ]
+    pen_candidates = [
+        "objective_penalized",
+        "sum_lambda_powers_penalized",
         "trace_estimate",
         "sum_lambda_powers",
-        "trace_exact",
-        "Z_exact",
-    ])
-    for key in fields:
-        v = row.get(key, "")
-        if v != "":
-            try:
-                return float(v)
-            except Exception:
-                pass
-    return float("nan")
+    ]
+    raw = next(( _safe_float(row.get(k, float("nan"))) for k in raw_candidates if str(row.get(k, "")) != ""), float("nan"))
+    pen = next(( _safe_float(row.get(k, float("nan"))) for k in pen_candidates if str(row.get(k, "")) != ""), float("nan"))
+    main, _, _ = _resolve_value_with_penalty(raw, pen, pf, use_penalty=use_penalty)
+    return main
 
-def _bounds(row: dict) -> Tuple[Optional[float], Optional[float]]:
-    lo=row.get("lower_bound",""); hi=row.get("upper_bound","")
-    try: lo = float(lo) if lo!="" else None
-    except: lo=None
-    try: hi = float(hi) if hi!="" else None
-    except: hi=None
-    return lo,hi
+def _bounds(row: dict, use_penalty: bool) -> Tuple[Optional[float], Optional[float]]:
+    pf = _safe_float(row.get("penalty_factor", 1.0), default=1.0)
+    lo_raw = _safe_float(row.get("lower_bound_raw", row.get("lower_bound", float("nan"))))
+    hi_raw = _safe_float(row.get("upper_bound_raw", row.get("upper_bound", float("nan"))))
+    lo_pen = _safe_float(row.get("lower_bound", float("nan")))
+    hi_pen = _safe_float(row.get("upper_bound", float("nan")))
+    lo, _, _ = _resolve_value_with_penalty(lo_raw, lo_pen, pf, use_penalty=use_penalty)
+    hi, _, _ = _resolve_value_with_penalty(hi_raw, hi_pen, pf, use_penalty=use_penalty)
+    return lo if np.isfinite(lo) else None, hi if np.isfinite(hi) else None
 
 def _gap_12(row:dict)->float:
     try: lam1 = float(row.get("lambda_max","nan"))
@@ -778,7 +798,7 @@ def plot_frontier_surfaces(front_csvs: Iterable[str],
 # =========================
 # 绘制三图（指定 n,k）
 # =========================
-def _bucket_best_and_band(rows: List[dict], use_logy: bool, objective_field: Optional[str] = None) -> Tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray]:
+def _bucket_best_and_band(rows: List[dict], use_logy: bool, objective_field: Optional[str] = None, use_penalty: bool = True) -> Tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray]:
     bucket: Dict[int, Dict[str, float]] = {}
     mins: Dict[int, float] = {}
     maxs: Dict[int, float] = {}
@@ -787,8 +807,8 @@ def _bucket_best_and_band(rows: List[dict], use_logy: bool, objective_field: Opt
             rc = int(r["rule_count"])
         except:
             continue
-        est = _y_metric(r, prefer_field=objective_field)
-        lo, hi = _bounds(r)
+        est = _y_metric(r, prefer_field=objective_field, use_penalty=use_penalty)
+        lo, hi = _bounds(r, use_penalty=use_penalty)
         cur = bucket.get(rc)
         if (cur is None) or (est > cur["est"]):
             bucket[rc] = {"est": est, "lo": lo, "hi": hi}
@@ -816,7 +836,8 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
                                 y_log: bool = False,
                                 style: str = "default",
                                 sym_filter: Optional[str] = None,
-                                objective_field: Optional[str] = None) -> Tuple[str,str,str]:
+                                objective_field: Optional[str] = None,
+                                apply_penalty: bool = True) -> Tuple[str,str,str]:
     apply_style(style); os.makedirs(out_dir, exist_ok=True)
     series = _collect_by_series_for_nk(front_paths, n, k, sym_filter=sym_filter)
     order  = ["stage1_raw", "stage1_canon", "ga_canon"]
@@ -832,7 +853,7 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
         xs, ys = [], []
         for r in rows:
             try:
-                xs.append(int(r["rule_count"])); ys.append(_y_metric(r, prefer_field=objective_field))
+                xs.append(int(r["rule_count"])); ys.append(_y_metric(r, prefer_field=objective_field, use_penalty=apply_penalty))
             except: pass
         xs, ys = np.asarray(xs,float), np.asarray(ys,float)
         m = np.isfinite(ys) & (ys>0 if y_log else np.isfinite(ys))
@@ -851,7 +872,7 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
     fig2, ax2 = plt.subplots(); anyp=False
     for key in order:
         rows = series.get(key, [])
-        xs, est, lo, hi = _bucket_best_and_band(rows, use_logy=y_log, objective_field=objective_field)
+        xs, est, lo, hi = _bucket_best_and_band(rows, use_logy=y_log, objective_field=objective_field, use_penalty=apply_penalty)
         if xs.size==0: continue
         xj = xs + jitter[key]
         ax2.plot(xj, est, marker=markers[key], linestyle=linest[key], alpha=0.95, label=labels[key])
@@ -880,7 +901,7 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
     painted_gap=False; painted_trace=False
     for key in order:
         rows = series.get(key, [])
-        xs, est, _, _ = _bucket_best_and_band(rows, use_logy=y_log, objective_field=objective_field)
+        xs, est, _, _ = _bucket_best_and_band(rows, use_logy=y_log, objective_field=objective_field, use_penalty=apply_penalty)
         if xs.size==0: continue
         # 同 |R| 选择 best-y 的 gap
         bucket_gap = {}
@@ -932,7 +953,8 @@ def plot_all(front_paths: List[str],
              y_log: bool=False,
              style: str="default",
              sym_filter: Optional[str] = None,
-             objective_field: Optional[str] = None)->List[str]:
+             objective_field: Optional[str] = None,
+             apply_penalty: bool = True)->List[str]:
     """
     兼容 rd_cli.py:
       - 若给定 n,k：仅绘制该 (n,k) 的三张图；
@@ -942,11 +964,11 @@ def plot_all(front_paths: List[str],
     apply_style(style); os.makedirs(out_dir, exist_ok=True)
     outs=[]
     if (n is not None) and (k is not None):
-        outs += list(plot_three_raw_canon_for_nk(front_paths, n, k, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter, objective_field=objective_field))
+        outs += list(plot_three_raw_canon_for_nk(front_paths, n, k, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter, objective_field=objective_field, apply_penalty=apply_penalty))
         return outs
     # 自动发现
     for n0,k0 in _discover_all_nk(front_paths):
-        outs += list(plot_three_raw_canon_for_nk(front_paths, n0, k0, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter, objective_field=objective_field))
+        outs += list(plot_three_raw_canon_for_nk(front_paths, n0, k0, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter, objective_field=objective_field, apply_penalty=apply_penalty))
     return outs
 
 # =========================
