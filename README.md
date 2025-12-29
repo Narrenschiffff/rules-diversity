@@ -53,7 +53,7 @@
 | 精确计算开关 | `--exact / --no-exact` | `use_exact` | 若开启，且行数未超过 `exact_rows_cap`，调用行枚举 + 转移矩阵精确计数。 |
 | 谱估计开关 | `--spectral / --no-spectral` | `use_spectral` | 启用/关闭 Hutch/Hutch++ 迹估计与 Lanczos 顶值估计。 |
 | 阈值联动 | `--exact-rows-cap` | `exact_rows_cap` | 行数超过阈值即跳过精确计算，以谱估计为主。 |
-| 缓存 | `--cache-dir / --no-cache` | `cache_dir` | 规则位串 + 有效状态数 + 边界 + 对称模式 + `n` 共同构成缓存键；命中后直接复用计算结果。 |
+| 缓存 | `--cache-dir / --no-cache` | `cache_dir` | 规则位串 + 有效状态数 + 边界 + 对称模式 + `n` 共同构成缓存键；命中后直接复用计算结果。若早期缓存缺少 archetype 字段，可用 `--refresh-cache` 触发重算并补写。 |
 | 设备选择 | `--device cpu|cuda` | `device` | `rules.eval.TransferOp` 支持 CPU/GPU，默认自动检测。 |
 
 > 若使用 Python API，可直接向 `evaluate_rules_batch` 传入上述同名参数；`scripts/run_pipeline.py` 将 CLI/配置映射到同一接口。
@@ -187,7 +187,7 @@ viz.plot_all(fronts, n=4, k=3, out_dir="results/fig_open_torus", sym_filter="per
 - **归一化拉普拉斯 $\mathcal{L}=I-D^{-1/2} A D^{-1/2}$**：抑制度差的影响；$\lambda_2(\mathcal{L})$ 接近 0 表示近似分离、接近 2 表示存在强二分结构。
 - **邻接谱间隙与顶特征值**：`adj_lambda1/2` 与 `adj_spectral_gap` 捕捉扩散与主导模式强度，常与膝点跃迁相关。
 - **聚类系数**：平均局部三角密度，区分树状/低闭合（近二部）与高闭合（团状）的规则图。
-- **结构识别**：若 `rules/structures` 可用，`archetype_hits` 与 `archetype_tags` 会标记星核、自环富集、近二分等模式，可与上述谱指标交叉验证。
+- **结构识别**：若 `rules/structures` 可用，`archetype_hits` 与 `archetype_tags` 会标记星核、自环富集、近二分等模式，可与上述谱指标交叉验证；`archetype_*_merged` 则对应 perm+swap 合并后统计。
 
 ---
 
@@ -246,7 +246,7 @@ python scripts/run_ga.py --nk "(6,3);(6,4)" --gens 12 --pop 32 --trace hutchpp -
     --out-csv ./out_csv --out-fig ./out_fig
 ```
 脚本会在 `out_csv/` 写入每代帕累托点，并在 `out_fig/` 输出散点 + 增长曲线，日志默认保存在控制台。
-> `--boundary open` 也支持谱估计，但行枚举随规模增长极快，建议在小型 $(n,k)$ 上启用或结合缓存使用。
+> `--boundary open` 也支持谱估计，但行枚举随规模增长极快，建议在小型 $(n,k)$ 上启用或结合缓存使用。输出 CSV 会同时写出主 `archetype_*`（perm 统计）与合并后 `archetype_*_merged`（perm+swap 合并结构）两列。
 
 ### 示例 4：多平台命令行
 ```bash

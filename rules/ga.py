@@ -335,6 +335,7 @@ class GAConfig:
                  boundary: str | None = None,
                  cache_dir=None,
                  use_cache: bool = True,
+                 refresh_cache: bool = False,
                  objective_mode: str = config.OBJECTIVE_MODE,
                  objective_use_penalty: bool = config.OBJECTIVE_USE_PENALTY,
                  use_penalized_objective: bool = True,
@@ -368,6 +369,7 @@ class GAConfig:
         self.boundary = (boundary or config.BOUNDARY_MODE)
         self.cache_dir = cache_dir if cache_dir is not None else config.EVAL_CACHE_DIR
         self.use_cache = use_cache
+        self.refresh_cache = refresh_cache
         self.objective_mode = objective_mode
         self.objective_use_penalty = objective_use_penalty
         self.use_penalized_objective = use_penalized_objective
@@ -590,6 +592,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
         eval_device = device
         eval_enable_spectral = enable_spectral
         eval_enable_exact = enable_exact
+        eval_refresh_cache = _bool_or(getattr(ga_conf, "refresh_cache", False), False)
 
         if boundary_mode == "open" and not open_path_logged:
             logger.info(
@@ -682,7 +685,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                             penalty_mode=penalty_mode,
                                             use_penalty=objective_use_penalty,
                                             cache_dir=str(cache_dir),
-                                            use_cache=use_cache)
+                                            use_cache=use_cache,
+                                            refresh_cache=eval_refresh_cache)
             except Exception:
                 outs = None
                 if eval_device == "cuda":
@@ -702,7 +706,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                                     penalty_mode=penalty_mode,
                                                     use_penalty=objective_use_penalty,
                                                     cache_dir=str(cache_dir),
-                                                    use_cache=use_cache)
+                                                    use_cache=use_cache,
+                                                    refresh_cache=eval_refresh_cache)
                     except Exception:
                         logger.warning("second CUDA attempt failed; fallback to CPU", exc_info=True)
                 if outs is None:
@@ -720,7 +725,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                                 penalty_mode=penalty_mode,
                                                 use_penalty=objective_use_penalty,
                                                 cache_dir=str(cache_dir),
-                                                use_cache=use_cache)
+                                                use_cache=use_cache,
+                                                refresh_cache=eval_refresh_cache)
             for pos, fit in zip(miss_pos, outs):
                 key = keys[pos]
                 fit_norm = _normalize_fit_fields(fit)
@@ -748,7 +754,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                                 penalty_mode=penalty_mode,
                                                 use_penalty=objective_use_penalty,
                                                 cache_dir=str(cache_dir),
-                                                use_cache=use_cache)
+                                                use_cache=use_cache,
+                                                refresh_cache=eval_refresh_cache)
                 except Exception:
                     logger.warning("CUDA retry for None fits failed; fallback to CPU", exc_info=True)
             if outs is None:
@@ -767,7 +774,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                             penalty_mode=penalty_mode,
                                             use_penalty=objective_use_penalty,
                                             cache_dir=str(cache_dir),
-                                            use_cache=use_cache)
+                                            use_cache=use_cache,
+                                            refresh_cache=eval_refresh_cache)
             for pos, fit in zip(retry_pos, outs):
                 key = keys[pos]
                 fit_norm = _normalize_fit_fields(fit)
@@ -792,7 +800,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                                         penalty_mode=penalty_mode,
                                         use_penalty=objective_use_penalty,
                                         cache_dir=str(cache_dir),
-                                        use_cache=use_cache)
+                                        use_cache=use_cache,
+                                        refresh_cache=eval_refresh_cache)
             for pos, fit in zip(retry_pos, outs):
                 key = keys[pos]
                 fit_norm = _normalize_fit_fields(fit)

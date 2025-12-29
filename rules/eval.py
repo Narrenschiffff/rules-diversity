@@ -787,6 +787,7 @@ def evaluate_rules_batch(n: int,
                          use_penalty: Optional[bool] = None,
                          cache_dir: Optional[Union[str, Path]] = None,
                          use_cache: bool = True,
+                         refresh_cache: bool = False,
                          ) -> List[Dict]:
     """
     批量评估规则个体，输出：
@@ -864,6 +865,8 @@ def evaluate_rules_batch(n: int,
         f["objective_penalized"] = objective_from_trace(raw, penalty_factor, objective_mode)
         f.setdefault("archetype_tags_merged", "")
         f.setdefault("archetype_hits_merged", {})
+        f.setdefault("archetype_tags", f.get("archetype_tags", ""))
+        f.setdefault("archetype_hits", f.get("archetype_hits", {}))
         return f
 
     def _extract_archetype_info(bits_raw: np.ndarray, bits_sym: np.ndarray, class_sizes: List[int]) -> Dict[str, object]:
@@ -890,6 +893,45 @@ def evaluate_rules_batch(n: int,
         except Exception:
             return out
         return out
+
+    def _maybe_refresh_cached_archetypes(cached_fit: Dict,
+                                         bits_raw: np.ndarray,
+                                         bits_sym: np.ndarray,
+                                         class_sizes: List[int],
+                                         cache_root: Optional[Path],
+                                         cache_key: Optional[str],
+                                         meta_extra: Dict[str, object]) -> Dict:
+        updated = dict(cached_fit)
+        merged_needed = ("swap" in sym_mode) and any(cs > 1 for cs in class_sizes)
+
+        base_missing = ("archetype_hits" not in updated) or ("archetype_tags" not in updated)
+        merged_missing = merged_needed and (("archetype_hits_merged" not in updated) or ("archetype_tags_merged" not in updated))
+
+        # 旧缓存可能写入了空字符串/空字典，此时若重新识别出标签也应覆盖空值
+        arc_info: Optional[Dict[str, object]] = None
+        def _arc():
+            nonlocal arc_info
+            if arc_info is None:
+                arc_info = _extract_archetype_info(bits_raw, bits_sym, class_sizes)
+            return arc_info
+
+        need_save = False
+        if base_missing or (not updated.get("archetype_tags") and _arc().get("archetype_tags")) or (not updated.get("archetype_hits") and _arc().get("archetype_hits")):
+            info = _arc()
+            updated["archetype_hits"] = info.get("archetype_hits", {})
+            updated["archetype_tags"] = info.get("archetype_tags", "")
+            need_save = True
+
+        if merged_missing or (merged_needed and not updated.get("archetype_tags_merged") and _arc().get("archetype_tags_merged")) or (merged_needed and not updated.get("archetype_hits_merged") and _arc().get("archetype_hits_merged")):
+            info = _arc()
+            updated["archetype_hits_merged"] = info.get("archetype_hits_merged", {})
+            updated["archetype_tags_merged"] = info.get("archetype_tags_merged", "")
+            need_save = True
+
+        if need_save and cache_root is not None and cache_key is not None:
+            dump_eval_cache(cache_root, cache_key, updated, meta_extra=meta_extra)
+
+        return updated
 
     cache_root = ensure_eval_cache_dir(cache_dir) if use_cache else None
 
@@ -919,8 +961,21 @@ def evaluate_rules_batch(n: int,
             cache_key = None
             if cache_root is not None:
                 cache_key = make_eval_cache_key(bits_sym, active_k, boundary, sym_mode, n)
-                cached = load_eval_cache(cache_root, cache_key)
+                cached = None if refresh_cache else load_eval_cache(cache_root, cache_key)
                 if cached is not None:
+                    cached = _maybe_refresh_cached_archetypes(
+                        cached, bits, bits_sym, class_sizes, cache_root, cache_key,
+                        meta_extra={
+                            "boundary": boundary,
+                            "sym_mode": sym_mode,
+                            "active_k": active_k,
+                            "k_sym": k_sym,
+                            "n": n,
+                            "objective_mode": objective_mode,
+                            "penalty_mode": penalty_mode,
+                            "apply_penalty": apply_penalty,
+                        },
+                    )
                     outs.append(_align_objective_fields(cached, int(cached.get("rows_m", m)), int(bits.sum()), penalty_mode))
                     continue
 
@@ -1177,8 +1232,21 @@ def evaluate_rules_batch(n: int,
         cache_key = None
         if cache_root is not None:
             cache_key = make_eval_cache_key(bits_sym, active_k, boundary, sym_mode, n)
-            cached = load_eval_cache(cache_root, cache_key)
+            cached = None if refresh_cache else load_eval_cache(cache_root, cache_key)
             if cached is not None:
+                cached = _maybe_refresh_cached_archetypes(
+                    cached, bits, bits_sym, class_sizes, cache_root, cache_key,
+                    meta_extra={
+                        "boundary": boundary,
+                        "sym_mode": sym_mode,
+                        "active_k": active_k,
+                        "k_sym": k_sym,
+                        "n": n,
+                        "objective_mode": objective_mode,
+                        "penalty_mode": penalty_mode,
+                        "apply_penalty": apply_penalty,
+                    },
+                )
                 outputs[idx] = _align_objective_fields(cached, int(cached.get("rows_m", m)), int(bits.sum()), penalty_mode)
                 continue
 

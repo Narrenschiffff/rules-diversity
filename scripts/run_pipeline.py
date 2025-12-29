@@ -253,6 +253,7 @@ def run_pipeline(args: argparse.Namespace) -> List[Dict[str, Any]]:
     use_exact = not args.no_exact if args.no_exact is not None else cfg.get("use_exact", rules_config.ENABLE_EXACT)
     use_spectral = not args.no_spectral if args.no_spectral is not None else cfg.get("use_spectral", rules_config.ENABLE_SPECTRAL)
     use_cache = not args.no_cache if args.no_cache is not None else cfg.get("use_cache", True)
+    refresh_cache = bool(cfg.get("refresh_cache", False) or getattr(args, "refresh_cache", False))
     objective_penalty_flag = (not args.no_objective_penalty) if args.no_objective_penalty is not None else cfg.get("objective_use_penalty", rules_config.OBJECTIVE_USE_PENALTY)
     obj_cfg = rules_config.resolve_objective(args.objective_mode or cfg.get("objective_mode"), objective_penalty_flag, prefer_penalized_field=True)
     objective_mode = obj_cfg["objective_mode"]
@@ -347,6 +348,7 @@ def run_pipeline(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     use_penalty=objective_use_penalty,
                     cache_dir=str(cache_dir),
                     use_cache=use_cache,
+                    refresh_cache=refresh_cache,
                 )
                 spectral_info = reports[0] if reports else {}
                 if spectral_info:
@@ -446,6 +448,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-exact", action="store_true", help="disable exact counting", default=None)
     parser.add_argument("--no-spectral", action="store_true", help="disable spectral eval", default=None)
     parser.add_argument("--no-cache", action="store_true", help="disable spectral cache reuse", default=None)
+    parser.add_argument("--refresh-cache", action="store_true", help="ignore existing spectral cache and rewrite it", default=False)
     parser.add_argument("--no-resume", action="store_true", help="disable resume from existing outputs", default=None)
     parser.add_argument("--exact-rows-cap", type=int, dest="exact_rows_cap", default=None, help="skip exact when rows exceed cap")
     parser.add_argument("--save-csv", action="store_true", help="force write CSV summary", default=None)
