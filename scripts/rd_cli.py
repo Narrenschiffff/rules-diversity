@@ -289,7 +289,7 @@ def cmd_viz_frontier(args):
         logging.exception("[viz-frontier] failed"); sys.exit(1)
 
 def cmd_motifs(args):
-    from rules.motifs import analyze_fronts_for_knees, analyze_fronts_for_mur
+    from rules.motifs import analyze_fronts_for_knees, analyze_fronts_for_mur, analyze_local_features
     paths = expand_globs(args.front)
     if not paths:
         print("[motifs] no front CSV matched"); sys.exit(1)
@@ -324,6 +324,22 @@ def cmd_motifs(args):
         ex_csv_mur = sum_csv_mur = glob_csv_mur = None
         figs_mur = []
 
+    local_csv = local_json = None
+    local_figs = []
+    if getattr(args, "local_features", False):
+        try:
+            local_csv, local_json, local_figs = analyze_local_features(
+                csv_paths=paths,
+                out_csv_dir=args.out_csv,
+                out_fig_dir=args.out_dir,
+                style=args.style,
+                logy=args.y_log,
+            )
+        except Exception:
+            logging.exception("[motifs] local feature export failed")
+            local_csv = local_json = None
+            local_figs = []
+
     # 3) 写入索引：同时记录膝点与 MUR 的路径，方便 Cell 自动解析
     idx_path = Path(args.out_csv) / "motifs_index.txt"
     with open(idx_path, "w", encoding="utf-8") as f:
@@ -344,6 +360,13 @@ def cmd_motifs(args):
         for i, p in enumerate(figs_mur or []):
             f.write(f"mur_fig{i+1}={os.path.abspath(p)}\n")
 
+        if local_csv:
+            f.write(f"local_features_csv={os.path.abspath(local_csv)}\n")
+        if local_json:
+            f.write(f"local_features_json={os.path.abspath(local_json)}\n")
+        for i, p in enumerate(local_figs or []):
+            f.write(f"local_fig{i+1}={os.path.abspath(p)}\n")
+
     # 4) 控制台输出
     print("[motifs] (knee) examples:", os.path.abspath(ex_csv_knee))
     print("[motifs] (knee) summary :", os.path.abspath(sum_csv_knee))
@@ -358,6 +381,13 @@ def cmd_motifs(args):
         if figs_mur:
             print("[motifs] (mur)  figs:")
             [print("  ", os.path.abspath(p)) for p in figs_mur]
+    if local_csv:
+        print("[motifs] (local) csv :", os.path.abspath(local_csv))
+    if local_json:
+        print("[motifs] (local) json:", os.path.abspath(local_json))
+    if local_figs:
+        print("[motifs] (local) figs:")
+        [print("  ", os.path.abspath(p)) for p in local_figs]
     print("[motifs] index  :", os.path.abspath(idx_path))
 
 
@@ -569,6 +599,7 @@ def main():
     sp.add_argument("--out-dir", default="out_fig")
     sp.add_argument("--style", default="default", choices=["default","ieee","acm","nature"])
     sp.add_argument("--y-log", action="store_true")
+    sp.add_argument("--local-features", action="store_true", help="启用局部特征导出（膝点/MUR/极值及邻点）")
     sp.set_defaults(func=cmd_motifs)
 
     # --- motifs-explain ---
