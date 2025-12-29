@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Motif analysis: knee & MUR finding on Pareto fronts and structural feature extraction."""
 from __future__ import annotations
-import os, re, math, csv
+import os, re, math, csv, json
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Iterable
 import numpy as np
@@ -14,7 +14,7 @@ except Exception:
         pass
 
 # -------- I/O utils (your project) --------
-from .utils_io import ensure_dir, expand_globs, load_csv_rows, parse_nk_from_filename, to_int
+from .utils_io import ensure_dir, expand_globs, load_csv_rows, parse_nk_from_filename, to_int, write_csv
 
 # ==============================================================
 # bits -> rule matrix (prefers eval.rule_from_bits; fallback ok)
@@ -502,6 +502,261 @@ def _write_global(glob_path: Path, examples: List[dict], center_label: str = "kn
     else:
         with open(glob_path, "w", encoding="utf-8") as f:
             f.write("where,count\n")
+
+# =========================================
+# Local feature extraction around key points
+# =========================================
+def _label_group(label: str) -> str:
+    if label.startswith("knee"):
+        return "knee"
+    if label.startswith("mur"):
+        return "mur"
+    if "ymax" in label:
+        return "ymax"
+    if "ymin" in label:
+        return "ymin"
+    return "other"
+
+
+def _active_k_from_row_or_R(row: dict, R: Optional[np.ndarray]) -> Optional[int]:
+    ak = to_int(row.get("active_k"))
+    if ak is not None:
+        return ak
+    if R is None:
+        return None
+    deg = R.astype(bool).sum(axis=1)
+    return int(np.count_nonzero(deg > 0))
+
+
+def _rows_m_from_row(row: dict) -> Optional[int]:
+    for key in ("rows_m", "rows", "m"):
+        v = to_int(row.get(key))
+        if v is not None:
+            return v
+    return None
+
+
+def _deg_histogram_str(deg: np.ndarray) -> str:
+    hist = {}
+    for d in deg.tolist():
+        hist[d] = hist.get(d, 0) + 1
+    return ";".join(f"{int(k)}:{int(v)}" for k, v in sorted(hist.items()))
+
+
+def _build_feature_record(row: dict, n: int, k: int, label: str, idx: int, x_val: int) -> dict:
+    rec = dict(
+        n=n,
+        k=k,
+        label=label,
+        label_group=_label_group(label),
+        order_idx=int(idx),
+        rule_count=int(x_val),
+        y=_y_metric(row),
+        source=str(row.get("__file__", "")),
+    )
+    # defaults
+    for key in [
+        "deg_max",
+        "deg_mean",
+        "deg_std",
+        "diag_cnt",
+        "selfloop_rich",
+        "tri",
+        "c4",
+        "c5",
+        "odd_girth",
+        "near_bip_chord",
+        "clustering",
+        "kcore",
+        "lambda1",
+        "lambda2",
+        "gap",
+        "lap_algebraic",
+        "star_core",
+        "active_k",
+        "rows_m",
+    ]:
+        rec[key] = np.nan
+
+    bits_s = _normalize_bits_field(row)
+    rec["rule_bits"] = bits_s
+    rec["deg_sequence"] = ""
+    rec["deg_histogram"] = ""
+
+    if bits_s:
+        bits = np.fromiter((1 if ch == "1" else 0 for ch in bits_s), dtype=np.uint8)
+        try:
+            R = rule_from_bits_any(k, bits)
+        except Exception:
+            R = None
+        if R is not None:
+            feats = extract_features_from_R(R)
+            rec.update({k: float(v) for k, v in feats.items()})
+            deg = R.astype(bool).sum(axis=1)
+            rec["deg_sequence"] = ";".join(str(int(x)) for x in deg.tolist())
+            rec["deg_histogram"] = _deg_histogram_str(deg)
+            ak = _active_k_from_row_or_R(row, R)
+            if ak is not None:
+                rec["active_k"] = float(ak)
+            rm = _rows_m_from_row(row)
+            if rm is not None:
+                rec["rows_m"] = float(rm)
+    # spectral metrics (prefer row-provided; fallback to recompute)
+    l1, l2, g = _extract_spectral_metrics(row, k)
+    rec["lambda1"] = l1
+    rec["lambda2"] = l2
+    rec["gap"] = g
+    if not np.isfinite(rec.get("gap", np.nan)) and np.isfinite(l1) and np.isfinite(l2):
+        rec["gap"] = l1 - l2
+
+    return rec
+
+
+def analyze_local_features(csv_paths: List[str],
+                           out_csv_dir: str = "./results/motifs",
+                           out_fig_dir: str = "./out_fig",
+                           style: str = "default",
+                           logy: bool = True):
+    """按前沿序列抽取膝点 / MUR / 极值及其邻点的局部结构 + 谱特征。"""
+    apply_style(style)
+    out_csv_dir = ensure_dir(out_csv_dir)
+    out_fig_dir = ensure_dir(out_fig_dir)
+
+    rows = load_csv_rows(csv_paths)
+    if not rows:
+        raise FileNotFoundError("[motifs/local] No rows loaded from CSV inputs.")
+
+    by_src = _group_by_nks(rows)
+    all_nk = sorted(set((n, k) for (n, k, _) in by_src.keys()))
+    by_nk = {}
+    for (n, k) in all_nk:
+        if (n, k, "stage1") in by_src:
+            by_nk[(n, k)] = by_src[(n, k, "stage1")]
+        elif (n, k, "ga") in by_src:
+            by_nk[(n, k)] = by_src[(n, k, "ga")]
+        else:
+            by_nk[(n, k)] = by_src.get((n, k, "unknown"), [])
+
+    records: List[dict] = []
+    for (n, k), rs in sorted(by_nk.items()):
+        buckets = _best_bucket_by_rulecount(rs)
+        if not buckets:
+            continue
+        xs = sorted(buckets.keys())
+        ys = np.array([buckets[x]["y"] for x in xs], float)
+
+        def add(label: str, idx: Optional[int]):
+            if idx is None or idx < 0 or idx >= len(xs):
+                return
+            row = buckets[xs[idx]]["row"]
+            records.append(_build_feature_record(row=row, n=n, k=k, label=label, idx=idx, x_val=xs[idx]))
+
+        idx_knee = robust_knee(xs, ys, logy=logy)
+        if idx_knee is not None:
+            add("knee_prev", idx_knee - 1)
+            add("knee_current", idx_knee)
+            add("knee_next", idx_knee + 1)
+
+        idx_mur = mur_index(xs, ys, logy=logy)
+        if idx_mur is not None:
+            add("mur_prev", idx_mur - 1)
+            add("mur_current", idx_mur)
+            add("mur_next", idx_mur + 1)
+
+        finite_mask = np.isfinite(ys)
+        if finite_mask.any():
+            try:
+                idx_max = int(np.nanargmax(ys))
+                idx_min = int(np.nanargmin(ys))
+                for lab, i in [
+                    ("ymax_prev", idx_max - 1),
+                    ("ymax_current", idx_max),
+                    ("ymax_next", idx_max + 1),
+                    ("ymin_prev", idx_min - 1),
+                    ("ymin_current", idx_min),
+                    ("ymin_next", idx_min + 1),
+                ]:
+                    add(lab, i)
+            except Exception:
+                pass
+
+    csv_path = Path(out_csv_dir) / "motif_local_features.csv"
+    write_csv(csv_path, records, fieldnames=sorted(set().union(*(set(r.keys()) for r in records))) if records else None)
+
+    json_path = Path(out_csv_dir) / "motif_local_features.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+
+    fig_paths: List[str] = []
+    metrics = ["deg_max", "clustering", "lambda1", "lambda2", "gap", "rule_count", "active_k"]
+
+    def _group_means():
+        agg: Dict[str, Dict[str, float]] = {}
+        for rec in records:
+            grp = rec.get("label_group", "other")
+            agg.setdefault(grp, {m: [] for m in metrics})
+            for m in metrics:
+                v = rec.get(m, np.nan)
+                if np.isfinite(v):
+                    agg[grp][m].append(float(v))
+        means: Dict[str, Dict[str, float]] = {}
+        for grp, vals in agg.items():
+            means[grp] = {m: (float(np.mean(vs)) if vs else float("nan")) for m, vs in vals.items()}
+        return means
+
+    agg_means = _group_means()
+    try:
+        import matplotlib.pyplot as plt
+        if agg_means:
+            groups = sorted(agg_means.keys())
+            angles = np.linspace(0, 2 * np.pi, len(metrics), endpoint=False).tolist()
+            angles += angles[:1]
+            fig = plt.figure(figsize=(7.2, 5.8))
+            ax = fig.add_subplot(111, polar=True)
+            max_per_metric = {
+                m: max([v for vals in agg_means.values() if np.isfinite(vals.get(m, np.nan)) for v in [vals.get(m, np.nan)]], default=1.0)
+                for m in metrics
+            }
+            for g in groups:
+                vals = [agg_means[g].get(m, np.nan) for m in metrics]
+                normed = [v / (max_per_metric[m] + 1e-9) if np.isfinite(v) else 0.0 for v, m in zip(vals, metrics)]
+                data = normed + normed[:1]
+                ax.plot(angles, data, label=g, marker="o", alpha=0.85)
+                ax.fill(angles, data, alpha=0.15)
+            ax.set_xticks(angles[:-1])
+            ax.set_xticklabels(metrics, fontsize=9)
+            ax.set_yticklabels([])
+            ax.set_title("Local motif feature radar (normalized)", fontsize=12)
+            ax.legend(loc="upper right", bbox_to_anchor=(1.2, 1.05), frameon=False)
+            radar_path = Path(out_fig_dir) / "motif_local_radar.png"
+            fig.tight_layout()
+            fig.savefig(radar_path, dpi=200)
+            plt.close(fig)
+            fig_paths.append(str(radar_path))
+
+            mat = np.array([[agg_means[g].get(m, np.nan) for m in metrics] for g in groups], float)
+            fig2, ax2 = plt.subplots(figsize=(8.0, 4.8))
+            im = ax2.imshow(mat, aspect="auto", cmap="YlGnBu")
+            ax2.set_xticks(range(len(metrics)))
+            ax2.set_xticklabels(metrics, rotation=25, ha="right")
+            ax2.set_yticks(range(len(groups)))
+            ax2.set_yticklabels(groups)
+            ax2.set_title("Local motif feature heatmap (group means)")
+            for i in range(mat.shape[0]):
+                for j in range(mat.shape[1]):
+                    val = mat[i, j]
+                    if np.isfinite(val):
+                        ax2.text(j, i, f"{val:.2g}", ha="center", va="center", fontsize=8, color="black")
+            fig2.colorbar(im, ax=ax2, shrink=0.85)
+            fig2.tight_layout()
+            heat_path = Path(out_fig_dir) / "motif_local_heatmap.png"
+            fig2.savefig(heat_path, dpi=210)
+            plt.close(fig2)
+            fig_paths.append(str(heat_path))
+    except Exception:
+        pass
+
+    return str(csv_path), str(json_path), fig_paths
 
 # =========================================
 # Main: Knee analysis (examples/summary/global + figs)
