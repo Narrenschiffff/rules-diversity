@@ -21,6 +21,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
+# Ensure in-repo execution works without PYTHONPATH tweaks.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from rules.bootstrap import ensure_repo_on_path
 from rules import config as rules_config
 from rules import logging_setup
 from rules.cache import make_eval_cache_key
@@ -190,6 +196,7 @@ def _prepare_rules(args: argparse.Namespace, cfg: Dict[str, Any]) -> Tuple[int, 
 
 
 def run_pipeline(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    ensure_repo_on_path()
     cfg = _load_config(args.config)
     logging_setup.setup_logging(level=args.log_level or cfg.get("log_level", "INFO"))
 

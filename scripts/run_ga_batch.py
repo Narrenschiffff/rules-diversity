@@ -26,19 +26,19 @@ import os
 import subprocess
 import textwrap
 from pathlib import Path
+import sys
+
+# Ensure in-repo execution works without PYTHONPATH tweaks.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from rules.bootstrap import ensure_repo_on_path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = ensure_repo_on_path()
 GA_GENS = int(os.environ.get("GA_GENS", 16))
 GA_POP = int(os.environ.get("GA_POP", 96))
-os.environ.setdefault("PYTHONPATH", str(ROOT))
-try:
-    import rules  # noqa: F401
-except ModuleNotFoundError as exc:  # pragma: no cover - import guard
-    raise SystemExit(
-        "[run_ga_batch] rules package not importable. Install via 'pip install -e .' "
-        "or ensure PYTHONPATH includes repo root."
-    ) from exc
 
 
 def run(cmd: str) -> None:
