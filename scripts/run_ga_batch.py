@@ -48,13 +48,14 @@ PENALTY_MODES = [
 ]
 
 
-def run(cmd: str, *, penalty_mode: str) -> None:
-    print(cmd)
+def run(cmd, *, penalty_mode: str) -> None:
+    """Run a command (list form preferred) with penalty env injected."""
+    print(cmd if isinstance(cmd, str) else " ".join(cmd))
     env = os.environ.copy()
     env.setdefault("PYTHONPATH", str(Path(__file__).resolve().parents[1]))
     # 将惩罚模式传递给规则评估
     env["RULES_PENALTY_MODE"] = penalty_mode
-    res = subprocess.run(cmd, shell=True, text=True, capture_output=True, env=env)
+    res = subprocess.run(cmd, shell=isinstance(cmd, str), text=True, capture_output=True, env=env)
     print(res.stdout)
     if res.stderr:
         print("[stderr]", res.stderr)
@@ -89,26 +90,41 @@ def ga_batch(n: int, k: int, sym: str, boundary: str, penalty_mode: str, out_roo
 
     # n*k>20 时倾向估计；未实现时 rd_cli 内部会继续精确
     exact_threshold = "nk<=20"
-    base = textwrap.dedent(
-        f"""
-        python scripts/rd_cli.py ga --n {n} --k {k} --generations {GA_GENS} --pop-size {GA_POP} \
-          --trace-mode hutchpp --r-vals 4 --hutch-s 32 {spectral_flags}\
-          --sym {sym} --boundary {boundary} --device {device} \
-          --out-csv {out_dir.as_posix()} --exact-threshold "{exact_threshold}" --refresh-cache
-        """
-    ).strip()
+    # 使用列表避免 Windows 下反斜杠导致的转义/换行问题，路径一律传递 POSIX 风格。
+    args = [
+        "python",
+        "scripts/rd_cli.py",
+        "ga",
+        "--n", str(n),
+        "--k", str(k),
+        "--generations", str(GA_GENS),
+        "--pop-size", str(GA_POP),
+        "--trace-mode", "hutchpp",
+        "--r-vals", "4",
+        "--hutch-s", "32",
+    ]
+    if spectral_flags:
+        args.extend(spectral_flags.split())
+    args.extend([
+        "--sym", sym,
+        "--boundary", boundary,
+        "--device", device,
+        "--out-csv", out_dir.as_posix(),
+        "--exact-threshold", exact_threshold,
+        "--refresh-cache",
+    ])
     try:
-        run(base, penalty_mode=penalty_mode)
+        run(args, penalty_mode=penalty_mode)
     except RuntimeError as e:
         if device == "cuda":
             print(
                 f"[WARN] CUDA failed for (n={n},k={k},sym={sym},boundary={boundary}), fallback CPU. {e}"
             )
             # CPU 回退：open 关闭谱估计，其余保持开启以允许估计路径
-            cpu_cmd = base.replace("--device cuda", "--device cpu")
-            if (boundary == "open") and ("--no-spectral" not in cpu_cmd):
-                cpu_cmd += " --no-spectral --no-lanczos"
-            run(cpu_cmd, penalty_mode=penalty_mode)
+            cpu_args = [a if a != "cuda" else "cpu" for a in args]
+            if (boundary == "open") and ("--no-spectral" not in cpu_args):
+                cpu_args.extend(["--no-spectral", "--no-lanczos"])
+            run(cpu_args, penalty_mode=penalty_mode)
         else:
             raise
 
