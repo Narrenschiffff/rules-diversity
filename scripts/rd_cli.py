@@ -9,9 +9,14 @@ import csv
 from pathlib import Path
 from typing import List, Optional
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+# Ensure in-repo execution works without PYTHONPATH tweaks.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from rules.bootstrap import ensure_repo_on_path
+
+ROOT = ensure_repo_on_path()
 
 from rules import config as _config
 
