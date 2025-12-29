@@ -1,7 +1,10 @@
 import csv
+import math
 from pathlib import Path
 
 import matplotlib
+import numpy as np
+import pytest
 
 matplotlib.use("Agg")
 
@@ -116,3 +119,89 @@ def test_viz_handles_symmetry_filter_and_summary(tmp_path: Path):
     summary_perm = viz.summarize_runs(csvs, sym_filter="perm")
     assert canon.name not in summary_perm
     assert summary_perm[raw.name]["symmetry_counts"] == {"perm": 1}
+
+
+def test_entropy_convergence_aggregates_csv(tmp_path: Path):
+    csv_a = tmp_path / "n3.csv"
+    csv_b = tmp_path / "n4.csv"
+    _write_csv(
+        csv_a,
+        [
+            {
+                "n": 3,
+                "k": 2,
+                "boundary": "torus",
+                "sym_mode": "perm",
+                "rule_bits": "1111",
+                "trace_exact": 8.0,
+                "penalty_factor": 0.5,
+            }
+        ],
+    )
+    _write_csv(
+        csv_b,
+        [
+            {
+                "n": 4,
+                "k": 2,
+                "boundary": "torus",
+                "sym_mode": "perm",
+                "rule_bits": "1111",
+                "trace_estimate_raw": 16.0,
+                "penalty_factor": 2.0,
+            }
+        ],
+    )
+
+    series = viz._prepare_entropy_series(
+        rule_bits=None,
+        k=None,
+        n_min=3,
+        n_max=4,
+        csv_paths=[str(csv_a), str(csv_b)],
+        boundary=None,
+        sym_mode=None,
+        device="cpu",
+        use_penalty=True,
+        normalize=True,
+        read_existing_exact=True,
+        read_existing_estimate=True,
+    )
+    assert series.k == 2
+    assert series.boundary == "torus"
+    np.testing.assert_allclose(series.n_vals, [3, 4])
+    expected = [math.log(8.0 * 0.5) / 3.0, math.log(16.0 * 2.0) / 4.0]
+    np.testing.assert_allclose(series.log_vals, expected)
+
+    out_figs = viz.plot_entropy_convergence(
+        rule_bits=None,
+        k=None,
+        n_min=3,
+        n_max=4,
+        csv_paths=[str(csv_a), str(csv_b)],
+        boundary=None,
+        sym_mode=None,
+        device="cpu",
+        out_dir=str(tmp_path / "figs"),
+        style="default",
+    )
+    assert len(out_figs) == 1
+    assert Path(out_figs[0]).exists()
+
+
+def test_entropy_requires_bits_or_rows(tmp_path: Path):
+    with pytest.raises(ValueError):
+        viz._prepare_entropy_series(
+            rule_bits=None,
+            k=None,
+            n_min=2,
+            n_max=3,
+            csv_paths=None,
+            boundary=None,
+            sym_mode=None,
+            device="cpu",
+            use_penalty=True,
+            normalize=True,
+            read_existing_exact=True,
+            read_existing_estimate=True,
+        )

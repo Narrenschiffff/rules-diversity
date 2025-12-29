@@ -206,15 +206,31 @@ def cmd_entropy(args):
     from rules.viz import plot_entropy_convergence, apply_style
     import numpy as np
     apply_style(args.style)
-    bits = np.array([1 if ch == '1' else 0 for ch in args.bits.strip()], dtype=np.uint8)
+    bits = None
+    if args.bits is not None:
+        bits = np.array([1 if ch == '1' else 0 for ch in str(args.bits).strip()], dtype=np.uint8)
+    csv_paths = []
+    if args.csv:
+        csv_paths.extend(expand_globs(args.csv))
+    if args.csv_dir:
+        csv_paths.extend(expand_globs([str(Path(args.csv_dir) / "*.csv")]))
     try:
         outs = plot_entropy_convergence(
             rule_bits=bits, k=args.k,
             n_min=args.n_min, n_max=args.n_max,
-            device=args.device, out_dir=args.out_dir, style=args.style, logy=args.logy
+            csv_paths=csv_paths or None,
+            boundary=args.boundary,
+            sym_mode=args.sym,
+            device=args.device, out_dir=args.out_dir, style=args.style, logy=args.logy,
+            read_existing_exact=not args.no_existing_exact,
+            read_existing_estimate=not args.no_existing_estimate,
+            normalize_log_per_n=not args.no_normalize,
+            apply_penalty=not args.no_penalty,
         )
         for p in outs:
             print("[entropy] saved:", os.path.abspath(p))
+    except ValueError as exc:
+        logging.error("[entropy] %s", exc); sys.exit(1)
     except Exception:
         logging.exception("[entropy] failed"); sys.exit(1)
 
@@ -468,15 +484,23 @@ def main():
     sp.set_defaults(func=cmd_ga)
 
     # --- entropy ---
-    sp = subparsers.add_parser("entropy", help="指定规则的条带熵收敛曲线")
-    sp.add_argument("--bits", required=True)
-    sp.add_argument("--k", type=int, required=True)
+    sp = subparsers.add_parser("entropy", help="指定规则或 CSV 的条带熵收敛曲线（log(Z)/n）")
+    sp.add_argument("--bits", default=None, help="规则位串；缺省时将尝试从 CSV 中推断")
+    sp.add_argument("--k", type=int, default=None, help="规则基数；若缺省则尝试由 CSV 推断")
+    sp.add_argument("--csv", nargs="+", default=None, help="包含 trace/Z 的 CSV（支持通配）")
+    sp.add_argument("--csv-dir", default=None, help="遍历目录下的 CSV（自动匹配 boundary/sym_mode）")
+    sp.add_argument("--boundary", default=None, choices=["torus", "open"])
+    sp.add_argument("--sym", default=None, help="对称模式过滤/评估（如 perm 或 perm+swap）")
     sp.add_argument("--n-min", type=int, default=3)
     sp.add_argument("--n-max", type=int, default=10)
     sp.add_argument("--device", default="cpu", choices=["cpu","cuda"])
     sp.add_argument("--out-dir", default="out_fig")
     sp.add_argument("--style", default="default", choices=["default","ieee","acm","nature"])
     sp.add_argument("--logy", action="store_true")
+    sp.add_argument("--no-existing-exact", action="store_true", help="忽略 CSV 中的 trace_exact/Z_exact")
+    sp.add_argument("--no-existing-estimate", action="store_true", help="忽略 CSV 中的 trace_estimate/sum_lambda_powers")
+    sp.add_argument("--no-normalize", action="store_true", help="禁用 log(Z)/n 归一化")
+    sp.add_argument("--no-penalty", action="store_true", help="禁用惩罚因子（始终视为 penalty_factor=1）")
     sp.set_defaults(func=cmd_entropy)
 
     # --- viz-all ---
