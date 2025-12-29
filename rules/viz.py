@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import os, re, csv, math, argparse
-from typing import Dict, List, Tuple, Iterable, Optional
+import os, re, csv, math, argparse, glob, logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple, Iterable, Optional, Sequence
 
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+
+from . import config
+from .eval import evaluate_rules_batch
 
 # =========================
 # 样式
@@ -30,6 +35,13 @@ _RX_TS = re.compile(r"(?:[_-]\d{9,})$")
 def _shorten(tag:str, max_len:int=24)->str:
     t = _RX_TS.sub("", tag or "")
     return t if len(t)<=max_len else (t[:max_len-3]+"...")
+
+
+def _bits_to_str(bits: np.ndarray | Sequence[int] | str) -> str:
+    if isinstance(bits, str):
+        return bits.strip()
+    arr = np.asarray(bits, dtype=np.uint8).reshape(-1)
+    return "".join(str(int(x)) for x in arr.tolist())
 
 def _jitter(xs: np.ndarray, scale: float = 0.12) -> np.ndarray:
     if xs.size == 0: return xs
@@ -97,6 +109,248 @@ def summarize_runs(csv_paths: Iterable[str], sym_filter: Optional[str] = None) -
             "boundaries": sorted(boundaries),
         }
     return out
+
+
+def _unique_field(rows: List[dict], field: str) -> Optional[str]:
+    vals = {str(r.get(field, "")).strip() for r in rows if str(r.get(field, "")).strip() != ""}
+    if not vals:
+        return None
+    if len(vals) > 1:
+        raise ValueError(f"multiple values for {field}: {sorted(vals)}")
+    return next(iter(vals))
+
+
+def _expand_globs(paths: Iterable[str]) -> List[str]:
+    outs: list[str] = []
+    for p in paths:
+        outs.extend(glob.glob(p))
+    seen = set(); uniq = []
+    for x in outs:
+        if x not in seen:
+            uniq.append(x); seen.add(x)
+    return uniq
+
+
+def _row_bits(row: dict) -> str:
+    for key in ("rule_bits", "rule_bits_raw", "rule_bits_canon"):
+        s = str(row.get(key, "")).strip()
+        if s:
+            return s
+    return ""
+
+
+def _entropy_value_from_row(row: Optional[dict], n: int, use_penalty: bool, normalize: bool,
+                            read_exact: bool, read_estimate: bool) -> float:
+    if not row:
+        return float("nan")
+    def _safe_float(val):
+        try:
+            return float(val)
+        except Exception:
+            return float("nan")
+    penalty = _safe_float(row.get("penalty_factor", 1.0))
+    if not np.isfinite(penalty):
+        penalty = 1.0
+    if not use_penalty:
+        penalty = 1.0
+
+    def _apply_penalty(v: float, is_penalized: bool) -> float:
+        if not use_penalty and is_penalized and penalty not in (0.0, 1.0):
+            return v / penalty
+        if use_penalty and (not is_penalized):
+            return v * penalty
+        return v
+
+    def _with_norm(v: float, is_penalized: bool) -> float:
+        if not (np.isfinite(v) and v > 0):
+            return float("nan")
+        v = _apply_penalty(v, is_penalized=is_penalized)
+        v = math.log(max(v, 1e-300))
+        return v / float(n) if normalize else v
+
+    if read_exact:
+        for key in ("trace_exact", "Z_exact", "exact_Z"):
+            v = _safe_float(row.get(key, float("nan")))
+            if np.isfinite(v) and v > 0:
+                return _with_norm(v, is_penalized=False)
+    if read_estimate:
+        for key in ("trace_estimate", "sum_lambda_powers", "sum_lambda_powers_penalized"):
+            v = _safe_float(row.get(key, float("nan")))
+            if np.isfinite(v) and v > 0:
+                return _with_norm(v, is_penalized=("penal" in key))
+        for key in ("trace_estimate_raw", "sum_lambda_powers_raw"):
+            v = _safe_float(row.get(key, float("nan")))
+            if np.isfinite(v) and v > 0:
+                return _with_norm(v, is_penalized=False)
+    return float("nan")
+
+
+@dataclass
+class EntropySeries:
+    n_vals: np.ndarray
+    log_vals: np.ndarray
+    rule_bits: str
+    k: int
+    boundary: str
+    sym_mode: str
+    sources: List[str]
+
+
+def _prepare_entropy_series(rule_bits: Optional[str],
+                            k: Optional[int],
+                            n_min: int,
+                            n_max: int,
+                            csv_paths: Optional[Iterable[str]] = None,
+                            boundary: Optional[str] = None,
+                            sym_mode: Optional[str] = None,
+                            device: str = config.DEFAULT_DEVICE,
+                            use_penalty: bool = True,
+                            normalize: bool = True,
+                            read_existing_exact: bool = True,
+                            read_existing_estimate: bool = True) -> EntropySeries:
+    paths = _expand_globs(csv_paths or [])
+    runs = _load_rows(paths) if paths else {}
+    rows: List[dict] = []
+    for rr in runs.values():
+        rows.extend(rr)
+
+    bits_str = rule_bits or ""
+    if not bits_str:
+        deduced = _unique_field(rows, "rule_bits") or _unique_field(rows, "rule_bits_raw") or _unique_field(rows, "rule_bits_canon")
+        if deduced:
+            bits_str = deduced
+    if not bits_str and not rows:
+        raise ValueError("rule_bits not provided and no CSV rows available")
+
+    if bits_str:
+        rows = [r for r in rows if _row_bits(r) == bits_str]
+
+    if not rows and not bits_str:
+        raise ValueError("rule_bits not provided and CSV rows contain multiple rules; please supply --bits")
+
+    boundary = boundary or _unique_field(rows, "boundary") or config.BOUNDARY_MODE
+    sym_mode = sym_mode or _unique_field(rows, "sym_mode") or "perm"
+    if k is None:
+        k_val = _unique_field(rows, "k")
+        if k_val is not None:
+            try:
+                k = int(k_val)
+            except Exception:
+                pass
+    if k is None and bits_str:
+        k = int(round(len(bits_str) ** 0.5))
+    if k is None:
+        raise ValueError("k is required (provide via argument or CSV field)")
+
+    rows_by_n: Dict[int, dict] = {}
+    for r in rows:
+        try:
+            n_val = int(r.get("n"))
+        except Exception:
+            continue
+        if (n_val < n_min) or (n_val > n_max):
+            continue
+        prev = rows_by_n.get(n_val)
+        has_exact = any(str(r.get(f, "")).strip() != "" for f in ("trace_exact", "Z_exact", "exact_Z"))
+        prev_exact = any(str(prev.get(f, "")) != "" for f in ("trace_exact", "Z_exact", "exact_Z")) if prev else False
+        if (prev is None) or (has_exact and not prev_exact):
+            rows_by_n[n_val] = r
+
+    n_list = []
+    log_list = []
+    sources: List[str] = []
+    bits_arr = np.array([int(c) for c in bits_str], dtype=np.uint8) if bits_str else None
+
+    for n in range(n_min, n_max + 1):
+        row = rows_by_n.get(n)
+        val = _entropy_value_from_row(row, n=n, use_penalty=use_penalty, normalize=normalize,
+                                      read_exact=read_existing_exact, read_estimate=read_existing_estimate)
+        source = "csv" if row is not None else ""
+        if (not np.isfinite(val)) and (bits_arr is not None):
+            try:
+                fits = evaluate_rules_batch(
+                    n=n, k=k, bits_list=[bits_arr],
+                    sym_mode=sym_mode,
+                    boundary=boundary,
+                    device=device,
+                    use_penalty=use_penalty,
+                    enable_exact=read_existing_exact,
+                    enable_spectral=read_existing_estimate,
+                )
+                fit = fits[0] if fits else {}
+                fit["n"] = n
+                fit["boundary"] = boundary
+                fit["sym_mode"] = sym_mode
+                val = _entropy_value_from_row(fit, n=n, use_penalty=use_penalty, normalize=normalize,
+                                              read_exact=True, read_estimate=True)
+                source = "eval"
+            except Exception as exc:
+                logging.getLogger(__name__).warning("[entropy] evaluate_rules_batch failed for n=%s: %s", n, exc)
+        if np.isfinite(val):
+            n_list.append(n)
+            log_list.append(val)
+            sources.append(source or "eval")
+
+    if not n_list:
+        raise ValueError("no entropy values available; provide rule_bits or CSVs with trace/estimate values")
+
+    return EntropySeries(
+        n_vals=np.array(n_list, dtype=float),
+        log_vals=np.array(log_list, dtype=float),
+        rule_bits=bits_str or "",
+        k=int(k),
+        boundary=str(boundary),
+        sym_mode=str(sym_mode),
+        sources=sources,
+    )
+
+
+def plot_entropy_convergence(rule_bits: Optional[Sequence[int] | np.ndarray | str] = None,
+                             k: Optional[int] = None,
+                             n_min: int = 3,
+                             n_max: int = 10,
+                             csv_paths: Optional[Iterable[str]] = None,
+                             boundary: Optional[str] = None,
+                             sym_mode: Optional[str] = None,
+                             device: str = config.DEFAULT_DEVICE,
+                             out_dir: str = "./out_fig",
+                             style: str = "default",
+                             logy: bool = False,
+                             read_existing_exact: bool = True,
+                             read_existing_estimate: bool = True,
+                             normalize_log_per_n: bool = True,
+                             apply_penalty: bool = True) -> List[str]:
+    """Plot log(Z)/n convergence for a single rule.
+
+    - Accepts direct rule_bits or a set of CSVs (stage1/GA) that contain matching rows.
+    - Auto-deduces k/boundary/sym_mode from CSV rows when omitted.
+    - Falls back to evaluate_rules_batch when CSVs lack the requested n range.
+    """
+    apply_style(style); os.makedirs(out_dir, exist_ok=True)
+    bits_str = _bits_to_str(rule_bits) if rule_bits is not None else None
+    series = _prepare_entropy_series(
+        rule_bits=bits_str, k=k, n_min=n_min, n_max=n_max,
+        csv_paths=csv_paths, boundary=boundary, sym_mode=sym_mode, device=device,
+        use_penalty=apply_penalty, normalize=normalize_log_per_n,
+        read_existing_exact=read_existing_exact, read_existing_estimate=read_existing_estimate,
+    )
+    fig, ax = plt.subplots()
+    ax.plot(series.n_vals, series.log_vals, marker="o", linestyle="-", alpha=0.95, label="log(Z)/n")
+    ax.set_xlabel("n")
+    ax.set_ylabel("log(Z)/n" if normalize_log_per_n else "log(Z)")
+    ax.set_title(f"Entropy convergence (k={series.k}, boundary={series.boundary}, sym={series.sym_mode})")
+    if logy:
+        ax.set_yscale("log")
+    if series.rule_bits:
+        ax.text(0.02, 0.02, f"rule_bits={_shorten(series.rule_bits, 32)}", transform=ax.transAxes,
+                fontsize=8, ha="left", va="bottom")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fname = f"entropy_n{n_min}-{n_max}_k{series.k}_{_shorten(series.rule_bits or 'rule', 16)}.png"
+    out_path = os.path.join(out_dir, fname)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+    return [out_path]
 
 
 def _warn_trace_diff(rows: List[dict], label: str = "") -> None:
