@@ -292,3 +292,101 @@ def test_bucket_band_penalty_alignment():
     assert est_raw.tolist() == pytest.approx([10.0, 6.0])
     assert lo_raw.tolist() == pytest.approx([8.0, 2.0])
     assert hi_raw.tolist() == pytest.approx([12.0, 4.0])
+
+
+def test_bucket_band_preserves_zero_metric_without_fake_anchor():
+    rows = [
+        {
+            "rule_count": 1,
+            "objective_penalized": 0.0,
+            "lower_bound": 0.0,
+            "upper_bound": 0.0,
+        },
+        {
+            "rule_count": 2,
+            "objective_penalized": 1.5,
+            "lower_bound": 1.2,
+            "upper_bound": 1.6,
+        },
+    ]
+
+    xs, est, lo, hi = viz._bucket_best_and_band(rows, use_logy=False, objective_field="objective_penalized", use_penalty=True)
+    assert xs.tolist() == pytest.approx([1.0, 2.0])
+    assert est.tolist() == pytest.approx([0.0, 1.5])
+    assert lo.tolist() == pytest.approx([0.0, math.log(1.2)])
+    assert hi.tolist() == pytest.approx([0.0, math.log(1.6)])
+
+    # when |R|=1 is absent, do not fabricate an anchor
+    rows_missing = rows[1:]
+    xs2, _, _, _ = viz._bucket_best_and_band(rows_missing, use_logy=True, objective_field="objective_penalized", use_penalty=True)
+    assert xs2.tolist() == pytest.approx([2.0])
+
+
+def test_ga_front_boolean_flags_and_empty_bounds(tmp_path: Path):
+    out_dir = tmp_path / "figs"
+    ga = tmp_path / "pareto_front_n3_k2.csv"
+    _write_csv(
+        ga,
+        [
+            {
+                "run_tag": "demo",
+                "n": 3,
+                "k": 2,
+                "rule_bits": "101",
+                "rule_count": 1,
+                "sum_lambda_powers": 1.5,
+                "lower_bound": "",
+                "upper_bound": "",
+                "lambda_max": 1.2,
+                "lambda_top2": "(1.2,0.8)",
+                "is_front0": "True",
+                "sym_mode": "perm",
+                "boundary": "torus",
+            },
+            {
+                "run_tag": "demo",
+                "n": 3,
+                "k": 2,
+                "rule_bits": "111",
+                "rule_count": 2,
+                "sum_lambda_powers": 3.2,
+                "lower_bound": "nan",
+                "upper_bound": "nan",
+                "lambda_max": 1.3,
+                "lambda_top2": "(1.3,0.7)",
+                "is_front0": False,
+                "sym_mode": "perm",
+                "boundary": "torus",
+            },
+            {
+                "run_tag": "demo",
+                "n": 3,
+                "k": 2,
+                "rule_bits": "110",
+                "rule_count": 2,
+                "sum_lambda_powers": 2.8,
+                "lower_bound": "",
+                "upper_bound": "",
+                "lambda_max": 1.1,
+                "lambda_top2": "(1.1,0.6)",
+                "is_front0": "FALSE",
+                "sym_mode": "perm",
+                "boundary": "torus",
+            },
+        ],
+    )
+
+    paths = viz.plot_all([str(ga)], n=3, k=2, out_dir=str(out_dir), y_log=True, objective_field="sum_lambda_powers")
+    assert len(paths) == 3
+    assert all(Path(p).exists() for p in paths)
+
+    series = viz._collect_by_series_for_nk([str(ga)], n=3, k=2)
+    xs, est, lo, hi = viz._bucket_best_and_band(
+        series["ga_canon"], use_logy=True, objective_field="sum_lambda_powers", use_penalty=True
+    )
+    assert xs.tolist() == pytest.approx([1.0, 2.0])
+    assert np.isfinite(est).all()
+    assert np.isfinite(lo).all()
+    assert np.isfinite(hi).all()
+    assert (lo > 0).all()
+    assert (hi > 0).all()

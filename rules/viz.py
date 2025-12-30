@@ -531,10 +531,17 @@ def _select_front0(rows:List[dict])->List[dict]:
 
 def _is_front0(row: dict) -> bool:
     val = row.get("is_front0", "0")
+    if isinstance(val, bool):
+        return val
+    sval = str(val).strip()
+    if sval.lower() == "true":
+        return True
+    if sval.lower() == "false":
+        return False
     try:
         return float(val) > 0.5
     except Exception:
-        return str(val).strip() == "1"
+        return sval == "1"
 
 # 文件名/字段解析 (n,k) + 系列
 _RX_STAGE1 = re.compile(r"stage1_(?:all|pareto)_n(\d+)_k(\d+)")
@@ -972,38 +979,34 @@ def _bucket_best_and_band(rows: List[dict], use_logy: bool, objective_field: Opt
     est = np.array([bucket[int(x)]["est"] for x in xs], float)
     los, his = [], []
     for x in xs:
-        d = bucket[int(x)]
+        rc = int(x)
+        d = bucket[rc]
         lo, hi = d["lo"], d["hi"]
-        if (lo is None) or (hi is None) or (not np.isfinite(lo)) or (not np.isfinite(hi)) or (hi<lo):
-            lo = mins.get(int(x), np.nan); hi = maxs.get(int(x), np.nan)
-        # ensure band encloses the selected best estimate
-        lo = min(lo, d["est"]) if np.isfinite(d["est"]) else lo
-        hi = max(hi, d["est"]) if np.isfinite(d["est"]) else hi
+        est_val = d["est"]
+        if (lo is None) or (hi is None) or (not np.isfinite(lo)) or (not np.isfinite(hi)) or (hi < lo):
+            lo = est_val
+            hi = est_val
+            if np.isfinite(est_val):
+                mins[rc] = min(mins.get(rc, +np.inf), est_val)
+                maxs[rc] = max(maxs.get(rc, -np.inf), est_val)
+        elif np.isfinite(est_val):
+            mins[rc] = min(mins.get(rc, +np.inf), est_val)
+            maxs[rc] = max(maxs.get(rc, -np.inf), est_val)
         los.append(lo); his.append(hi)
     los = np.array(los,float); his = np.array(his,float)
     if use_logy:
         est = np.where(est>0, est, np.nan)
         los = np.where(los>0, los, np.nan)
         his = np.where(his>0, his, np.nan)
-        # keep rule_count=1 anchor if available
-        if 1.0 not in xs and len(xs)>0:
-            try:
-                min_rc = int(xs.min())
-                if min_rc > 1:
-                    xs = np.insert(xs, 0, 1.0)
-                    est = np.insert(est, 0, est[0])
-                    los = np.insert(los, 0, los[0])
-                    his = np.insert(his, 0, his[0])
-            except Exception:
-                pass
         log_est = np.log(est)
         log_lo = np.log(los)
         log_hi = np.log(his)
         log_lo = np.minimum(log_lo, log_est)
         log_hi = np.maximum(log_hi, log_est)
         est, los, his = np.exp(log_est), np.exp(log_lo), np.exp(log_hi)
-    m = np.isfinite(est) & (est>0 if use_logy else np.isfinite(est))
-    m = m & np.isfinite(los) & np.isfinite(his)
+    m = np.isfinite(est) & np.isfinite(los) & np.isfinite(his)
+    if use_logy:
+        m = m & (est > 0) & (los > 0) & (his > 0)
     return xs[m], est[m], los[m], his[m]
 
 def plot_three_raw_canon_for_nk(front_paths: List[str],
