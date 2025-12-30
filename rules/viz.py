@@ -926,7 +926,8 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
                                 style: str = "default",
                                 sym_filter: Optional[str] = None,
                                 objective_field: Optional[str] = None,
-                                apply_penalty: bool = True) -> Tuple[str,str,str]:
+                                apply_penalty: bool = True,
+                                show_band: bool = False) -> Tuple[str,str,str]:
     apply_style(style); os.makedirs(out_dir, exist_ok=True)
     series = _collect_by_series_for_nk(front_paths, n, k, sym_filter=sym_filter)
     order  = ["stage1_raw", "stage1_canon", "ga_canon"]
@@ -966,7 +967,8 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
         xj = xs + jitter[key]
         ax2.plot(xj, est, marker=markers[key], linestyle=linest[key], alpha=0.95, label=labels[key])
         vb = np.isfinite(lo) & np.isfinite(hi) & (hi>=lo)
-        if vb.any(): ax2.fill_between(xj[vb], lo[vb], hi[vb], alpha=0.12, linewidth=0)
+        if show_band and vb.any():
+            ax2.fill_between(xj[vb], lo[vb], hi[vb], alpha=0.12, linewidth=0)
         i2 = _knee_second(xs, est, logy=y_log)
         il = _knee_l(xs, est, logxy=True)
         iu = _unit_best_idx(xs, est)
@@ -1043,7 +1045,8 @@ def plot_all(front_paths: List[str],
              style: str="default",
              sym_filter: Optional[str] = None,
              objective_field: Optional[str] = None,
-             apply_penalty: bool = True)->List[str]:
+             apply_penalty: bool = True,
+             show_band: bool = False)->List[str]:
     """
     兼容 rd_cli.py:
       - 若给定 n,k：仅绘制该 (n,k) 的三张图；
@@ -1053,11 +1056,11 @@ def plot_all(front_paths: List[str],
     apply_style(style); os.makedirs(out_dir, exist_ok=True)
     outs=[]
     if (n is not None) and (k is not None):
-        outs += list(plot_three_raw_canon_for_nk(front_paths, n, k, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter, objective_field=objective_field, apply_penalty=apply_penalty))
+        outs += list(plot_three_raw_canon_for_nk(front_paths, n, k, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter, objective_field=objective_field, apply_penalty=apply_penalty, show_band=show_band))
         return outs
     # 自动发现
     for n0,k0 in _discover_all_nk(front_paths):
-        outs += list(plot_three_raw_canon_for_nk(front_paths, n0, k0, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter, objective_field=objective_field, apply_penalty=apply_penalty))
+        outs += list(plot_three_raw_canon_for_nk(front_paths, n0, k0, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter, objective_field=objective_field, apply_penalty=apply_penalty, show_band=show_band))
     return outs
 
 # =========================
