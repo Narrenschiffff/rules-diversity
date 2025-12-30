@@ -717,7 +717,8 @@ def plot_frontier_surfaces(front_csvs: Iterable[str],
                            out_dir: str = "./out_fig",
                            style: str = "default",
                            contour_levels: int = 10,
-                           wireframe_stride: int = 1) -> Tuple[List[str], List[FrontierSurfaceData]]:
+                           wireframe_stride: int = 1,
+                           max_series_per_fig: int = 4) -> Tuple[List[str], List[FrontierSurfaceData]]:
     """绘制 (n, |R|, 目标值) 的前沿曲面/等高线，并标注膝点/MUR/极值。
 
     返回：(输出图片路径列表, 对每个 k 的关键点数据)。
@@ -735,63 +736,78 @@ def plot_frontier_surfaces(front_csvs: Iterable[str],
 
     for t in types:
         if t in ("surface", "wireframe"):
-            fig = plt.figure()
-            ax = fig.add_subplot(111, projection="3d")
-            proxies: List[mpl.lines.Line2D] = []
-            labels: List[str] = []
-            for idx, d in enumerate(data):
-                color = cmap(idx % cmap.N)
-                X, Y = np.meshgrid(d.ns, d.rule_counts)
-                Z = np.ma.array(d.grid, mask=~np.isfinite(d.grid))
-                if t == "surface":
-                    ax.plot_surface(X, Y, Z, color=color, alpha=0.65, linewidth=0.3, antialiased=True)
-                else:
-                    ax.plot_wireframe(X, Y, Z, color=color, rstride=max(1, wireframe_stride),
-                                      cstride=max(1, wireframe_stride), linewidth=0.8, alpha=0.9)
-                kp_sorted = sorted(d.key_points, key=lambda p: p.rule_count)
-                if kp_sorted:
-                    xs = [p.n for p in kp_sorted]; ys = [p.rule_count for p in kp_sorted]; zs = [p.metric for p in kp_sorted]
-                    ax.plot(xs, ys, zs, color=color, linestyle="--", marker="o", alpha=0.95, label=f"k={d.k} key pts")
-                    for p in kp_sorted:
-                        ax.scatter([p.n], [p.rule_count], [p.metric], color=color, s=55, marker="D")
-                        ax.text(p.n, p.rule_count, p.metric, f"{p.kind} (k={d.k})", color=color, fontsize=8)
-                proxies.append(mpl.lines.Line2D([0], [0], color=color, lw=2))
-                labels.append(f"k={d.k}")
-            ax.set_xlabel("n"); ax.set_ylabel("|R|"); ax.set_zlabel(metric or "objective")
-            ax.set_title(f"Frontier surface ({t}) — boundary={data[0].boundary}, sym={data[0].sym_mode}")
-            ax.legend(proxies, labels, loc="best")
-            fig.tight_layout()
-            fname = f"frontier_{t}_k{'-'.join(str(k) for k in ks)}_{_shorten(metric or 'objective', 20)}.png"
-            out_path = os.path.join(out_dir, fname)
-            fig.savefig(out_path, dpi=220)
-            plt.close(fig)
-            outs.append(out_path)
+            for chunk_idx in range(0, len(data), max(1, int(max_series_per_fig))):
+                subset = data[chunk_idx:chunk_idx + max(1, int(max_series_per_fig))]
+                if not subset:
+                    continue
+                fig = plt.figure()
+                ax = fig.add_subplot(111, projection="3d")
+                proxies: List[mpl.lines.Line2D] = []
+                labels: List[str] = []
+                for idx, d in enumerate(subset):
+                    color = cmap(idx % cmap.N)
+                    X, Y = np.meshgrid(d.ns, d.rule_counts)
+                    Z = np.ma.array(d.grid, mask=~np.isfinite(d.grid))
+                    if t == "surface":
+                        ax.plot_surface(X, Y, Z, color=color, alpha=0.65, linewidth=0.3, antialiased=True)
+                    else:
+                        ax.plot_wireframe(X, Y, Z, color=color, rstride=max(1, wireframe_stride),
+                                          cstride=max(1, wireframe_stride), linewidth=0.8, alpha=0.9)
+                    kp_sorted = sorted(d.key_points, key=lambda p: p.rule_count)
+                    if kp_sorted:
+                        xs = [p.n for p in kp_sorted]; ys = [p.rule_count for p in kp_sorted]; zs = [p.metric for p in kp_sorted]
+                        ax.plot(xs, ys, zs, color=color, linestyle="--", marker="o", alpha=0.95, label=f"k={d.k} key pts")
+                        for p in kp_sorted:
+                            ax.scatter([p.n], [p.rule_count], [p.metric], color=color, s=55, marker="D")
+                            ax.text(p.n, p.rule_count, p.metric, f"{p.kind} (k={d.k})", color=color, fontsize=8)
+                    proxies.append(mpl.lines.Line2D([0], [0], color=color, lw=2))
+                    labels.append(f"k={d.k}")
+                ax.set_xlabel("n"); ax.set_ylabel("|R|"); ax.set_zlabel(metric or "objective")
+                part = 1 + chunk_idx // max(1, int(max_series_per_fig))
+                part_suffix = f" (part {part})" if len(data) > len(subset) else ""
+                ax.set_title(f"Frontier surface ({t}) — boundary={subset[0].boundary}, sym={subset[0].sym_mode}{part_suffix}")
+                ax.legend(proxies, labels, loc="best")
+                fig.tight_layout()
+                fname = f"frontier_{t}_k{'-'.join(str(d.k) for d in subset)}_{_shorten(metric or 'objective', 20)}.png"
+                out_path = os.path.join(out_dir, fname)
+                fig.savefig(out_path, dpi=220)
+                plt.close(fig)
+                outs.append(out_path)
         elif t == "contour":
-            fig, ax = plt.subplots()
-            for idx, d in enumerate(data):
-                color = cmap(idx % cmap.N)
-                X, Y = np.meshgrid(d.ns, d.rule_counts)
-                Z = np.ma.array(d.grid, mask=~np.isfinite(d.grid))
-                if np.isfinite(Z).any():
-                    cs = ax.contour(X, Y, Z, levels=contour_levels, colors=[color], linewidths=1.0, alpha=0.85)
-                    ax.clabel(cs, inline=True, fmt=lambda v: f"{v:.2g}", fontsize=8)
-                kp_sorted = sorted(d.key_points, key=lambda p: p.rule_count)
-                if kp_sorted:
-                    xs = [p.n for p in kp_sorted]; ys = [p.rule_count for p in kp_sorted]
-                    ax.plot(xs, ys, color=color, linestyle="--", marker="o", label=f"k={d.k} key pts")
-                    for p in kp_sorted:
-                        ax.text(p.n, p.rule_count, f"{p.kind}\n{p.metric:.2g}", color=color, fontsize=8,
-                                ha="left", va="bottom")
-            ax.set_xlabel("n"); ax.set_ylabel("|R|")
-            ax.set_title(f"Frontier contours — boundary={data[0].boundary}, sym={data[0].sym_mode}, metric={metric}")
-            if any(d.key_points for d in data):
-                ax.legend(loc="best")
-            fig.tight_layout()
-            fname = f"frontier_contour_k{'-'.join(str(k) for k in ks)}_{_shorten(metric or 'objective', 20)}.png"
-            out_path = os.path.join(out_dir, fname)
-            fig.savefig(out_path, dpi=220)
-            plt.close(fig)
-            outs.append(out_path)
+            for chunk_idx in range(0, len(data), max(1, int(max_series_per_fig))):
+                subset = data[chunk_idx:chunk_idx + max(1, int(max_series_per_fig))]
+                if not subset:
+                    continue
+                fig, ax = plt.subplots()
+                for idx, d in enumerate(subset):
+                    color = cmap(idx % cmap.N)
+                    X, Y = np.meshgrid(d.ns, d.rule_counts)
+                    Z = np.ma.array(d.grid, mask=~np.isfinite(d.grid))
+                    can_contour = (Z.shape[0] >= 2) and (Z.shape[1] >= 2) and np.isfinite(Z).sum() >= 4
+                    if can_contour:
+                        cs = ax.contour(X, Y, Z, levels=contour_levels, colors=[color], linewidths=1.0, alpha=0.85)
+                        ax.clabel(cs, inline=True, fmt=lambda v: f"{v:.2g}", fontsize=8)
+                    else:
+                        logging.warning("[viz] skip contour for k=%s (insufficient grid: %s)", d.k, Z.shape)
+                    kp_sorted = sorted(d.key_points, key=lambda p: p.rule_count)
+                    if kp_sorted:
+                        xs = [p.n for p in kp_sorted]; ys = [p.rule_count for p in kp_sorted]
+                        ax.plot(xs, ys, color=color, linestyle="--", marker="o", label=f"k={d.k} key pts")
+                        for p in kp_sorted:
+                            ax.text(p.n, p.rule_count, f"{p.kind}\n{p.metric:.2g}", color=color, fontsize=8,
+                                    ha="left", va="bottom")
+                ax.set_xlabel("n"); ax.set_ylabel("|R|")
+                part = 1 + chunk_idx // max(1, int(max_series_per_fig))
+                part_suffix = f" (part {part})" if len(data) > len(subset) else ""
+                ax.set_title(f"Frontier contours — boundary={subset[0].boundary}, sym={subset[0].sym_mode}, metric={metric}{part_suffix}")
+                if any(d.key_points for d in subset):
+                    ax.legend(loc="best")
+                fig.tight_layout()
+                fname = f"frontier_contour_k{'-'.join(str(d.k) for d in subset)}_{_shorten(metric or 'objective', 20)}.png"
+                out_path = os.path.join(out_dir, fname)
+                fig.savefig(out_path, dpi=220)
+                plt.close(fig)
+                outs.append(out_path)
 
     return outs, data
 
@@ -827,7 +843,11 @@ def _bucket_best_and_band(rows: List[dict], use_logy: bool, objective_field: Opt
             lo = mins.get(int(x), np.nan); hi = maxs.get(int(x), np.nan)
         los.append(lo); his.append(hi)
     los = np.array(los,float); his = np.array(his,float)
+    if use_logy:
+        los = np.where(los>0, los, np.nan)
+        his = np.where(his>0, his, np.nan)
     m = np.isfinite(est) & (est>0 if use_logy else np.isfinite(est))
+    m = m & np.isfinite(los) & np.isfinite(his)
     return xs[m], est[m], los[m], his[m]
 
 def plot_three_raw_canon_for_nk(front_paths: List[str],
