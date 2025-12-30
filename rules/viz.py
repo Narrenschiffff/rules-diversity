@@ -891,8 +891,15 @@ def _bucket_best_and_band(rows: List[dict], use_logy: bool, objective_field: Opt
         los.append(lo); his.append(hi)
     los = np.array(los,float); his = np.array(his,float)
     if use_logy:
+        est = np.where(est>0, est, np.nan)
         los = np.where(los>0, los, np.nan)
         his = np.where(his>0, his, np.nan)
+        log_est = np.log(est)
+        log_lo = np.log(los)
+        log_hi = np.log(his)
+        log_lo = np.minimum(log_lo, log_est)
+        log_hi = np.maximum(log_hi, log_est)
+        est, los, his = np.exp(log_est), np.exp(log_lo), np.exp(log_hi)
     m = np.isfinite(est) & (est>0 if use_logy else np.isfinite(est))
     m = m & np.isfinite(los) & np.isfinite(his)
     return xs[m], est[m], los[m], his[m]
