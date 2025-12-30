@@ -485,14 +485,29 @@ def _y_metric(row: dict, prefer_field: Optional[str] = None, use_penalty: bool =
     main, _, _ = _resolve_value_with_penalty(raw, pen, pf, use_penalty=use_penalty)
     return main
 
-def _bounds(row: dict, use_penalty: bool) -> Tuple[Optional[float], Optional[float]]:
+def _bounds(row: dict, use_penalty: bool, objective_field: Optional[str] = None) -> Tuple[Optional[float], Optional[float]]:
     pf = _safe_float(row.get("penalty_factor", 1.0), default=1.0)
     lo_raw = _safe_float(row.get("lower_bound_raw", row.get("lower_bound", float("nan"))))
     hi_raw = _safe_float(row.get("upper_bound_raw", row.get("upper_bound", float("nan"))))
     lo_pen = _safe_float(row.get("lower_bound", float("nan")))
     hi_pen = _safe_float(row.get("upper_bound", float("nan")))
-    lo, _, _ = _resolve_value_with_penalty(lo_raw, lo_pen, pf, use_penalty=use_penalty)
-    hi, _, _ = _resolve_value_with_penalty(hi_raw, hi_pen, pf, use_penalty=use_penalty)
+    if objective_field and objective_field.startswith("objective"):
+        def _log_after_penalty(raw_v, pen_v):
+            raw = _safe_float(raw_v, default=float("nan"))
+            pen = _safe_float(pen_v, default=float("nan"))
+            raw_log = math.log(max(raw, 1e-300)) if np.isfinite(raw) and raw > 0 else float("nan")
+            pen_log = math.log(max(pen, 1e-300)) if np.isfinite(pen) and pen > 0 else float("nan")
+            if not np.isfinite(pen_log) and np.isfinite(raw_log):
+                pen_log = raw_log / max(pf, 1e-9)
+            if not np.isfinite(raw_log) and np.isfinite(pen_log):
+                raw_log = pen_log * max(pf, 1e-9)
+            return pen_log if use_penalty else raw_log
+
+        lo = _log_after_penalty(lo_raw, lo_pen)
+        hi = _log_after_penalty(hi_raw, hi_pen)
+    else:
+        lo, _, _ = _resolve_value_with_penalty(lo_raw, lo_pen, pf, use_penalty=use_penalty)
+        hi, _, _ = _resolve_value_with_penalty(hi_raw, hi_pen, pf, use_penalty=use_penalty)
     return lo if np.isfinite(lo) else None, hi if np.isfinite(hi) else None
 
 def _gap_12(row:dict)->float:
@@ -868,7 +883,7 @@ def _bucket_best_and_band(rows: List[dict], use_logy: bool, objective_field: Opt
         except:
             continue
         est = _y_metric(r, prefer_field=objective_field, use_penalty=use_penalty)
-        lo, hi = _bounds(r, use_penalty=use_penalty)
+        lo, hi = _bounds(r, use_penalty=use_penalty, objective_field=objective_field)
         cur = bucket.get(rc)
         if (cur is None) or (est > cur["est"]):
             bucket[rc] = {"est": est, "lo": lo, "hi": hi}
