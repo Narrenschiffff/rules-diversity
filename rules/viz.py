@@ -232,6 +232,50 @@ class FrontierSurfaceData:
     key_points: List[KeyPoint]
 
 
+def frontier_surface_to_json(d: FrontierSurfaceData, include_grid: bool = True) -> dict:
+    """Convert FrontierSurfaceData into a JSON-serializable dict.
+
+    Args:
+        d: dataclass instance to convert.
+        include_grid: whether to emit the full (rule_count, n) grid. Set False if file size is a concern.
+    """
+    def _arr(x):
+        return np.asarray(x).tolist()
+
+    return {
+        "k": int(d.k),
+        "boundary": d.boundary,
+        "sym_mode": d.sym_mode,
+        "metric_field": d.metric_field,
+        "ns": _arr(d.ns),
+        "rule_counts": _arr(d.rule_counts),
+        "grid": _arr(d.grid) if include_grid else None,
+        "best_curve_metric": _arr(d.best_curve_metric),
+        "best_curve_n": _arr(d.best_curve_n),
+        "key_points": [
+            {
+                "kind": kp.kind,
+                "n": float(kp.n),
+                "rule_count": float(kp.rule_count),
+                "metric": float(kp.metric),
+                "label": kp.label,
+            }
+            for kp in d.key_points
+        ],
+    }
+
+
+def frontier_surfaces_to_json(data: Sequence[FrontierSurfaceData], include_grid: bool = True) -> List[dict]:
+    """Batch version of frontier_surface_to_json."""
+    return [frontier_surface_to_json(d, include_grid=include_grid) for d in data]
+
+
+def write_frontier_surfaces_json(data: Sequence[FrontierSurfaceData], path: str | os.PathLike, include_grid: bool = True) -> None:
+    """Write FrontierSurfaceData list to JSON file (helper for notebooks/CLI)."""
+    obj = frontier_surfaces_to_json(data, include_grid=include_grid)
+    Path(path).write_text(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
 def _prepare_entropy_series(rule_bits: Optional[str],
                             k: Optional[int],
                             n_min: int,
@@ -441,14 +485,29 @@ def _y_metric(row: dict, prefer_field: Optional[str] = None, use_penalty: bool =
     main, _, _ = _resolve_value_with_penalty(raw, pen, pf, use_penalty=use_penalty)
     return main
 
-def _bounds(row: dict, use_penalty: bool) -> Tuple[Optional[float], Optional[float]]:
+def _bounds(row: dict, use_penalty: bool, objective_field: Optional[str] = None) -> Tuple[Optional[float], Optional[float]]:
     pf = _safe_float(row.get("penalty_factor", 1.0), default=1.0)
     lo_raw = _safe_float(row.get("lower_bound_raw", row.get("lower_bound", float("nan"))))
     hi_raw = _safe_float(row.get("upper_bound_raw", row.get("upper_bound", float("nan"))))
     lo_pen = _safe_float(row.get("lower_bound", float("nan")))
     hi_pen = _safe_float(row.get("upper_bound", float("nan")))
-    lo, _, _ = _resolve_value_with_penalty(lo_raw, lo_pen, pf, use_penalty=use_penalty)
-    hi, _, _ = _resolve_value_with_penalty(hi_raw, hi_pen, pf, use_penalty=use_penalty)
+    if objective_field and objective_field.startswith("objective"):
+        def _log_after_penalty(raw_v, pen_v):
+            raw = _safe_float(raw_v, default=float("nan"))
+            pen = _safe_float(pen_v, default=float("nan"))
+            raw_log = math.log(max(raw, 1e-300)) if np.isfinite(raw) and raw > 0 else float("nan")
+            pen_log = math.log(max(pen, 1e-300)) if np.isfinite(pen) and pen > 0 else float("nan")
+            if not np.isfinite(pen_log) and np.isfinite(raw_log):
+                pen_log = raw_log / max(pf, 1e-9)
+            if not np.isfinite(raw_log) and np.isfinite(pen_log):
+                raw_log = pen_log * max(pf, 1e-9)
+            return pen_log if use_penalty else raw_log
+
+        lo = _log_after_penalty(lo_raw, lo_pen)
+        hi = _log_after_penalty(hi_raw, hi_pen)
+    else:
+        lo, _, _ = _resolve_value_with_penalty(lo_raw, lo_pen, pf, use_penalty=use_penalty)
+        hi, _, _ = _resolve_value_with_penalty(hi_raw, hi_pen, pf, use_penalty=use_penalty)
     return lo if np.isfinite(lo) else None, hi if np.isfinite(hi) else None
 
 def _gap_12(row:dict)->float:
@@ -468,6 +527,14 @@ def _select_front0(rows:List[dict])->List[dict]:
     if ("is_front0" in rows[0]) and any(str(r.get("is_front0","0"))=="1" for r in rows):
         return [r for r in rows if str(r.get("is_front0","0"))=="1"]
     return rows
+
+
+def _is_front0(row: dict) -> bool:
+    val = row.get("is_front0", "0")
+    try:
+        return float(val) > 0.5
+    except Exception:
+        return str(val).strip() == "1"
 
 # 文件名/字段解析 (n,k) + 系列
 _RX_STAGE1 = re.compile(r"stage1_(?:all|pareto)_n(\d+)_k(\d+)")
@@ -548,22 +615,69 @@ def _extract_key_points(rule_counts: np.ndarray,
         return []
     xs = xs[m]; ys = ys[m]; ns = ns[m]
     points: List[KeyPoint] = []
-    i2 = _knee_second(xs, ys, logy=True)
-    if i2 is not None:
-        points.append(KeyPoint("knee-2Δ", ns[i2], xs[i2], ys[i2], f"knee-2Δ |R|={int(xs[i2])}"))
-    il = _knee_l(xs, ys, logxy=True)
-    if il is not None:
-        points.append(KeyPoint("knee-L", ns[il], xs[il], ys[il], f"knee-L |R|={int(xs[il])}"))
-    iu = _unit_best_idx(xs, ys)
-    if iu is not None:
-        points.append(KeyPoint("unit-best", ns[iu], xs[iu], ys[iu], f"unit-best |R|={int(xs[iu])}"))
+
+    # 仅在非递减子序列上计算 MUR / 膝点；若整体递减，仅返回全局最大值
+    inc_idx: List[int] = []
+    if xs.size:
+        cur = -np.inf
+        for i, y in enumerate(ys):
+            if y >= cur:
+                inc_idx.append(i)
+                cur = y
+    inc_idx = np.array(inc_idx, dtype=int)
+    # ensure we always include the global maximum for labeling (even if curve is decreasing)
     try:
         imax = int(np.nanargmax(ys))
-        points.append(KeyPoint("max", ns[imax], xs[imax], ys[imax], f"max |R|={int(xs[imax])}"))
     except Exception:
-        pass
+        imax = None
+    if (imax is not None) and (imax not in inc_idx):
+        inc_idx = np.unique(np.concatenate([inc_idx, np.array([imax], dtype=int)]))
+    if inc_idx.size >= 1:
+        inc_xs = xs[inc_idx]
+        inc_ys = ys[inc_idx]
+        inc_ns = ns[inc_idx]
+        i2 = _knee_second(inc_xs, inc_ys, logy=True) if inc_idx.size >= 3 else None
+        if i2 is not None:
+            points.append(KeyPoint("knee-2Δ", inc_ns[i2], inc_xs[i2], inc_ys[i2], f"knee-2Δ |R|={int(inc_xs[i2])}"))
+        il = _knee_l(inc_xs, inc_ys, logxy=True) if inc_idx.size >= 3 else None
+        if il is not None:
+            points.append(KeyPoint("knee-L", inc_ns[il], inc_xs[il], inc_ys[il], f"knee-L |R|={int(inc_xs[il])}"))
+        iu = _unit_best_idx(inc_xs, inc_ys) if inc_idx.size >= 1 else None
+        if iu is not None:
+            points.append(KeyPoint("unit-best", inc_ns[iu], inc_xs[iu], inc_ys[iu], f"unit-best |R|={int(inc_xs[iu])}"))
+
+    if imax is not None:
+        points.append(KeyPoint("max", ns[imax], xs[imax], ys[imax], f"max |R|={int(xs[imax])}"))
     points.sort(key=lambda p: (p.rule_count, p.kind))
     return points
+
+
+def _monotone_idx_with_max(xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+    """Return indices of a non-decreasing subsequence plus the global max (if outside)."""
+    inc_idx: List[int] = []
+    if xs.size:
+        cur = -np.inf
+        for i, y in enumerate(ys):
+            if y >= cur:
+                inc_idx.append(i)
+                cur = y
+    inc_idx = np.array(inc_idx, dtype=int)
+    try:
+        imax = int(np.nanargmax(ys))
+    except Exception:
+        imax = None
+    if (imax is not None) and (imax not in inc_idx):
+        inc_idx = np.unique(np.concatenate([inc_idx, np.array([imax], dtype=int)]))
+    return inc_idx
+
+
+def _objective_ylabel(objective_field: Optional[str], apply_penalty: bool) -> str:
+    lbl = r"Objective (log $Z$)"
+    if objective_field and "per" in objective_field:
+        lbl += r" / penalty"
+    elif apply_penalty:
+        lbl += r" / penalty"
+    return lbl
 
 
 def _prepare_surface_data(front_csvs: Iterable[str],
@@ -717,7 +831,8 @@ def plot_frontier_surfaces(front_csvs: Iterable[str],
                            out_dir: str = "./out_fig",
                            style: str = "default",
                            contour_levels: int = 10,
-                           wireframe_stride: int = 1) -> Tuple[List[str], List[FrontierSurfaceData]]:
+                           wireframe_stride: int = 1,
+                           max_series_per_fig: int = 3) -> Tuple[List[str], List[FrontierSurfaceData]]:
     """绘制 (n, |R|, 目标值) 的前沿曲面/等高线，并标注膝点/MUR/极值。
 
     返回：(输出图片路径列表, 对每个 k 的关键点数据)。
@@ -735,63 +850,78 @@ def plot_frontier_surfaces(front_csvs: Iterable[str],
 
     for t in types:
         if t in ("surface", "wireframe"):
-            fig = plt.figure()
-            ax = fig.add_subplot(111, projection="3d")
-            proxies: List[mpl.lines.Line2D] = []
-            labels: List[str] = []
-            for idx, d in enumerate(data):
-                color = cmap(idx % cmap.N)
-                X, Y = np.meshgrid(d.ns, d.rule_counts)
-                Z = np.ma.array(d.grid, mask=~np.isfinite(d.grid))
-                if t == "surface":
-                    ax.plot_surface(X, Y, Z, color=color, alpha=0.65, linewidth=0.3, antialiased=True)
-                else:
-                    ax.plot_wireframe(X, Y, Z, color=color, rstride=max(1, wireframe_stride),
-                                      cstride=max(1, wireframe_stride), linewidth=0.8, alpha=0.9)
-                kp_sorted = sorted(d.key_points, key=lambda p: p.rule_count)
-                if kp_sorted:
-                    xs = [p.n for p in kp_sorted]; ys = [p.rule_count for p in kp_sorted]; zs = [p.metric for p in kp_sorted]
-                    ax.plot(xs, ys, zs, color=color, linestyle="--", marker="o", alpha=0.95, label=f"k={d.k} key pts")
-                    for p in kp_sorted:
-                        ax.scatter([p.n], [p.rule_count], [p.metric], color=color, s=55, marker="D")
-                        ax.text(p.n, p.rule_count, p.metric, f"{p.kind} (k={d.k})", color=color, fontsize=8)
-                proxies.append(mpl.lines.Line2D([0], [0], color=color, lw=2))
-                labels.append(f"k={d.k}")
-            ax.set_xlabel("n"); ax.set_ylabel("|R|"); ax.set_zlabel(metric or "objective")
-            ax.set_title(f"Frontier surface ({t}) — boundary={data[0].boundary}, sym={data[0].sym_mode}")
-            ax.legend(proxies, labels, loc="best")
-            fig.tight_layout()
-            fname = f"frontier_{t}_k{'-'.join(str(k) for k in ks)}_{_shorten(metric or 'objective', 20)}.png"
-            out_path = os.path.join(out_dir, fname)
-            fig.savefig(out_path, dpi=220)
-            plt.close(fig)
-            outs.append(out_path)
+            for chunk_idx in range(0, len(data), max(1, int(max_series_per_fig))):
+                subset = data[chunk_idx:chunk_idx + max(1, int(max_series_per_fig))]
+                if not subset:
+                    continue
+                fig = plt.figure()
+                ax = fig.add_subplot(111, projection="3d")
+                proxies: List[mpl.lines.Line2D] = []
+                labels: List[str] = []
+                for idx, d in enumerate(subset):
+                    color = cmap(idx % cmap.N)
+                    X, Y = np.meshgrid(d.ns, d.rule_counts)
+                    Z = np.ma.array(d.grid, mask=~np.isfinite(d.grid))
+                    if t == "surface":
+                        ax.plot_surface(X, Y, Z, color=color, alpha=0.65, linewidth=0.3, antialiased=True)
+                    else:
+                        ax.plot_wireframe(X, Y, Z, color=color, rstride=max(1, wireframe_stride),
+                                          cstride=max(1, wireframe_stride), linewidth=0.8, alpha=0.9)
+                    kp_sorted = sorted(d.key_points, key=lambda p: p.rule_count)
+                    if kp_sorted:
+                        xs = [p.n for p in kp_sorted]; ys = [p.rule_count for p in kp_sorted]; zs = [p.metric for p in kp_sorted]
+                        ax.plot(xs, ys, zs, color=color, linestyle="--", marker="o", alpha=0.95, label=f"k={d.k} key pts")
+                        for p in kp_sorted:
+                            ax.scatter([p.n], [p.rule_count], [p.metric], color=color, s=55, marker="D")
+                            ax.text(p.n, p.rule_count, p.metric, f"{p.kind} (k={d.k})", color=color, fontsize=8)
+                    proxies.append(mpl.lines.Line2D([0], [0], color=color, lw=2))
+                    labels.append(f"k={d.k}")
+                ax.set_xlabel("n"); ax.set_ylabel("|R|"); ax.set_zlabel(metric or "objective")
+                part = 1 + chunk_idx // max(1, int(max_series_per_fig))
+                part_suffix = f" (part {part})" if len(data) > len(subset) else ""
+                ax.set_title(f"Frontier surface ({t}) — boundary={subset[0].boundary}, sym={subset[0].sym_mode}{part_suffix}")
+                ax.legend(proxies, labels, loc="best")
+                fig.tight_layout()
+                fname = f"frontier_{t}_k{'-'.join(str(d.k) for d in subset)}_{_shorten(metric or 'objective', 20)}.png"
+                out_path = os.path.join(out_dir, fname)
+                fig.savefig(out_path, dpi=220)
+                plt.close(fig)
+                outs.append(out_path)
         elif t == "contour":
-            fig, ax = plt.subplots()
-            for idx, d in enumerate(data):
-                color = cmap(idx % cmap.N)
-                X, Y = np.meshgrid(d.ns, d.rule_counts)
-                Z = np.ma.array(d.grid, mask=~np.isfinite(d.grid))
-                if np.isfinite(Z).any():
-                    cs = ax.contour(X, Y, Z, levels=contour_levels, colors=[color], linewidths=1.0, alpha=0.85)
-                    ax.clabel(cs, inline=True, fmt=lambda v: f"{v:.2g}", fontsize=8)
-                kp_sorted = sorted(d.key_points, key=lambda p: p.rule_count)
-                if kp_sorted:
-                    xs = [p.n for p in kp_sorted]; ys = [p.rule_count for p in kp_sorted]
-                    ax.plot(xs, ys, color=color, linestyle="--", marker="o", label=f"k={d.k} key pts")
-                    for p in kp_sorted:
-                        ax.text(p.n, p.rule_count, f"{p.kind}\n{p.metric:.2g}", color=color, fontsize=8,
-                                ha="left", va="bottom")
-            ax.set_xlabel("n"); ax.set_ylabel("|R|")
-            ax.set_title(f"Frontier contours — boundary={data[0].boundary}, sym={data[0].sym_mode}, metric={metric}")
-            if any(d.key_points for d in data):
-                ax.legend(loc="best")
-            fig.tight_layout()
-            fname = f"frontier_contour_k{'-'.join(str(k) for k in ks)}_{_shorten(metric or 'objective', 20)}.png"
-            out_path = os.path.join(out_dir, fname)
-            fig.savefig(out_path, dpi=220)
-            plt.close(fig)
-            outs.append(out_path)
+            for chunk_idx in range(0, len(data), max(1, int(max_series_per_fig))):
+                subset = data[chunk_idx:chunk_idx + max(1, int(max_series_per_fig))]
+                if not subset:
+                    continue
+                fig, ax = plt.subplots()
+                for idx, d in enumerate(subset):
+                    color = cmap(idx % cmap.N)
+                    X, Y = np.meshgrid(d.ns, d.rule_counts)
+                    Z = np.ma.array(d.grid, mask=~np.isfinite(d.grid))
+                    can_contour = (Z.shape[0] >= 2) and (Z.shape[1] >= 2) and np.isfinite(Z).sum() >= 4
+                    if can_contour:
+                        cs = ax.contour(X, Y, Z, levels=contour_levels, colors=[color], linewidths=1.0, alpha=0.85)
+                        ax.clabel(cs, inline=True, fmt=lambda v: f"{v:.2g}", fontsize=8)
+                    else:
+                        logging.warning("[viz] skip contour for k=%s (insufficient grid: %s)", d.k, Z.shape)
+                    kp_sorted = sorted(d.key_points, key=lambda p: p.rule_count)
+                    if kp_sorted:
+                        xs = [p.n for p in kp_sorted]; ys = [p.rule_count for p in kp_sorted]
+                        ax.plot(xs, ys, color=color, linestyle="--", marker="o", label=f"k={d.k} key pts")
+                        for p in kp_sorted:
+                            ax.text(p.n, p.rule_count, f"{p.kind}\n{p.metric:.2g}", color=color, fontsize=8,
+                                    ha="left", va="bottom")
+                ax.set_xlabel("n"); ax.set_ylabel("|R|")
+                part = 1 + chunk_idx // max(1, int(max_series_per_fig))
+                part_suffix = f" (part {part})" if len(data) > len(subset) else ""
+                ax.set_title(f"Frontier contours — boundary={subset[0].boundary}, sym={subset[0].sym_mode}, metric={metric}{part_suffix}")
+                if any(d.key_points for d in subset):
+                    ax.legend(loc="best")
+                fig.tight_layout()
+                fname = f"frontier_contour_k{'-'.join(str(d.k) for d in subset)}_{_shorten(metric or 'objective', 20)}.png"
+                out_path = os.path.join(out_dir, fname)
+                fig.savefig(out_path, dpi=220)
+                plt.close(fig)
+                outs.append(out_path)
 
     return outs, data
 
@@ -802,19 +932,40 @@ def _bucket_best_and_band(rows: List[dict], use_logy: bool, objective_field: Opt
     bucket: Dict[int, Dict[str, float]] = {}
     mins: Dict[int, float] = {}
     maxs: Dict[int, float] = {}
-    for r in rows:
+    # prefer front0 rows if available; supplement missing rule_counts with best from non-front0 rows
+    front_rows = [r for r in rows if _is_front0(r)]
+    non_front_rows = [r for r in rows if not _is_front0(r)]
+    # process front rows first (if any), then backfill with non-front rows per rule_count
+    row_iter = front_rows if front_rows else rows
+    for r in row_iter:
         try:
             rc = int(r["rule_count"])
         except:
             continue
         est = _y_metric(r, prefer_field=objective_field, use_penalty=use_penalty)
-        lo, hi = _bounds(r, use_penalty=use_penalty)
+        lo, hi = _bounds(r, use_penalty=use_penalty, objective_field=objective_field)
         cur = bucket.get(rc)
         if (cur is None) or (est > cur["est"]):
             bucket[rc] = {"est": est, "lo": lo, "hi": hi}
         if np.isfinite(est):
             mins[rc] = min(mins.get(rc, +np.inf), est)
             maxs[rc] = max(maxs.get(rc, -np.inf), est)
+    # supplement per rule_count from non-front rows where front rows are missing that rc
+    if front_rows:
+        present_rc = set(bucket.keys())
+        for r in non_front_rows:
+            try:
+                rc = int(r["rule_count"])
+            except:
+                continue
+            if rc in present_rc:
+                continue
+            est = _y_metric(r, prefer_field=objective_field, use_penalty=use_penalty)
+            lo, hi = _bounds(r, use_penalty=use_penalty, objective_field=objective_field)
+            bucket[rc] = {"est": est, "lo": lo, "hi": hi}
+            if np.isfinite(est):
+                mins[rc] = min(mins.get(rc, +np.inf), est)
+                maxs[rc] = max(maxs.get(rc, -np.inf), est)
     if not bucket:
         return (np.array([]),)*4
     xs  = np.array(sorted(bucket.keys()), float)
@@ -825,9 +976,34 @@ def _bucket_best_and_band(rows: List[dict], use_logy: bool, objective_field: Opt
         lo, hi = d["lo"], d["hi"]
         if (lo is None) or (hi is None) or (not np.isfinite(lo)) or (not np.isfinite(hi)) or (hi<lo):
             lo = mins.get(int(x), np.nan); hi = maxs.get(int(x), np.nan)
+        # ensure band encloses the selected best estimate
+        lo = min(lo, d["est"]) if np.isfinite(d["est"]) else lo
+        hi = max(hi, d["est"]) if np.isfinite(d["est"]) else hi
         los.append(lo); his.append(hi)
     los = np.array(los,float); his = np.array(his,float)
+    if use_logy:
+        est = np.where(est>0, est, np.nan)
+        los = np.where(los>0, los, np.nan)
+        his = np.where(his>0, his, np.nan)
+        # keep rule_count=1 anchor if available
+        if 1.0 not in xs and len(xs)>0:
+            try:
+                min_rc = int(xs.min())
+                if min_rc > 1:
+                    xs = np.insert(xs, 0, 1.0)
+                    est = np.insert(est, 0, est[0])
+                    los = np.insert(los, 0, los[0])
+                    his = np.insert(his, 0, his[0])
+            except Exception:
+                pass
+        log_est = np.log(est)
+        log_lo = np.log(los)
+        log_hi = np.log(his)
+        log_lo = np.minimum(log_lo, log_est)
+        log_hi = np.maximum(log_hi, log_est)
+        est, los, his = np.exp(log_est), np.exp(log_lo), np.exp(log_hi)
     m = np.isfinite(est) & (est>0 if use_logy else np.isfinite(est))
+    m = m & np.isfinite(los) & np.isfinite(his)
     return xs[m], est[m], los[m], his[m]
 
 def plot_three_raw_canon_for_nk(front_paths: List[str],
@@ -837,7 +1013,8 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
                                 style: str = "default",
                                 sym_filter: Optional[str] = None,
                                 objective_field: Optional[str] = None,
-                                apply_penalty: bool = True) -> Tuple[str,str,str]:
+                                apply_penalty: bool = True,
+                                show_band: bool = False) -> Tuple[str,str,str]:
     apply_style(style); os.makedirs(out_dir, exist_ok=True)
     series = _collect_by_series_for_nk(front_paths, n, k, sym_filter=sym_filter)
     order  = ["stage1_raw", "stage1_canon", "ga_canon"]
@@ -861,7 +1038,7 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
         if xs.size==0: continue
         ax1.scatter(xs + jitter[key], ys, label=labels[key], alpha=0.9, marker=markers[key]); anyp=True
     if y_log: ax1.set_yscale("log")
-    ax1.set_xlabel("|R|"); ax1.set_ylabel(r"$\widehat{\mathrm{trace}}(T^n)$ / $Z_{\mathrm{exact}}$")
+    ax1.set_xlabel("|R|"); ax1.set_ylabel(_objective_ylabel(objective_field, apply_penalty))
     ax1.set_title(f"(n={n}, k={k}) stage1_raw vs stage1_canon vs ga_canon — Scatter")
     if anyp: ax1.legend(loc="best")
     fig1.tight_layout()
@@ -877,19 +1054,24 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
         xj = xs + jitter[key]
         ax2.plot(xj, est, marker=markers[key], linestyle=linest[key], alpha=0.95, label=labels[key])
         vb = np.isfinite(lo) & np.isfinite(hi) & (hi>=lo)
-        if vb.any(): ax2.fill_between(xj[vb], lo[vb], hi[vb], alpha=0.12, linewidth=0)
-        i2 = _knee_second(xs, est, logy=y_log)
-        il = _knee_l(xs, est, logxy=True)
-        iu = _unit_best_idx(xs, est)
-        if i2 is not None: ax2.scatter([xj[i2]],[est[i2]],s=70,marker="D",label=f"{labels[key]}: knee-2Δ |R|={int(xs[i2])}")
-        if il is not None: ax2.scatter([xj[il]],[est[il]],s=70,marker="s",label=f"{labels[key]}: knee-L  |R|={int(xs[il])}")
-        if (i2 is not None) and (il is not None) and abs(int(xs[i2])-int(xs[il]))<=1:
-            idx = i2 if xs[i2]<=xs[il] else il
-            ax2.scatter([xj[idx]],[est[idx]],s=110,marker="*",label=f"{labels[key]}: robust-knee |R|={int(xs[idx])}")
-        if iu is not None: ax2.scatter([xj[iu]],[est[iu]],s=110,marker="p",label=f"{labels[key]}: unit-best |R|={int(xs[iu])}")
+        if show_band and vb.any():
+            ax2.fill_between(xj[vb], lo[vb], hi[vb], alpha=0.12, linewidth=0)
+        inc_idx = _monotone_idx_with_max(xs, est)
+        if inc_idx.size:
+            inc_xs, inc_est = xs[inc_idx], est[inc_idx]
+            i2 = _knee_second(inc_xs, inc_est, logy=y_log) if inc_idx.size >= 3 else None
+            il = _knee_l(inc_xs, inc_est, logxy=True) if inc_idx.size >= 3 else None
+            iu = _unit_best_idx(inc_xs, inc_est) if inc_idx.size >= 1 else None
+            if i2 is not None: ax2.scatter([xj[inc_idx[i2]]],[est[inc_idx[i2]]],s=70,marker="D",label=f"{labels[key]}: knee-2Δ |R|={int(inc_xs[i2])}")
+            if il is not None: ax2.scatter([xj[inc_idx[il]]],[est[inc_idx[il]]],s=70,marker="s",label=f"{labels[key]}: knee-L  |R|={int(inc_xs[il])}")
+            if (i2 is not None) and (il is not None) and abs(int(inc_xs[i2])-int(inc_xs[il]))<=1:
+                idx = i2 if inc_xs[i2]<=inc_xs[il] else il
+                ax2.scatter([xj[inc_idx[idx]]],[est[inc_idx[idx]]],s=110,marker="*",label=f"{labels[key]}: robust-knee |R|={int(inc_xs[idx])}")
+            if iu is not None: ax2.scatter([xj[inc_idx[iu]]],[est[inc_idx[iu]]],s=110,marker="p",label=f"{labels[key]}: unit-best |R|={int(inc_xs[iu])}")
         anyp=True
     if y_log: ax2.set_yscale("log")
-    ax2.set_xlabel("|R|"); ax2.set_ylabel(r"Best $\widehat{\mathrm{trace}}(T^n)$ / $Z_{\mathrm{exact}}$")
+    ylabel = _objective_ylabel(objective_field, apply_penalty)
+    ax2.set_xlabel("|R|"); ax2.set_ylabel(ylabel)
     ax2.set_title(f"(n={n}, k={k}) Growth Curves with Knees & Bands")
     if anyp: ax2.legend(loc="best", ncol=2)
     fig2.tight_layout()
@@ -924,16 +1106,19 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
             ax4.plot(gxs, gaps, marker="^", linestyle=":", alpha=0.9,
                      label=("spectral gap" if not painted_gap else None), color="tab:orange")
             painted_gap=True or painted_gap
-        i2 = _knee_second(xs, est, logy=y_log)
-        il = _knee_l(xs, est, logxy=True)
-        iu = _unit_best_idx(xs, est)
-        if i2 is not None: ax3.scatter([xj[i2]],[est[i2]],s=70,marker="D")
-        if il is not None: ax3.scatter([xj[il]],[est[il]],s=70,marker="s")
-        if (i2 is not None) and (il is not None) and abs(int(xs[i2])-int(xs[il]))<=1:
-            idx = i2 if xs[i2]<=xs[il] else il
-            ax3.scatter([xj[idx]],[est[idx]],s=110,marker="*")
-        if iu is not None: ax3.scatter([xj[iu]],[est[iu]],s=110,marker="p")
-    ax3.set_xlabel("|R|"); ax3.set_ylabel(r"Best $\widehat{\mathrm{trace}}(T^n)$ / $Z_{\mathrm{exact}}$")
+        inc_idx = _monotone_idx_with_max(xs, est)
+        if inc_idx.size:
+            inc_xs, inc_est = xs[inc_idx], est[inc_idx]
+            i2 = _knee_second(inc_xs, inc_est, logy=y_log) if inc_idx.size >= 3 else None
+            il = _knee_l(inc_xs, inc_est, logxy=True) if inc_idx.size >= 3 else None
+            iu = _unit_best_idx(inc_xs, inc_est) if inc_idx.size >= 1 else None
+            if i2 is not None: ax3.scatter([xj[inc_idx[i2]]],[est[inc_idx[i2]]],s=70,marker="D")
+            if il is not None: ax3.scatter([xj[inc_idx[il]]],[est[inc_idx[il]]],s=70,marker="s")
+            if (i2 is not None) and (il is not None) and abs(int(inc_xs[i2])-int(inc_xs[il]))<=1:
+                idx = i2 if inc_xs[i2]<=inc_xs[il] else il
+                ax3.scatter([xj[inc_idx[idx]]],[est[inc_idx[idx]]],s=110,marker="*")
+            if iu is not None: ax3.scatter([xj[inc_idx[iu]]],[est[inc_idx[iu]]],s=110,marker="p")
+    ax3.set_xlabel("|R|"); ax3.set_ylabel(ylabel)
     ax4.set_ylabel(r"$\lambda_1-\lambda_2$")
     ax3.set_title(f"(n={n}, k={k}) Knees & Spectral Gap — stage1_raw vs stage1_canon vs ga_canon")
     ax3.legend(loc="upper left")
@@ -954,7 +1139,8 @@ def plot_all(front_paths: List[str],
              style: str="default",
              sym_filter: Optional[str] = None,
              objective_field: Optional[str] = None,
-             apply_penalty: bool = True)->List[str]:
+             apply_penalty: bool = True,
+             show_band: bool = False)->List[str]:
     """
     兼容 rd_cli.py:
       - 若给定 n,k：仅绘制该 (n,k) 的三张图；
@@ -964,11 +1150,11 @@ def plot_all(front_paths: List[str],
     apply_style(style); os.makedirs(out_dir, exist_ok=True)
     outs=[]
     if (n is not None) and (k is not None):
-        outs += list(plot_three_raw_canon_for_nk(front_paths, n, k, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter, objective_field=objective_field, apply_penalty=apply_penalty))
+        outs += list(plot_three_raw_canon_for_nk(front_paths, n, k, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter, objective_field=objective_field, apply_penalty=apply_penalty, show_band=show_band))
         return outs
     # 自动发现
     for n0,k0 in _discover_all_nk(front_paths):
-        outs += list(plot_three_raw_canon_for_nk(front_paths, n0, k0, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter, objective_field=objective_field, apply_penalty=apply_penalty))
+        outs += list(plot_three_raw_canon_for_nk(front_paths, n0, k0, out_dir=out_dir, y_log=y_log, style=style, sym_filter=sym_filter, objective_field=objective_field, apply_penalty=apply_penalty, show_band=show_band))
     return outs
 
 # =========================
