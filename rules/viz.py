@@ -270,6 +270,12 @@ def frontier_surfaces_to_json(data: Sequence[FrontierSurfaceData], include_grid:
     return [frontier_surface_to_json(d, include_grid=include_grid) for d in data]
 
 
+def write_frontier_surfaces_json(data: Sequence[FrontierSurfaceData], path: str | os.PathLike, include_grid: bool = True) -> None:
+    """Write FrontierSurfaceData list to JSON file (helper for notebooks/CLI)."""
+    obj = frontier_surfaces_to_json(data, include_grid=include_grid)
+    Path(path).write_text(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
 def _prepare_entropy_series(rule_bits: Optional[str],
                             k: Optional[int],
                             n_min: int,
@@ -756,7 +762,7 @@ def plot_frontier_surfaces(front_csvs: Iterable[str],
                            style: str = "default",
                            contour_levels: int = 10,
                            wireframe_stride: int = 1,
-                           max_series_per_fig: int = 4) -> Tuple[List[str], List[FrontierSurfaceData]]:
+                           max_series_per_fig: int = 3) -> Tuple[List[str], List[FrontierSurfaceData]]:
     """绘制 (n, |R|, 目标值) 的前沿曲面/等高线，并标注膝点/MUR/极值。
 
     返回：(输出图片路径列表, 对每个 k 的关键点数据)。
@@ -879,6 +885,9 @@ def _bucket_best_and_band(rows: List[dict], use_logy: bool, objective_field: Opt
         lo, hi = d["lo"], d["hi"]
         if (lo is None) or (hi is None) or (not np.isfinite(lo)) or (not np.isfinite(hi)) or (hi<lo):
             lo = mins.get(int(x), np.nan); hi = maxs.get(int(x), np.nan)
+        # ensure band encloses the selected best estimate
+        lo = min(lo, d["est"]) if np.isfinite(d["est"]) else lo
+        hi = max(hi, d["est"]) if np.isfinite(d["est"]) else hi
         los.append(lo); his.append(hi)
     los = np.array(los,float); his = np.array(his,float)
     if use_logy:
