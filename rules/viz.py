@@ -528,6 +528,14 @@ def _select_front0(rows:List[dict])->List[dict]:
         return [r for r in rows if str(r.get("is_front0","0"))=="1"]
     return rows
 
+
+def _is_front0(row: dict) -> bool:
+    val = row.get("is_front0", "0")
+    try:
+        return float(val) > 0.5
+    except Exception:
+        return str(val).strip() == "1"
+
 # 文件名/字段解析 (n,k) + 系列
 _RX_STAGE1 = re.compile(r"stage1_(?:all|pareto)_n(\d+)_k(\d+)")
 _RX_GA     = re.compile(r"pareto_front_(?:nk_)?n(\d+)_k(\d+)(?:_|\.csv)")
@@ -925,8 +933,9 @@ def _bucket_best_and_band(rows: List[dict], use_logy: bool, objective_field: Opt
     mins: Dict[int, float] = {}
     maxs: Dict[int, float] = {}
     # prefer front0 rows if available; supplement missing rule_counts with best from non-front0 rows
-    front_rows = [r for r in rows if str(r.get("is_front0", "0")) == "1"]
-    non_front_rows = [r for r in rows if str(r.get("is_front0", "0")) != "1"]
+    front_rows = [r for r in rows if _is_front0(r)]
+    non_front_rows = [r for r in rows if not _is_front0(r)]
+    # process front rows first (if any), then backfill with non-front rows per rule_count
     row_iter = front_rows if front_rows else rows
     for r in row_iter:
         try:
@@ -941,7 +950,7 @@ def _bucket_best_and_band(rows: List[dict], use_logy: bool, objective_field: Opt
         if np.isfinite(est):
             mins[rc] = min(mins.get(rc, +np.inf), est)
             maxs[rc] = max(maxs.get(rc, -np.inf), est)
-    # supplement missing rc from non-front rows
+    # supplement per rule_count from non-front rows where front rows are missing that rc
     if front_rows:
         present_rc = set(bucket.keys())
         for r in non_front_rows:
