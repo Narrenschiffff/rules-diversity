@@ -232,6 +232,44 @@ class FrontierSurfaceData:
     key_points: List[KeyPoint]
 
 
+def frontier_surface_to_json(d: FrontierSurfaceData, include_grid: bool = True) -> dict:
+    """Convert FrontierSurfaceData into a JSON-serializable dict.
+
+    Args:
+        d: dataclass instance to convert.
+        include_grid: whether to emit the full (rule_count, n) grid. Set False if file size is a concern.
+    """
+    def _arr(x):
+        return np.asarray(x).tolist()
+
+    return {
+        "k": int(d.k),
+        "boundary": d.boundary,
+        "sym_mode": d.sym_mode,
+        "metric_field": d.metric_field,
+        "ns": _arr(d.ns),
+        "rule_counts": _arr(d.rule_counts),
+        "grid": _arr(d.grid) if include_grid else None,
+        "best_curve_metric": _arr(d.best_curve_metric),
+        "best_curve_n": _arr(d.best_curve_n),
+        "key_points": [
+            {
+                "kind": kp.kind,
+                "n": float(kp.n),
+                "rule_count": float(kp.rule_count),
+                "metric": float(kp.metric),
+                "label": kp.label,
+            }
+            for kp in d.key_points
+        ],
+    }
+
+
+def frontier_surfaces_to_json(data: Sequence[FrontierSurfaceData], include_grid: bool = True) -> List[dict]:
+    """Batch version of frontier_surface_to_json."""
+    return [frontier_surface_to_json(d, include_grid=include_grid) for d in data]
+
+
 def _prepare_entropy_series(rule_bits: Optional[str],
                             k: Optional[int],
                             n_min: int,
