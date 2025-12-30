@@ -617,6 +617,13 @@ def _extract_key_points(rule_counts: np.ndarray,
                 inc_idx.append(i)
                 cur = y
     inc_idx = np.array(inc_idx, dtype=int)
+    # ensure we always include the global maximum for labeling (even if curve is decreasing)
+    try:
+        imax = int(np.nanargmax(ys))
+    except Exception:
+        imax = None
+    if (imax is not None) and (imax not in inc_idx):
+        inc_idx = np.unique(np.concatenate([inc_idx, np.array([imax], dtype=int)]))
     if inc_idx.size >= 1:
         inc_xs = xs[inc_idx]
         inc_ys = ys[inc_idx]
@@ -631,11 +638,8 @@ def _extract_key_points(rule_counts: np.ndarray,
         if iu is not None:
             points.append(KeyPoint("unit-best", inc_ns[iu], inc_xs[iu], inc_ys[iu], f"unit-best |R|={int(inc_xs[iu])}"))
 
-    try:
-        imax = int(np.nanargmax(ys))
+    if imax is not None:
         points.append(KeyPoint("max", ns[imax], xs[imax], ys[imax], f"max |R|={int(xs[imax])}"))
-    except Exception:
-        pass
     points.sort(key=lambda p: (p.rule_count, p.kind))
     return points
 
@@ -924,6 +928,17 @@ def _bucket_best_and_band(rows: List[dict], use_logy: bool, objective_field: Opt
         est = np.where(est>0, est, np.nan)
         los = np.where(los>0, los, np.nan)
         his = np.where(his>0, his, np.nan)
+        # keep rule_count=1 anchor if available
+        if 1.0 not in xs and len(xs)>0:
+            try:
+                min_rc = int(xs.min())
+                if min_rc > 1:
+                    xs = np.insert(xs, 0, 1.0)
+                    est = np.insert(est, 0, est[0])
+                    los = np.insert(los, 0, los[0])
+                    his = np.insert(his, 0, his[0])
+            except Exception:
+                pass
         log_est = np.log(est)
         log_lo = np.log(los)
         log_hi = np.log(his)
@@ -995,7 +1010,11 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
         if iu is not None: ax2.scatter([xj[iu]],[est[iu]],s=110,marker="p",label=f"{labels[key]}: unit-best |R|={int(xs[iu])}")
         anyp=True
     if y_log: ax2.set_yscale("log")
-    ax2.set_xlabel("|R|"); ax2.set_ylabel(r"Best $\widehat{\mathrm{trace}}(T^n)$ / $Z_{\mathrm{exact}}$")
+    ylabel = r"Objective (log $Z$)"
+    if objective_field:
+        if "penalized" in objective_field or apply_penalty:
+            ylabel += r" / penalty"
+    ax2.set_xlabel("|R|"); ax2.set_ylabel(ylabel)
     ax2.set_title(f"(n={n}, k={k}) Growth Curves with Knees & Bands")
     if anyp: ax2.legend(loc="best", ncol=2)
     fig2.tight_layout()
@@ -1039,7 +1058,7 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
             idx = i2 if xs[i2]<=xs[il] else il
             ax3.scatter([xj[idx]],[est[idx]],s=110,marker="*")
         if iu is not None: ax3.scatter([xj[iu]],[est[iu]],s=110,marker="p")
-    ax3.set_xlabel("|R|"); ax3.set_ylabel(r"Best $\widehat{\mathrm{trace}}(T^n)$ / $Z_{\mathrm{exact}}$")
+    ax3.set_xlabel("|R|"); ax3.set_ylabel(ylabel)
     ax4.set_ylabel(r"$\lambda_1-\lambda_2$")
     ax3.set_title(f"(n={n}, k={k}) Knees & Spectral Gap — stage1_raw vs stage1_canon vs ga_canon")
     ax3.legend(loc="upper left")
