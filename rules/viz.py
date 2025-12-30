@@ -644,6 +644,34 @@ def _extract_key_points(rule_counts: np.ndarray,
     return points
 
 
+def _monotone_idx_with_max(xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+    """Return indices of a non-decreasing subsequence plus the global max (if outside)."""
+    inc_idx: List[int] = []
+    if xs.size:
+        cur = -np.inf
+        for i, y in enumerate(ys):
+            if y >= cur:
+                inc_idx.append(i)
+                cur = y
+    inc_idx = np.array(inc_idx, dtype=int)
+    try:
+        imax = int(np.nanargmax(ys))
+    except Exception:
+        imax = None
+    if (imax is not None) and (imax not in inc_idx):
+        inc_idx = np.unique(np.concatenate([inc_idx, np.array([imax], dtype=int)]))
+    return inc_idx
+
+
+def _objective_ylabel(objective_field: Optional[str], apply_penalty: bool) -> str:
+    lbl = r"Objective (log $Z$)"
+    if objective_field and "per" in objective_field:
+        lbl += r" / penalty"
+    elif apply_penalty:
+        lbl += r" / penalty"
+    return lbl
+
+
 def _prepare_surface_data(front_csvs: Iterable[str],
                           ks: Sequence[int],
                           boundary: Optional[str],
@@ -896,7 +924,11 @@ def _bucket_best_and_band(rows: List[dict], use_logy: bool, objective_field: Opt
     bucket: Dict[int, Dict[str, float]] = {}
     mins: Dict[int, float] = {}
     maxs: Dict[int, float] = {}
-    for r in rows:
+    # prefer front0 rows if available; supplement missing rule_counts with best from non-front0 rows
+    front_rows = [r for r in rows if str(r.get("is_front0", "0")) == "1"]
+    non_front_rows = [r for r in rows if str(r.get("is_front0", "0")) != "1"]
+    row_iter = front_rows if front_rows else rows
+    for r in row_iter:
         try:
             rc = int(r["rule_count"])
         except:
@@ -909,6 +941,22 @@ def _bucket_best_and_band(rows: List[dict], use_logy: bool, objective_field: Opt
         if np.isfinite(est):
             mins[rc] = min(mins.get(rc, +np.inf), est)
             maxs[rc] = max(maxs.get(rc, -np.inf), est)
+    # supplement missing rc from non-front rows
+    if front_rows:
+        present_rc = set(bucket.keys())
+        for r in non_front_rows:
+            try:
+                rc = int(r["rule_count"])
+            except:
+                continue
+            if rc in present_rc:
+                continue
+            est = _y_metric(r, prefer_field=objective_field, use_penalty=use_penalty)
+            lo, hi = _bounds(r, use_penalty=use_penalty, objective_field=objective_field)
+            bucket[rc] = {"est": est, "lo": lo, "hi": hi}
+            if np.isfinite(est):
+                mins[rc] = min(mins.get(rc, +np.inf), est)
+                maxs[rc] = max(maxs.get(rc, -np.inf), est)
     if not bucket:
         return (np.array([]),)*4
     xs  = np.array(sorted(bucket.keys()), float)
@@ -981,7 +1029,7 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
         if xs.size==0: continue
         ax1.scatter(xs + jitter[key], ys, label=labels[key], alpha=0.9, marker=markers[key]); anyp=True
     if y_log: ax1.set_yscale("log")
-    ax1.set_xlabel("|R|"); ax1.set_ylabel(r"$\widehat{\mathrm{trace}}(T^n)$ / $Z_{\mathrm{exact}}$")
+    ax1.set_xlabel("|R|"); ax1.set_ylabel(_objective_ylabel(objective_field, apply_penalty))
     ax1.set_title(f"(n={n}, k={k}) stage1_raw vs stage1_canon vs ga_canon — Scatter")
     if anyp: ax1.legend(loc="best")
     fig1.tight_layout()
@@ -999,21 +1047,21 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
         vb = np.isfinite(lo) & np.isfinite(hi) & (hi>=lo)
         if show_band and vb.any():
             ax2.fill_between(xj[vb], lo[vb], hi[vb], alpha=0.12, linewidth=0)
-        i2 = _knee_second(xs, est, logy=y_log)
-        il = _knee_l(xs, est, logxy=True)
-        iu = _unit_best_idx(xs, est)
-        if i2 is not None: ax2.scatter([xj[i2]],[est[i2]],s=70,marker="D",label=f"{labels[key]}: knee-2Δ |R|={int(xs[i2])}")
-        if il is not None: ax2.scatter([xj[il]],[est[il]],s=70,marker="s",label=f"{labels[key]}: knee-L  |R|={int(xs[il])}")
-        if (i2 is not None) and (il is not None) and abs(int(xs[i2])-int(xs[il]))<=1:
-            idx = i2 if xs[i2]<=xs[il] else il
-            ax2.scatter([xj[idx]],[est[idx]],s=110,marker="*",label=f"{labels[key]}: robust-knee |R|={int(xs[idx])}")
-        if iu is not None: ax2.scatter([xj[iu]],[est[iu]],s=110,marker="p",label=f"{labels[key]}: unit-best |R|={int(xs[iu])}")
+        inc_idx = _monotone_idx_with_max(xs, est)
+        if inc_idx.size:
+            inc_xs, inc_est = xs[inc_idx], est[inc_idx]
+            i2 = _knee_second(inc_xs, inc_est, logy=y_log) if inc_idx.size >= 3 else None
+            il = _knee_l(inc_xs, inc_est, logxy=True) if inc_idx.size >= 3 else None
+            iu = _unit_best_idx(inc_xs, inc_est) if inc_idx.size >= 1 else None
+            if i2 is not None: ax2.scatter([xj[inc_idx[i2]]],[est[inc_idx[i2]]],s=70,marker="D",label=f"{labels[key]}: knee-2Δ |R|={int(inc_xs[i2])}")
+            if il is not None: ax2.scatter([xj[inc_idx[il]]],[est[inc_idx[il]]],s=70,marker="s",label=f"{labels[key]}: knee-L  |R|={int(inc_xs[il])}")
+            if (i2 is not None) and (il is not None) and abs(int(inc_xs[i2])-int(inc_xs[il]))<=1:
+                idx = i2 if inc_xs[i2]<=inc_xs[il] else il
+                ax2.scatter([xj[inc_idx[idx]]],[est[inc_idx[idx]]],s=110,marker="*",label=f"{labels[key]}: robust-knee |R|={int(inc_xs[idx])}")
+            if iu is not None: ax2.scatter([xj[inc_idx[iu]]],[est[inc_idx[iu]]],s=110,marker="p",label=f"{labels[key]}: unit-best |R|={int(inc_xs[iu])}")
         anyp=True
     if y_log: ax2.set_yscale("log")
-    ylabel = r"Objective (log $Z$)"
-    if objective_field:
-        if "penalized" in objective_field or apply_penalty:
-            ylabel += r" / penalty"
+    ylabel = _objective_ylabel(objective_field, apply_penalty)
     ax2.set_xlabel("|R|"); ax2.set_ylabel(ylabel)
     ax2.set_title(f"(n={n}, k={k}) Growth Curves with Knees & Bands")
     if anyp: ax2.legend(loc="best", ncol=2)
@@ -1049,15 +1097,18 @@ def plot_three_raw_canon_for_nk(front_paths: List[str],
             ax4.plot(gxs, gaps, marker="^", linestyle=":", alpha=0.9,
                      label=("spectral gap" if not painted_gap else None), color="tab:orange")
             painted_gap=True or painted_gap
-        i2 = _knee_second(xs, est, logy=y_log)
-        il = _knee_l(xs, est, logxy=True)
-        iu = _unit_best_idx(xs, est)
-        if i2 is not None: ax3.scatter([xj[i2]],[est[i2]],s=70,marker="D")
-        if il is not None: ax3.scatter([xj[il]],[est[il]],s=70,marker="s")
-        if (i2 is not None) and (il is not None) and abs(int(xs[i2])-int(xs[il]))<=1:
-            idx = i2 if xs[i2]<=xs[il] else il
-            ax3.scatter([xj[idx]],[est[idx]],s=110,marker="*")
-        if iu is not None: ax3.scatter([xj[iu]],[est[iu]],s=110,marker="p")
+        inc_idx = _monotone_idx_with_max(xs, est)
+        if inc_idx.size:
+            inc_xs, inc_est = xs[inc_idx], est[inc_idx]
+            i2 = _knee_second(inc_xs, inc_est, logy=y_log) if inc_idx.size >= 3 else None
+            il = _knee_l(inc_xs, inc_est, logxy=True) if inc_idx.size >= 3 else None
+            iu = _unit_best_idx(inc_xs, inc_est) if inc_idx.size >= 1 else None
+            if i2 is not None: ax3.scatter([xj[inc_idx[i2]]],[est[inc_idx[i2]]],s=70,marker="D")
+            if il is not None: ax3.scatter([xj[inc_idx[il]]],[est[inc_idx[il]]],s=70,marker="s")
+            if (i2 is not None) and (il is not None) and abs(int(inc_xs[i2])-int(inc_xs[il]))<=1:
+                idx = i2 if inc_xs[i2]<=inc_xs[il] else il
+                ax3.scatter([xj[inc_idx[idx]]],[est[inc_idx[idx]]],s=110,marker="*")
+            if iu is not None: ax3.scatter([xj[inc_idx[iu]]],[est[inc_idx[iu]]],s=110,marker="p")
     ax3.set_xlabel("|R|"); ax3.set_ylabel(ylabel)
     ax4.set_ylabel(r"$\lambda_1-\lambda_2$")
     ax3.set_title(f"(n={n}, k={k}) Knees & Spectral Gap — stage1_raw vs stage1_canon vs ga_canon")
