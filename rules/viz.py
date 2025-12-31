@@ -623,7 +623,7 @@ def _extract_key_points(rule_counts: np.ndarray,
     xs = xs[m]; ys = ys[m]; ns = ns[m]
     points: List[KeyPoint] = []
 
-    # 仅在非递减子序列上计算 MUR / 膝点；若整体递减，仅返回全局最大值
+    # 仅在非递减子序列上计算膝点；若整体递减，仅返回全局最大值
     inc_idx: List[int] = []
     if xs.size:
         cur = -np.inf
@@ -632,30 +632,29 @@ def _extract_key_points(rule_counts: np.ndarray,
                 inc_idx.append(i)
                 cur = y
     inc_idx = np.array(inc_idx, dtype=int)
-    # ensure we always include the global maximum for labeling (even if curve is decreasing)
     try:
         imax = int(np.nanargmax(ys))
     except Exception:
         imax = None
+    if imax is None:
+        return points
+
+    xs_max = xs[imax]; ys_max = ys[imax]
+    opt_idx = imax
+
     if (imax is not None) and (imax not in inc_idx):
         inc_idx = np.unique(np.concatenate([inc_idx, np.array([imax], dtype=int)]))
-    if inc_idx.size >= 1:
+    if inc_idx.size >= 3:
         inc_xs = xs[inc_idx]
         inc_ys = ys[inc_idx]
-        inc_ns = ns[inc_idx]
-        i2 = _knee_second(inc_xs, inc_ys, logy=True) if inc_idx.size >= 3 else None
-        if i2 is not None:
-            points.append(KeyPoint("knee-2Δ", inc_ns[i2], inc_xs[i2], inc_ys[i2], f"knee-2Δ |R|={int(inc_xs[i2])}"))
-        il = _knee_l(inc_xs, inc_ys, logxy=True) if inc_idx.size >= 3 else None
-        if il is not None:
-            points.append(KeyPoint("knee-L", inc_ns[il], inc_xs[il], inc_ys[il], f"knee-L |R|={int(inc_xs[il])}"))
-        iu = _unit_best_idx(inc_xs, inc_ys) if inc_idx.size >= 1 else None
-        if iu is not None:
-            points.append(KeyPoint("unit-best", inc_ns[iu], inc_xs[iu], inc_ys[iu], f"unit-best |R|={int(inc_xs[iu])}"))
+        knee_local = _knee_second(inc_xs, inc_ys, logy=True)
+        if knee_local is not None:
+            knee_global = inc_idx[knee_local]
+            knee_x = xs[knee_global]; knee_y = ys[knee_global]
+            if (knee_y >= 0.9 * ys_max) and (knee_x <= 0.5 * xs_max):
+                opt_idx = knee_global
 
-    if imax is not None:
-        points.append(KeyPoint("max", ns[imax], xs[imax], ys[imax], f"max |R|={int(xs[imax])}"))
-    points.sort(key=lambda p: (p.rule_count, p.kind))
+    points.append(KeyPoint("Optimal", ns[opt_idx], xs[opt_idx], ys[opt_idx], f"Optimal |R|={int(xs[opt_idx])}"))
     return points
 
 
