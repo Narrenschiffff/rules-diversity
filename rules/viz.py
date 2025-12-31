@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import os, re, csv, math, argparse, glob, logging
+import os, re, csv, math, argparse, glob, logging, json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Iterable, Optional, Sequence
@@ -229,7 +229,7 @@ class FrontierSurfaceData:
     grid: np.ndarray
     best_curve_metric: np.ndarray
     best_curve_n: np.ndarray
-    optimal_curve: List[Tuple[float, float, float]]
+    optimal_curve: Optional[List[Tuple[float, float, float]]] = None
     key_points: List[KeyPoint]
 
 
@@ -253,6 +253,7 @@ def frontier_surface_to_json(d: FrontierSurfaceData, include_grid: bool = True) 
         "grid": _arr(d.grid) if include_grid else None,
         "best_curve_metric": _arr(d.best_curve_metric),
         "best_curve_n": _arr(d.best_curve_n),
+        "optimal_curve": _arr(d.optimal_curve) if d.optimal_curve is not None else None,
         "key_points": [
             {
                 "kind": kp.kind,
@@ -622,11 +623,8 @@ def _extract_key_points(rule_counts: np.ndarray,
     if not m.any():
         return []
     xs = xs[m]; ys = ys[m]; ns = ns[m]
-    points: List[KeyPoint] = []
-
     opt_idx = _get_optimal_idx(xs, ys, logy=True)
-    points.append(KeyPoint("Optimal", ns[opt_idx], xs[opt_idx], ys[opt_idx], f"Optimal |R|={int(xs[opt_idx])}"))
-    return points
+    return [KeyPoint("Optimal", ns[opt_idx], xs[opt_idx], ys[opt_idx], f"Optimal |R|={int(xs[opt_idx])}")]
 
 
 def _monotone_idx_with_max(xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
@@ -661,29 +659,32 @@ def _get_optimal_idx(xs: np.ndarray, ys: np.ndarray, logy: bool = True) -> int:
     except Exception:
         return 0
 
-    # knee on monotone subsequence
-    inc_idx = _monotone_idx_with_max(xs, Y)
-    i_knee = None
-    if inc_idx.size >= 3:
-        i_local = _knee_second(xs[inc_idx], ys[inc_idx], logy=logy)
-        if i_local is not None:
-            i_knee = int(inc_idx[i_local])
-
+    i_knee = _knee_second(xs, ys, logy=logy)
+    if i_knee is None:
+        i_knee = _knee_l(xs, ys, logxy=logy)
     i_mur = _unit_best_idx(xs, ys) if xs.size >= 2 else None
-    candidates = [i for i in [i_knee, i_mur] if i is not None and i != i_max and 0 <= i < len(xs)]
+
+    candidates = []
+    for c in (i_knee, i_mur, None if i_mur is None else i_mur + 1):
+        if c is None:
+            continue
+        if c >= len(xs) or c < 0:
+            continue
+        if c >= i_max:
+            continue
+        candidates.append(c)
 
     best_idx = i_max
-    threshold = 0.2
-    for cand in candidates:
-        dx = xs[i_max] - xs[cand]
-        dy = Y[i_max] - Y[cand]
-        if dx <= 0 or dy <= 0 or xs[cand] <= 0:
+    for c in candidates:
+        gain_rem = ys[i_max] - ys[c]
+        cost_rem = xs[i_max] - xs[c]
+        if cost_rem <= 0:
             continue
-        slope_tail = dy / dx
-        slope_local = Y[cand] / xs[cand]
-        if slope_tail < threshold * slope_local:
-            if xs[cand] < xs[best_idx] or best_idx == i_max:
-                best_idx = cand
+        slope_tail = gain_rem / cost_rem
+        slope_base = ys[c] / xs[c] if xs[c] > 0 else 0.0
+        if slope_tail < 0.2 * slope_base:
+            if xs[c] < xs[best_idx]:
+                best_idx = c
 
     return int(best_idx)
 
@@ -786,17 +787,15 @@ def _prepare_surface_data(front_csvs: Iterable[str],
                 best_z[i] = row[j]
                 best_n[i] = ns[j]
 
-        # optimal curve across n for this k
+        # optimal curve across n for this k (per-column optimal rule count/metric)
         optimal_curve: List[Tuple[float, float, float]] = []
         for j in range(ns.size):
             col = grid[:, j]
             if not np.isfinite(col).any():
                 continue
-            xs = rcs
-            ys = col
-            idx_opt = _get_optimal_idx(xs, ys, logy=True)
-            if 0 <= idx_opt < len(xs) and np.isfinite(ys[idx_opt]):
-                optimal_curve.append((ns[j], xs[idx_opt], ys[idx_opt]))
+            idx_opt = _get_optimal_idx(rcs, col, logy=True)
+            if 0 <= idx_opt < len(rcs) and np.isfinite(col[idx_opt]):
+                optimal_curve.append((ns[j], rcs[idx_opt], col[idx_opt]))
 
         key_points = _extract_key_points(rule_counts=rcs, metrics=best_z, ns_for_rule=best_n)
         outs.append(FrontierSurfaceData(
@@ -856,13 +855,13 @@ def plot_frontier_surfaces(front_csvs: Iterable[str],
                            ks: Sequence[int],
                            boundary: Optional[str] = None,
                            sym_mode: Optional[str] = None,
-                           metric: Optional[str] = "objective_penalized",
-                           plot_types: Sequence[str] | str = ("surface",),
-                           out_dir: str = "./out_fig",
-                           style: str = "default",
-                           contour_levels: int = 10,
-                           wireframe_stride: int = 1,
-                           max_series_per_fig: int = 1) -> Tuple[List[str], List[FrontierSurfaceData]]:
+                            metric: Optional[str] = "objective_penalized",
+                            plot_types: Sequence[str] | str = ("surface",),
+                            out_dir: str = "./out_fig",
+                            style: str = "default",
+                            contour_levels: int = 10,
+                            wireframe_stride: int = 1,
+                            max_series_per_fig: int = 1) -> Tuple[List[str], List[FrontierSurfaceData]]:
     """绘制 (n, |R|, 目标值) 的前沿曲面/等高线，并标注膝点/MUR/极值。
 
     返回：(输出图片路径列表, 对每个 k 的关键点数据)。
@@ -901,9 +900,7 @@ def plot_frontier_surfaces(front_csvs: Iterable[str],
                     if d.optimal_curve:
                         opt_ns, opt_rcs, opt_zs = zip(*d.optimal_curve)
                         ax.plot(opt_ns, opt_rcs, opt_zs, color="red", linewidth=2.2, label=f"k={d.k} optimal")
-                        # projection on bottom plane
-                        finite_grid = np.asarray(d.grid, float)
-                        z_min = np.nanmin(finite_grid[np.isfinite(finite_grid)]) if np.isfinite(finite_grid).any() else 0.0
+                        z_min = ax.get_zlim()[0]
                         ax.plot(opt_ns, opt_rcs, zs=z_min, zdir="z", color="red", linewidth=1.5, linestyle="--", alpha=0.8)
                     proxies.append(mpl.lines.Line2D([0], [0], color=color, lw=2))
                     labels.append(f"k={d.k}")
@@ -941,6 +938,9 @@ def plot_frontier_surfaces(front_csvs: Iterable[str],
                         for p in kp_sorted:
                             ax.text(p.n, p.rule_count, f"{p.kind}\n{p.metric:.2g}", color=color, fontsize=8,
                                     ha="left", va="bottom")
+                    if d.optimal_curve:
+                        opt_ns, opt_rcs, _ = zip(*d.optimal_curve)
+                        ax.plot(opt_ns, opt_rcs, color="red", linewidth=1.8, linestyle="-", label=f"k={d.k} optimal curve")
                 ax.set_xlabel("n"); ax.set_ylabel("|R|")
                 part = 1 + chunk_idx // max(1, int(max_series_per_fig))
                 part_suffix = f" (part {part})" if len(data) > len(subset) else ""

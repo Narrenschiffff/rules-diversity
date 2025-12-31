@@ -129,31 +129,33 @@ def optimal_index(xs, ys, logy: bool = True) -> int:
         i_max = int(np.nanargmax(Y))
     except Exception:
         return 0
-    best_idx = i_max
 
-    i_knee = robust_knee(xs, ys, logy=logy)
+    i_knee = knee_second_diff(xs, ys, logy=logy)
+    if i_knee is None:
+        i_knee = knee_lcurve(xs, ys, logxy=logy)
     i_mur = mur_index(xs, ys, logy=logy)
 
-    cand_set = set()
-    if i_knee is not None:
-        cand_set.add(i_knee)
-    if i_mur is not None:
-        cand_set.add(i_mur)
-        if i_mur + 1 < len(xs):
-            cand_set.add(i_mur + 1)
+    candidates: List[int] = []
+    for c in (i_knee, i_mur, None if i_mur is None else i_mur + 1):
+        if c is None:
+            continue
+        if c < 0 or c >= len(xs):
+            continue
+        if c >= i_max:
+            continue
+        candidates.append(c)
 
-    def _qualifies(idx: int) -> bool:
-        if idx == i_max:
-            return False
-        dx = max(xs[i_max] - xs[idx], 1e-12)
-        slope_to_max = (Y[i_max] - Y[idx]) / dx
-        slope_from_origin = Y[idx] / max(xs[idx], 1e-12)
-        return slope_to_max <= 0.1 * slope_from_origin
-
-    qualified = [i for i in cand_set if 0 <= i < len(xs) and _qualifies(i)]
-    if qualified:
-        qualified.sort(key=lambda i: (Y[i], xs[i]), reverse=True)
-        best_idx = qualified[0]
+    best_idx = i_max
+    for c in candidates:
+        gain_rem = ys[i_max] - ys[c]
+        cost_rem = xs[i_max] - xs[c]
+        if cost_rem <= 0:
+            continue
+        slope_tail = gain_rem / cost_rem
+        slope_base = ys[c] / xs[c] if xs[c] > 0 else 0.0
+        if slope_tail < 0.2 * slope_base:
+            if xs[c] < xs[best_idx]:
+                best_idx = c
 
     return int(best_idx)
 
@@ -1193,14 +1195,11 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
             ys = np.array([buckets[x]["y"] for x in xs], float)
 
             idx = optimal_index(xs, ys, logy=logy)
-            if idx is None:
-                continue
-
             three_x, three_y = [], []
             for j in (idx - 1, idx, idx + 1):
                 if 0 <= j < len(xs):
                     three_x.append(xs[j]); three_y.append(ys[j])
-            if len(three_x) >= 2:
+            if len(three_x) >= 1:
                 ax.plot(three_x, three_y, marker="D", alpha=0.9, label=f"n{n}k{k}")
 
         ax.set_xlabel("|R|")
