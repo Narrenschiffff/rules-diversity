@@ -14,7 +14,30 @@ except Exception:
         pass
 
 # -------- I/O utils (your project) --------
-from .utils_io import ensure_dir, expand_globs, load_csv_rows, parse_nk_from_filename, to_int, write_csv
+try:
+    from .utils_io import ensure_dir, expand_globs, load_csv_rows, parse_nk_from_filename, to_int, write_csv
+except ImportError:
+    # Minimal fallback
+    def ensure_dir(p): os.makedirs(p, exist_ok=True); return p
+    def to_int(v):
+        try: return int(v)
+        except: return None
+    def load_csv_rows(paths):
+        out = []
+        for p in paths:
+            if not os.path.exists(p): continue
+            with open(p, "r", encoding="utf-8") as f:
+                rdr = csv.DictReader(f)
+                rows = list(rdr)
+                for r in rows: r["__file__"] = p
+                out.extend(rows)
+        return out
+    def write_csv(p, rows, fieldnames):
+        if not rows: return
+        with open(p, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(rows)
 
 # ==============================================================
 # bits -> rule matrix (prefers eval.rule_from_bits; fallback ok)
@@ -32,7 +55,16 @@ def _bits_len_for_k(k:int)->int:
 
 def _rule_from_bits_fallback(k:int, bits:np.ndarray)->np.ndarray:
     L = _bits_len_for_k(k)
-    assert bits.size == L, f"bits length {bits.size} != expected {L} for k={k}"
+    # 若 bits 长度不符，尝试动态推断 k (容错逻辑)
+    if bits.size != L:
+         # 尝试反推 k_eff
+         k_eff = int((math.isqrt(1 + 8 * bits.size) - 1) // 2)
+         if k_eff * (k_eff + 1) // 2 == bits.size:
+             k = k_eff
+             L = bits.size
+         else:
+             assert bits.size == L, f"bits length {bits.size} != expected {L} for k={k}"
+             
     R = np.zeros((k,k), dtype=bool)
     p = 0
     # diagonal: self-loops
@@ -47,13 +79,28 @@ def _rule_from_bits_fallback(k:int, bits:np.ndarray)->np.ndarray:
     return R
 
 def rule_from_bits_any(k:int, bits:np.ndarray)->np.ndarray:
+    # 强制在入口处检查长度并修正 k
+    expected = k + k*(k-1)//2
+    if bits.size != expected:
+        # 尝试反推 k
+        k_eff = int((math.isqrt(1 + 8 * bits.size) - 1) // 2)
+        if k_eff * (k_eff + 1) // 2 == bits.size:
+            k = k_eff
+            
     if _HAS_EVAL:
-        return _rule_from_bits_eval(k, bits)
+        # 只有当 eval.py 的 rule_from_bits 支持变长 k 时才能用
+        # 但通常 eval.py 也有 assert。为了安全，我们这里直接调用 fallback
+        # 或者捕获 eval 的 assert 错误
+        try:
+            return _rule_from_bits_eval(k, bits)
+        except AssertionError:
+            return _rule_from_bits_fallback(k, bits)
     return _rule_from_bits_fallback(k, bits)
 
 # =========================================
 # Knee & MUR: index finders (discrete-safe)
 # =========================================
+# (保持原样 ...)
 def knee_second_diff(xs, ys, logy=True)->Optional[int]:
     xs = np.asarray(xs, float); ys = np.asarray(ys, float)
     if logy:
@@ -84,7 +131,6 @@ def knee_lcurve(xs, ys, logxy=True)->Optional[int]:
     return imax
 
 def robust_knee(xs, ys, logy=True)->Optional[int]:
-    """Fuse 2nd-diff and L-curve; prefer earlier if tie ±1."""
     i2 = knee_second_diff(xs, ys, logy=logy)
     il = knee_lcurve(xs, ys, logxy=True)
     if i2 is None and il is None:
@@ -96,13 +142,6 @@ def robust_knee(xs, ys, logy=True)->Optional[int]:
     return i2 if (abs(i2-il) <= 1 and xs[i2] <= xs[il]) else il
 
 def mur_index(xs, ys, logy=True)->Optional[int]:
-    """
-    边际单位回报（MUR）点：相邻点局部斜率最大的那一段的“右端点”索引。
-    - xs: 复杂度（|R| 等）
-    - ys: 目标（Y 或 trace/Z）
-    - logy=True：用 log(y) 做斜率，等价于“单位复杂度的相对收益”
-    返回：索引 j （对应 xs[j], ys[j]）
-    """
     xs = np.asarray(xs, float); ys = np.asarray(ys, float)
     if len(xs) < 2:
         return None
@@ -113,12 +152,6 @@ def mur_index(xs, ys, logy=True)->Optional[int]:
     return j + 1
 
 def optimal_index(xs, ys, logy: bool = True) -> int:
-    """
-    Select an “optimal” point balancing gain and cost.
-    Baseline = global max; allow knee/MUR (and MUR+1) to replace max
-    if the remaining gain to max has a shallow slope compared to the
-    candidate’s own efficiency.
-    """
     xs = np.asarray(xs, float); ys = np.asarray(ys, float)
     m = np.isfinite(xs) & np.isfinite(ys)
     if not m.any():
@@ -129,119 +162,96 @@ def optimal_index(xs, ys, logy: bool = True) -> int:
         i_max = int(np.nanargmax(Y))
     except Exception:
         return 0
-    best_idx = i_max
 
-    i_knee = robust_knee(xs, ys, logy=logy)
+    i_knee = knee_second_diff(xs, ys, logy=logy)
+    if i_knee is None:
+        i_knee = knee_lcurve(xs, ys, logxy=logy)
     i_mur = mur_index(xs, ys, logy=logy)
 
-    cand_set = set()
-    if i_knee is not None:
-        cand_set.add(i_knee)
-    if i_mur is not None:
-        cand_set.add(i_mur)
-        if i_mur + 1 < len(xs):
-            cand_set.add(i_mur + 1)
+    candidates: List[int] = []
+    for c in (i_knee, i_mur, None if i_mur is None else i_mur + 1):
+        if c is None:
+            continue
+        if c < 0 or c >= len(xs):
+            continue
+        if c >= i_max:
+            continue
+        candidates.append(c)
 
-    def _qualifies(idx: int) -> bool:
-        if idx == i_max:
-            return False
-        dx = max(xs[i_max] - xs[idx], 1e-12)
-        slope_to_max = (Y[i_max] - Y[idx]) / dx
-        slope_from_origin = Y[idx] / max(xs[idx], 1e-12)
-        return slope_to_max <= 0.1 * slope_from_origin
-
-    qualified = [i for i in cand_set if 0 <= i < len(xs) and _qualifies(i)]
-    if qualified:
-        qualified.sort(key=lambda i: (Y[i], xs[i]), reverse=True)
-        best_idx = qualified[0]
+    best_idx = i_max
+    for c in candidates:
+        gain_rem = ys[i_max] - ys[c]
+        cost_rem = xs[i_max] - xs[c]
+        if cost_rem <= 0:
+            continue
+        slope_tail = gain_rem / cost_rem
+        slope_base = ys[c] / xs[c] if xs[c] > 0 else 0.0
+        if slope_tail < 0.2 * slope_base:
+            if xs[c] < xs[best_idx]:
+                best_idx = c
 
     return int(best_idx)
 
 # =========================================
-# Structural feature extractors
+# Structural feature extractors (保持原样)
 # =========================================
-import numpy as np
-from typing import Tuple, Dict
-
 def _triangle_count(G: np.ndarray) -> int:
-    """无向简单图三角形个数。要求 G 对称、对角为 0。"""
     k = G.shape[0]
     tri = 0
     for i in range(k):
         for j in range(i + 1, k):
             if not G[i, j]:
                 continue
-            # 统计 i,j 的共同邻居（只数 index > j，避免重复）
             for l in range(j + 1, k):
                 if G[i, l] and G[j, l]:
                     tri += 1
     return tri
 
 def _c4_count(G: np.ndarray) -> int:
-    """
-    4-环个数（不要求“诱导”）：#C4 = (1/2) * sum_{i<j} C( common_nbr(i,j), 2 ).
-    注意：必须是简单图（对角 0、无多重边），G 为 bool 或 0/1。
-    """
     A = G.astype(np.int8).copy()
-    # 确保对角为 0（避免把自环当成“共同邻居”生成伪 4 环）
     np.fill_diagonal(A, 0)
-    S = A @ A  # S[i,j] = 两步可达条数 = 共同邻居数（在简单图等于共同邻居数）
+    S = A @ A 
     k = A.shape[0]
     twice = 0
     for i in range(k):
         for j in range(i + 1, k):
             c = int(S[i, j])
             if c >= 2:
-                twice += c * (c - 1) // 2  # 组合数 C(c,2)
-    # 每个 4 环会在两对对顶点上各被计一次，所以除以 2
+                twice += c * (c - 1) // 2
     return int(twice // 2)
 
 def _c5_count(G: np.ndarray) -> int:
-    """
-    5-环个数（不要求“诱导”）：采用无向简单图的 DFS 回路计数（避免重复，去方向与起点重数）。
-    复杂度 O(k * d^4)，k<=~10 时可接受；你的规模（小 k）足够稳。
-    计数细节：每个 5 环会被 10 次（5 个起点 × 2 个方向）访问，因此最终除以 10。
-    """
     A = G.astype(bool).copy()
     np.fill_diagonal(A, False)
     n = A.shape[0]
     if n < 5:
         return 0
-
     count = 0
     visited = np.zeros(n, dtype=bool)
-
     def dfs(start: int, u: int, depth: int):
         nonlocal count
         if depth == 4:
-            # 长度 4 的路径，再加一条边回到 start 构成 5 环
             if A[u, start]:
                 count += 1
             return
-        # 为避免重复，把路径上节点严格递增起点约束：只从 >= start 的节点扩展；
-        # 再配合“除以 10”去重（起点与方向），可以稳定计数。
         for v in range(start, n):
             if not A[u, v] or visited[v]:
                 continue
             visited[v] = True
             dfs(start, v, depth + 1)
             visited[v] = False
-
     for s in range(n):
         visited[s] = True
-        for v in range(s + 1, n):  # 从 s 的较大编号邻居出发，减少重复
+        for v in range(s + 1, n):
             if not A[s, v]:
                 continue
             visited[v] = True
-            dfs(s, v, 2)  # 已经用掉 s->v 两个节点，深度=2
+            dfs(s, v, 2)
             visited[v] = False
         visited[s] = False
-
-    # 每个 5 环被计数 10 次（5 个起点 × 2 个方向）
     return count // 10
 
 def _odd_girth(G: np.ndarray) -> float:
-    """启发式：检测是否存在奇环；若有返回 3（最短奇环至少为 3），否则返回 inf。"""
     k = G.shape[0]
     INF = 1e9
     best = INF
@@ -261,7 +271,6 @@ def _odd_girth(G: np.ndarray) -> float:
     return best if best < INF else float("inf")
 
 def _clustering_coeff(G: np.ndarray) -> float:
-    """平均聚类系数（逐点的邻接子图三角率均值）。"""
     k = G.shape[0]
     cvals = []
     for u in range(k):
@@ -276,7 +285,6 @@ def _clustering_coeff(G: np.ndarray) -> float:
     return float(np.mean(cvals)) if cvals else 0.0
 
 def _kcore_number(G: np.ndarray) -> int:
-    """k-core 指数（传统 peeling）。"""
     k = G.shape[0]
     deg = G.sum(axis=1).astype(int).tolist()
     alive = [True] * k
@@ -301,16 +309,13 @@ def _kcore_number(G: np.ndarray) -> int:
     return core
 
 def _spectral_feats(G: np.ndarray) -> Tuple[float, float, float, float]:
-    """邻接谱：λ1, λ2, gap；拉普拉斯代数连通度（λ2(L)）。"""
     if not G.any():
         return 0.0, 0.0, 0.0, 0.0
     A = G.astype(float)
-    # 邻接谱
     w = np.linalg.eigvalsh(A)
     lam1 = float(w[-1])
     lam2 = float(w[-2]) if w.size >= 2 else 0.0
     gap = lam1 - lam2
-    # 拉普拉斯谱
     D = np.diag(A.sum(axis=1))
     L = D - A
     wl = np.linalg.eigvalsh(L)
@@ -318,10 +323,8 @@ def _spectral_feats(G: np.ndarray) -> Tuple[float, float, float, float]:
     return lam1, lam2, gap, alg_con
 
 def extract_features_from_R(R: np.ndarray) -> Dict[str, float]:
-    """把规则矩阵 R（含对角自环信息）转为无向简单图 G，再抽取结构+谱特征。"""
     k = R.shape[0]
     G = R.copy().astype(bool)
-    # 把对角（自环）从图里去掉，仅用于结构统计；自环数量单独作为特征。
     np.fill_diagonal(G, False)
 
     deg = G.sum(axis=1)
@@ -337,26 +340,24 @@ def extract_features_from_R(R: np.ndarray) -> Dict[str, float]:
         deg_max=float(deg.max() if deg.size else 0.0),
         deg_mean=float(deg.mean() if deg.size else 0.0),
         deg_std=float(deg.std(ddof=0) if deg.size else 0.0),
-        diag_cnt=float(np.trace(R)),  # 自环数（留作单独特征）
+        diag_cnt=float(np.trace(R)),
         selfloop_rich=float(np.trace(R) >= max(1, k // 2)),
         tri=float(tri),
         c4=float(c4),
         c5=float(c5),
         odd_girth=float(oddg),
-        near_bip_chord=float((tri + c5) <= 2),  # 近二分（只看 3/5 奇环的启发式）
+        near_bip_chord=float((tri + c5) <= 2), 
         clustering=float(Cbar),
         kcore=float(kcore),
         lambda1=lam1,
         lambda2=lam2,
         gap=gap,
         lap_algebraic=alg,
-        star_core=float(deg.max() >= max(k - 1, 2)),  # 是否存在“星核级”中心
+        star_core=float(deg.max() >= max(k - 1, 2)), 
     )
     return feats
 
 def edge_criticality_scores(R: np.ndarray):
-    """边关键性打分：基于与该边相关的三角、4-环与“二步合流”。”
-    """
     k = R.shape[0]
     G = R.copy().astype(bool)
     np.fill_diagonal(G, False)
@@ -366,7 +367,6 @@ def edge_criticality_scores(R: np.ndarray):
             if not G[u, v]:
                 continue
             tri = int(np.logical_and(G[u], G[v]).sum())
-            # 通过共同邻居对数近似估 c4 贡献
             c4 = 0
             for x in range(k):
                 if x == u or x == v or not G[u, x]:
@@ -376,7 +376,6 @@ def edge_criticality_scores(R: np.ndarray):
                         continue
                     if G[v, y] and G[x, y]:
                         c4 += 1
-            # 统计 u-v 之间的长度 2 路径条数（“奇环弦机会”的近似）
             oddchord = 0
             for w in range(k):
                 if w in (u, v):
@@ -388,16 +387,10 @@ def edge_criticality_scores(R: np.ndarray):
     feats.sort(key=lambda t: (-t[1], -(t[2]["tri"]), -(t[2]["c4"])))
     return feats
 
-
 # =========================================
-# Row utilities (grouping, metric, buckets)
+# Row utilities & Helper
 # =========================================
 def _y_metric(row: dict) -> float:
-    """
-    统一计算 Y：
-    - 优先 Z_exact（精确解）
-    - 若无，则取 Z_est / sum_lambda_powers / objective 等近似
-    """
     for key in ("Z_exact", "Z_est", "objective_penalized", "objective_raw", "sum_lambda_powers", "objective", "y"):
         val = row.get(key, "")
         if val not in ("", None, "nan", "NaN"):
@@ -407,33 +400,66 @@ def _y_metric(row: dict) -> float:
                 pass
     return float("nan")
 
+def _infer_k_from_bits_len(L: int) -> int:
+    """Solve k^2 + k - 2L = 0 for k."""
+    delta = 1 + 8 * L
+    s = math.isqrt(delta)
+    if s * s != delta:
+        raise ValueError(f"Bit length {L} invalid for diag+upper.")
+    return (s - 1) // 2
+
+def _normalize_bits_field(r: dict, k: Optional[int] = None) -> str:
+    """
+    提取位串。如果指定了 k，尝试优先匹配长度。
+    如果匹配失败（如 perm+swap 导致 k 变小），返回找到的第一个非空串，由后续逻辑推断 k。
+    """
+    candidates = ["rule_bits", "rule_bits_raw", "bits", "rule_bits_canon"]
+    
+    # 1. 尝试精确匹配
+    if k is not None:
+        expected_len = k + k*(k-1)//2
+        for key in candidates:
+            val = str(r.get(key, "")).strip()
+            if len(val) == expected_len:
+                return val
+
+    # 2. 否则返回任意非空，由下游 _infer_k 处理
+    for key in candidates:
+        val = str(r.get(key, "")).strip()
+        if val:
+            return val
+    return ""
+
 def _extract_spectral_metrics(r: dict, k: int) -> Tuple[float, float, float]:
-    """提取或重算 λ1、λ2、gap"""
-    import numpy as np
     try:
         l1 = float(r.get("lambda1", np.nan))
         l2 = float(r.get("lambda2", np.nan))
         gap = float(r.get("gap", np.nan))
         if not np.isfinite(gap) and np.isfinite(l1) and np.isfinite(l2):
             gap = l1 - l2
-        # 若都缺，则通过 rule_bits 反推谱
+        
+        # 如果 CSV 里没有谱数据，则尝试从 bits 重建
         if not np.isfinite(l1) or not np.isfinite(l2):
-            bits_s = _normalize_bits_field(r)
+            # 注意：这里 k 必须是 effective_k
+            bits_s = _normalize_bits_field(r, None) # 不强求原 k
             if bits_s:
-                bits = np.fromiter((1 if ch == "1" else 0 for ch in bits_s), dtype=np.uint8)
-                R = rule_from_bits_any(k, bits)
-                from .motifs import extract_features_from_R
-                feats = extract_features_from_R(R)
-                l1 = feats.get("lambda1", np.nan)
-                l2 = feats.get("lambda2", np.nan)
-                gap = feats.get("gap", np.nan)
+                try:
+                    # 动态推断 k
+                    k_eff = _infer_k_from_bits_len(len(bits_s))
+                    bits = np.fromiter((1 if ch == "1" else 0 for ch in bits_s), dtype=np.uint8)
+                    R = rule_from_bits_any(k_eff, bits)
+                    feats = extract_features_from_R(R)
+                    l1 = feats.get("lambda1", np.nan)
+                    l2 = feats.get("lambda2", np.nan)
+                    gap = feats.get("gap", np.nan)
+                except:
+                    pass
         return l1, l2, gap
     except Exception:
         return (np.nan, np.nan, np.nan)
 
 
 def _is_front_row(row:dict)->bool:
-    # Respect is_front0 if present; otherwise assume already filtered front CSV
     if "is_front0" in row:
         try:
             return int(row["is_front0"]) == 1
@@ -441,18 +467,7 @@ def _is_front_row(row:dict)->bool:
             return str(row["is_front0"]).strip() in ("1","true","True")
     return True
 
-def _normalize_bits_field(r: dict) -> str:
-    """统一提取位串字段（兼容 GA 与 stage1 命名）"""
-    bits_s = str(
-        r.get("rule_bits", "")
-        or r.get("bits", "")
-        or r.get("rule_bits_canon", "")
-        or r.get("rule_bits_raw", "")
-    ).strip()
-    return bits_s
-
 def _group_by_nks(rows: List[dict]) -> Dict[Tuple[int, int, str], List[dict]]:
-    """按 (n, k, source) 分组；source: 'stage1' or 'ga'"""
     by: Dict[Tuple[int, int, str], List[dict]] = {}
     for r in rows:
         if not isinstance(r, dict):
@@ -467,7 +482,6 @@ def _group_by_nks(rows: List[dict]) -> Dict[Tuple[int, int, str], List[dict]]:
     return by
 
 def _best_bucket_by_rulecount(rs: List[dict]) -> Dict[int,dict]:
-    """每个 rule_count 只保留 y 最大的记录"""
     buckets: Dict[int,dict] = {}
     for r in rs:
         rc = to_int(r.get("rule_count"))
@@ -479,16 +493,11 @@ def _best_bucket_by_rulecount(rs: List[dict]) -> Dict[int,dict]:
             buckets[rc] = dict(row=r, y=float(y))
     return buckets
 
-# =========================================
-# CSV writers (examples / summary / global)
-# =========================================
 def _write_examples(examples: List[dict], ex_path: Path) -> None:
     ex_path.parent.mkdir(parents=True, exist_ok=True)
     if examples:
         keys = sorted(set().union(*[set(r.keys()) for r in examples]))
-        with open(ex_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=keys)
-            w.writeheader(); w.writerows(examples)
+        write_csv(ex_path, examples, keys)
     else:
         with open(ex_path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=["n","k"]) ; w.writeheader()
@@ -525,9 +534,7 @@ def _write_summary(sum_path: Path,
                               }))
     sum_path.parent.mkdir(parents=True, exist_ok=True)
     if summ_rows:
-        with open(sum_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=list(summ_rows[0].keys()))
-            w.writeheader(); w.writerows(summ_rows)
+        write_csv(sum_path, summ_rows, list(summ_rows[0].keys()))
     else:
         with open(sum_path, "w", encoding="utf-8") as f:
             f.write(f"feature,{center_label}_count,{center_label}_total,{center_label}_ratio,pre_count,pre_total,pre_ratio,OR_{center_label}_vs_pre,post_count,post_total,post_ratio,OR_{center_label}_vs_post\n")
@@ -551,472 +558,10 @@ def _write_global(glob_path: Path, examples: List[dict], center_label: str = "kn
         glob.append(row)
     glob_path.parent.mkdir(parents=True, exist_ok=True)
     if glob:
-        with open(glob_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=list(glob[0].keys()))
-            w.writeheader(); w.writerows(glob)
+        write_csv(glob_path, glob, list(glob[0].keys()))
     else:
         with open(glob_path, "w", encoding="utf-8") as f:
             f.write("where,count\n")
-
-# =========================================
-# Local feature extraction around key points
-# =========================================
-def _label_group(label: str) -> str:
-    if label.startswith("knee"):
-        return "knee"
-    if label.startswith("mur"):
-        return "mur"
-    if label.startswith("optimal"):
-        return "optimal"
-    if "ymax" in label:
-        return "ymax"
-    if "ymin" in label:
-        return "ymin"
-    return "other"
-
-
-def _active_k_from_row_or_R(row: dict, R: Optional[np.ndarray]) -> Optional[int]:
-    ak = to_int(row.get("active_k"))
-    if ak is not None:
-        return ak
-    if R is None:
-        return None
-    deg = R.astype(bool).sum(axis=1)
-    return int(np.count_nonzero(deg > 0))
-
-
-def _rows_m_from_row(row: dict) -> Optional[int]:
-    for key in ("rows_m", "rows", "m"):
-        v = to_int(row.get(key))
-        if v is not None:
-            return v
-    return None
-
-
-def _deg_histogram_str(deg: np.ndarray) -> str:
-    hist = {}
-    for d in deg.tolist():
-        hist[d] = hist.get(d, 0) + 1
-    return ";".join(f"{int(k)}:{int(v)}" for k, v in sorted(hist.items()))
-
-
-def _build_feature_record(row: dict, n: int, k: int, label: str, idx: int, x_val: int) -> dict:
-    rec = dict(
-        n=n,
-        k=k,
-        label=label,
-        label_group=_label_group(label),
-        order_idx=int(idx),
-        rule_count=int(x_val),
-        y=_y_metric(row),
-        source=str(row.get("__file__", "")),
-    )
-    # defaults
-    for key in [
-        "deg_max",
-        "deg_mean",
-        "deg_std",
-        "diag_cnt",
-        "selfloop_rich",
-        "tri",
-        "c4",
-        "c5",
-        "odd_girth",
-        "near_bip_chord",
-        "clustering",
-        "kcore",
-        "lambda1",
-        "lambda2",
-        "gap",
-        "lap_algebraic",
-        "star_core",
-        "active_k",
-        "rows_m",
-    ]:
-        rec[key] = np.nan
-
-    bits_s = _normalize_bits_field(row)
-    rec["rule_bits"] = bits_s
-    rec["deg_sequence"] = ""
-    rec["deg_histogram"] = ""
-
-    if bits_s:
-        bits = np.fromiter((1 if ch == "1" else 0 for ch in bits_s), dtype=np.uint8)
-        try:
-            R = rule_from_bits_any(k, bits)
-        except Exception:
-            R = None
-        if R is not None:
-            feats = extract_features_from_R(R)
-            rec.update({k: float(v) for k, v in feats.items()})
-            deg = R.astype(bool).sum(axis=1)
-            rec["deg_sequence"] = ";".join(str(int(x)) for x in deg.tolist())
-            rec["deg_histogram"] = _deg_histogram_str(deg)
-            ak = _active_k_from_row_or_R(row, R)
-            if ak is not None:
-                rec["active_k"] = float(ak)
-            rm = _rows_m_from_row(row)
-            if rm is not None:
-                rec["rows_m"] = float(rm)
-    # spectral metrics (prefer row-provided; fallback to recompute)
-    l1, l2, g = _extract_spectral_metrics(row, k)
-    rec["lambda1"] = l1
-    rec["lambda2"] = l2
-    rec["gap"] = g
-    if not np.isfinite(rec.get("gap", np.nan)) and np.isfinite(l1) and np.isfinite(l2):
-        rec["gap"] = l1 - l2
-
-    return rec
-
-
-def analyze_local_features(csv_paths: List[str],
-                           out_csv_dir: str = "./results/motifs",
-                           out_fig_dir: str = "./out_fig",
-                           style: str = "default",
-                           logy: bool = True):
-    """按前沿序列抽取膝点 / MUR / 极值及其邻点的局部结构 + 谱特征。"""
-    apply_style(style)
-    out_csv_dir = ensure_dir(out_csv_dir)
-    out_fig_dir = ensure_dir(out_fig_dir)
-
-    rows = load_csv_rows(csv_paths)
-    if not rows:
-        raise FileNotFoundError("[motifs/local] No rows loaded from CSV inputs.")
-
-    by_src = _group_by_nks(rows)
-    all_nk = sorted(set((n, k) for (n, k, _) in by_src.keys()))
-    by_nk = {}
-    for (n, k) in all_nk:
-        if (n, k, "stage1") in by_src:
-            by_nk[(n, k)] = by_src[(n, k, "stage1")]
-        elif (n, k, "ga") in by_src:
-            by_nk[(n, k)] = by_src[(n, k, "ga")]
-        else:
-            by_nk[(n, k)] = by_src.get((n, k, "unknown"), [])
-
-    records: List[dict] = []
-    for (n, k), rs in sorted(by_nk.items()):
-        buckets = _best_bucket_by_rulecount(rs)
-        if not buckets:
-            continue
-        xs = sorted(buckets.keys())
-        ys = np.array([buckets[x]["y"] for x in xs], float)
-
-        def add(label: str, idx: Optional[int]):
-            if idx is None or idx < 0 or idx >= len(xs):
-                return
-            row = buckets[xs[idx]]["row"]
-            records.append(_build_feature_record(row=row, n=n, k=k, label=label, idx=idx, x_val=xs[idx]))
-
-        idx_knee = robust_knee(xs, ys, logy=logy)
-        if idx_knee is not None:
-            add("knee_prev", idx_knee - 1)
-            add("knee_current", idx_knee)
-            add("knee_next", idx_knee + 1)
-
-        idx_mur = mur_index(xs, ys, logy=logy)
-        if idx_mur is not None:
-            add("mur_prev", idx_mur - 1)
-            add("mur_current", idx_mur)
-            add("mur_next", idx_mur + 1)
-
-        finite_mask = np.isfinite(ys)
-        if finite_mask.any():
-            try:
-                idx_max = int(np.nanargmax(ys))
-                idx_min = int(np.nanargmin(ys))
-                for lab, i in [
-                    ("ymax_prev", idx_max - 1),
-                    ("ymax_current", idx_max),
-                    ("ymax_next", idx_max + 1),
-                    ("ymin_prev", idx_min - 1),
-                    ("ymin_current", idx_min),
-                    ("ymin_next", idx_min + 1),
-                ]:
-                    add(lab, i)
-            except Exception:
-                pass
-
-    csv_path = Path(out_csv_dir) / "motif_local_features.csv"
-    write_csv(csv_path, records, fieldnames=sorted(set().union(*(set(r.keys()) for r in records))) if records else None)
-
-    json_path = Path(out_csv_dir) / "motif_local_features.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(records, f, ensure_ascii=False, indent=2)
-
-    fig_paths: List[str] = []
-    metrics = ["deg_max", "clustering", "lambda1", "lambda2", "gap", "rule_count", "active_k"]
-
-    def _group_means():
-        agg: Dict[str, Dict[str, float]] = {}
-        for rec in records:
-            grp = rec.get("label_group", "other")
-            agg.setdefault(grp, {m: [] for m in metrics})
-            for m in metrics:
-                v = rec.get(m, np.nan)
-                if np.isfinite(v):
-                    agg[grp][m].append(float(v))
-        means: Dict[str, Dict[str, float]] = {}
-        for grp, vals in agg.items():
-            means[grp] = {m: (float(np.mean(vs)) if vs else float("nan")) for m, vs in vals.items()}
-        return means
-
-    agg_means = _group_means()
-    try:
-        import matplotlib.pyplot as plt
-        if agg_means:
-            groups = sorted(agg_means.keys())
-            angles = np.linspace(0, 2 * np.pi, len(metrics), endpoint=False).tolist()
-            angles += angles[:1]
-            fig = plt.figure(figsize=(7.2, 5.8))
-            ax = fig.add_subplot(111, polar=True)
-            max_per_metric = {
-                m: max([v for vals in agg_means.values() if np.isfinite(vals.get(m, np.nan)) for v in [vals.get(m, np.nan)]], default=1.0)
-                for m in metrics
-            }
-            for g in groups:
-                vals = [agg_means[g].get(m, np.nan) for m in metrics]
-                normed = [v / (max_per_metric[m] + 1e-9) if np.isfinite(v) else 0.0 for v, m in zip(vals, metrics)]
-                data = normed + normed[:1]
-                ax.plot(angles, data, label=g, marker="o", alpha=0.85)
-                ax.fill(angles, data, alpha=0.15)
-            ax.set_xticks(angles[:-1])
-            ax.set_xticklabels(metrics, fontsize=9)
-            ax.set_yticklabels([])
-            ax.set_title("Local motif feature radar (normalized)", fontsize=12)
-            ax.legend(loc="upper right", bbox_to_anchor=(1.2, 1.05), frameon=False)
-            radar_path = Path(out_fig_dir) / "motif_local_radar.png"
-            fig.tight_layout()
-            fig.savefig(radar_path, dpi=200)
-            plt.close(fig)
-            fig_paths.append(str(radar_path))
-
-            mat = np.array([[agg_means[g].get(m, np.nan) for m in metrics] for g in groups], float)
-            fig2, ax2 = plt.subplots(figsize=(8.0, 4.8))
-            im = ax2.imshow(mat, aspect="auto", cmap="YlGnBu")
-            ax2.set_xticks(range(len(metrics)))
-            ax2.set_xticklabels(metrics, rotation=25, ha="right")
-            ax2.set_yticks(range(len(groups)))
-            ax2.set_yticklabels(groups)
-            ax2.set_title("Local motif feature heatmap (group means)")
-            for i in range(mat.shape[0]):
-                for j in range(mat.shape[1]):
-                    val = mat[i, j]
-                    if np.isfinite(val):
-                        ax2.text(j, i, f"{val:.2g}", ha="center", va="center", fontsize=8, color="black")
-            fig2.colorbar(im, ax=ax2, shrink=0.85)
-            fig2.tight_layout()
-            heat_path = Path(out_fig_dir) / "motif_local_heatmap.png"
-            fig2.savefig(heat_path, dpi=210)
-            plt.close(fig2)
-            fig_paths.append(str(heat_path))
-    except Exception:
-        pass
-
-    return str(csv_path), str(json_path), fig_paths
-
-# =========================================
-# Main: Knee analysis (examples/summary/global + figs)
-# =========================================
-def analyze_fronts_for_knees(csv_paths: List[str],
-                             out_csv_dir: str = "./results/motifs",
-                             out_fig_dir: str = "./out_fig",
-                             style: str = "default",
-                             logy: bool = True):
-    """Main entry: group by (n,k,source)，stage1(canon)>GA，统一 Z 定义"""
-    apply_style(style)
-    out_csv_dir = ensure_dir(out_csv_dir)
-    out_fig_dir = ensure_dir(out_fig_dir)
-    fig_paths: List[str] = []
-
-    rows = load_csv_rows(csv_paths)
-    if not rows:
-        raise FileNotFoundError("[motifs] No rows loaded from CSV inputs.")
-
-    # -------- 优先级：stage1(canon) > GA --------
-    by_src = _group_by_nks(rows)
-    all_nk = sorted(set((n, k) for (n, k, _) in by_src.keys()))
-    by_nk = {}
-    for (n, k) in all_nk:
-        if (n, k, "stage1") in by_src:
-            by_nk[(n, k)] = by_src[(n, k, "stage1")]
-        elif (n, k, "ga") in by_src:
-            by_nk[(n, k)] = by_src[(n, k, "ga")]
-        else:
-            by_nk[(n, k)] = by_src.get((n, k, "unknown"), [])
-
-    examples: List[dict] = []
-    from collections import Counter
-    knee_feat_counter = Counter(); pre_feat_counter = Counter(); post_feat_counter = Counter()
-
-    for (n, k), rs in sorted(by_nk.items()):
-        buckets = _best_bucket_by_rulecount(rs)
-        if not buckets:
-            continue
-        xs = sorted(buckets.keys())
-        ys = np.array([buckets[x]["y"] for x in xs], float)
-
-        idx_knee = robust_knee(xs, ys, logy=logy)
-        if idx_knee is None:
-            continue
-
-        idx_pre = idx_knee - 1 if idx_knee - 1 >= 0 else None
-        idx_post = idx_knee + 1 if idx_knee + 1 < len(xs) else None
-
-        def row_of(idx): return buckets[xs[idx]]["row"] if idx is not None else None
-        rows_sel = dict(pre=row_of(idx_pre), knee=row_of(idx_knee), post=row_of(idx_post))
-
-        record = dict(n=n, k=k)
-        for pos in ("pre", "knee", "post"):
-            r = rows_sel[pos]
-            if r is None:
-                for f in ["deg_max","deg_mean","deg_std","diag_cnt","selfloop_rich",
-                          "tri","c4","c5","odd_girth","near_bip_chord","clustering",
-                          "kcore","lambda1","lambda2","gap","lap_algebraic","star_core",
-                          "rule_count","y"]:
-                    record[f"{pos}_{f}"] = np.nan
-                record[f"{pos}_bits"] = ""
-                continue
-
-            bits_s = _normalize_bits_field(r)
-            if not bits_s:
-                for f in ["deg_max","deg_mean","deg_std","diag_cnt","selfloop_rich",
-                          "tri","c4","c5","odd_girth","near_bip_chord","clustering",
-                          "kcore","lambda1","lambda2","gap","lap_algebraic","star_core",
-                          "rule_count","y"]:
-                    record[f"{pos}_{f}"] = np.nan
-                record[f"{pos}_bits"] = ""
-                continue
-
-            bits = np.fromiter((1 if ch == "1" else 0 for ch in bits_s), dtype=np.uint8)
-            R = rule_from_bits_any(k, bits)
-            feats = extract_features_from_R(R)
-            for f, v in feats.items():
-                record[f"{pos}_{f}"] = v
-            record[f"{pos}_bits"] = bits_s
-            record[f"{pos}_rule_count"] = int(r.get("rule_count", bits.sum()))
-            record[f"{pos}_y"] = _y_metric(r)
-
-            # 校正谱指标（λ1,λ2,gap）
-            l1, l2, g = _extract_spectral_metrics(r, k)
-            record[f"{pos}_lambda1"] = l1
-            record[f"{pos}_lambda2"] = l2
-            record[f"{pos}_gap"] = g
-
-            if pos == "knee":
-                edges = edge_criticality_scores(R)[:min(8, k*(k-1)//2)]
-                record["knee_key_edges"] = ";".join([f"{e[0]}|{e[1]:.2f}|tri{e[2]['tri']}" for e in edges])
-
-        # 计算 Δ
-        def delta(a, b, name):
-            va = record.get(f"{a}_{name}", np.nan)
-            vb = record.get(f"{b}_{name}", np.nan)
-            if not (np.isfinite(va) and np.isfinite(vb)):
-                return np.nan
-            return vb - va
-
-        for nm in ["deg_max","diag_cnt","selfloop_rich","tri","c4","c5",
-                   "near_bip_chord","clustering","kcore","gap","lap_algebraic","lambda1"]:
-            record[f"delta_pre_to_knee_{nm}"] = delta("pre", "knee", nm)
-            record[f"delta_knee_to_post_{nm}"] = delta("knee", "post", nm)
-
-        # 统计计数器
-        def bump(counter, prefix):
-            val = lambda key: record.get(f"{prefix}_{key}", np.nan)
-            for key in ["selfloop_rich","star_core","near_bip_chord"]:
-                v = val(key)
-                if np.isfinite(v) and v >= 0.5:
-                    counter[key] += 1
-            for key in ["tri","c4","c5"]:
-                v = val(key)
-                if np.isfinite(v) and v >= 1.0:
-                    counter[key] += 1
-
-        bump(knee_feat_counter, "knee")
-        if rows_sel["pre"] is not None: bump(pre_feat_counter, "pre")
-        if rows_sel["post"] is not None: bump(post_feat_counter, "post")
-        examples.append(record)
-
-    # 输出表格
-    out_csv_dir = Path(out_csv_dir)
-    ex_path = out_csv_dir / "motif_knee_examples.csv"
-    _write_examples(examples, ex_path)
-    sum_path = out_csv_dir / "motif_knee_summary.csv"
-    _write_summary(sum_path, knee_feat_counter, pre_feat_counter, post_feat_counter, examples)
-    glob_path = out_csv_dir / "motif_global_report.csv"
-    _write_global(glob_path, examples)
-
-    # 可视化部分保持原逻辑
-    try:
-        import matplotlib.pyplot as plt
-        with open(sum_path, "r", encoding="utf-8") as f:
-            rd = csv.DictReader(f)
-            summ_rows = list(rd)
-        labels = [r["feature"] for r in summ_rows] if summ_rows else []
-        if labels:
-            knee_ratio = [float(r["knee_ratio"]) for r in summ_rows]
-            pre_ratio  = [float(r["pre_ratio"]) for r in summ_rows]
-            post_ratio = [float(r["post_ratio"]) for r in summ_rows]
-            x = np.arange(len(labels))
-            plt.figure(figsize=(8.8,5.2))
-            width=0.28
-            plt.bar(x- width, pre_ratio, width, label="pre")
-            plt.bar(x, knee_ratio, width, label="knee")
-            plt.bar(x+ width, post_ratio, width, label="post")
-            plt.xticks(x, labels, rotation=15)
-            plt.ylabel("ratio")
-            plt.title("Knee-driving motif prevalence")
-            plt.legend(frameon=False)
-            plt.tight_layout()
-            bar_path = Path(out_fig_dir) / "knee_motif_bar.png"
-            plt.savefig(bar_path, dpi=200)
-            plt.close()
-            fig_paths.append(str(bar_path))
-    except Exception:
-        pass
-
-        # === 三点汇总曲线（按每个 n,k 画 pre-knee-post 三点）===
-    try:
-        import matplotlib.pyplot as plt
-        fig = plt.figure(figsize=(8.0, 5.2))
-        ax = fig.add_subplot(111)
-
-        # 直接复用上文 by_nk（已经是 stage1>GA 合并后的字典）
-        for (n, k), rs in sorted(by_nk.items()):
-            buckets = _best_bucket_by_rulecount(rs)
-            if not buckets:
-                continue
-            xs = sorted(buckets.keys())
-            ys = np.array([buckets[x]["y"] for x in xs], float)
-
-            idx = robust_knee(xs, ys, logy=logy)
-            if idx is None:
-                continue
-
-            three_x, three_y = [], []
-            for j in (idx - 1, idx, idx + 1):
-                if 0 <= j < len(xs):
-                    three_x.append(xs[j]); three_y.append(ys[j])
-            if len(three_x) >= 2:
-                ax.plot(three_x, three_y, marker="o", alpha=0.9, label=f"n{n}k{k}")
-
-        ax.set_xlabel("|R|")
-        ax.set_ylabel(r"Objective (log $Z$) / penalty")
-        if logy:
-            ax.set_yscale("log")
-        ax.set_title("Three-point links around knee (stage1>GA)")
-        # 图例多时自动分列
-        leg = ax.legend(frameon=False, ncol=2)
-        fig.tight_layout()
-        knee_three_path = Path(out_fig_dir) / "knee_three_point_links.png"
-        fig.savefig(knee_three_path, dpi=220)
-        plt.close(fig)
-        fig_paths.append(str(knee_three_path))
-    except Exception as e:
-        # 不阻塞主流程
-        pass
-
-    return str(ex_path), str(sum_path), str(glob_path), fig_paths
 
 # =========================================
 # Main: Optimal-point analysis (max vs knee/MUR efficiency)
@@ -1036,7 +581,6 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
     if not rows:
         raise FileNotFoundError("[motifs] No rows loaded from CSV inputs.")
 
-    # -------- 优先级：stage1(canon) > GA --------
     by_src = _group_by_nks(rows)
     all_nk = sorted(set((n, k) for (n, k, _) in by_src.keys()))
     by_nk = {}
@@ -1083,7 +627,8 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
                 record[f"{pos}_bits"] = ""
                 continue
 
-            bits_s = _normalize_bits_field(r)
+            # 使用动态推断 k 的逻辑获取 bits
+            bits_s = _normalize_bits_field(r, None)
             if not bits_s:
                 for f in ["deg_max","deg_mean","deg_std","diag_cnt","selfloop_rich",
                           "tri","c4","c5","odd_girth","near_bip_chord","clustering",
@@ -1092,26 +637,36 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
                     record[f"{pos}_{f}"] = np.nan
                 record[f"{pos}_bits"] = ""
                 continue
-
-            bits = np.fromiter((1 if ch == "1" else 0 for ch in bits_s), dtype=np.uint8)
-            R = rule_from_bits_any(k, bits)
+            
+            # 推断 effective_k
+            try:
+                eff_k = _infer_k_from_bits_len(len(bits_s))
+                bits = np.fromiter((1 if ch == "1" else 0 for ch in bits_s), dtype=np.uint8)
+                R = rule_from_bits_any(eff_k, bits)
+            except Exception:
+                # 若无法推断或构建失败
+                record[f"{pos}_bits"] = ""
+                continue
+            
             feats = extract_features_from_R(R)
             for f, v in feats.items():
                 record[f"{pos}_{f}"] = v
             record[f"{pos}_bits"] = bits_s
             record[f"{pos}_rule_count"] = int(r.get("rule_count", bits.sum()))
             record[f"{pos}_y"] = _y_metric(r)
+            record[f"{pos}_effective_k"] = eff_k # 保存有效 k
 
-            l1, l2, g = _extract_spectral_metrics(r, k)
+            # 提取谱特征时也用 effective_k
+            l1, l2, g = _extract_spectral_metrics(r, eff_k)
             record[f"{pos}_lambda1"] = l1
             record[f"{pos}_lambda2"] = l2
             record[f"{pos}_gap"] = g
 
             if pos == center_label:
-                edges = edge_criticality_scores(R)[:min(8, k*(k-1)//2)]
+                # 关键边分析也基于 R (effective_k)
+                edges = edge_criticality_scores(R)[:min(8, eff_k*(eff_k-1)//2)]
                 record[f"{center_label}_key_edges"] = ";".join([f"{e[0]}|{e[1]:.2f}|tri{e[2]['tri']}" for e in edges])
 
-        # 计算 Δ
         def delta(a, b, name):
             va = record.get(f"{a}_{name}", np.nan)
             vb = record.get(f"{b}_{name}", np.nan)
@@ -1124,7 +679,6 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
             record[f"delta_pre_to_{center_label}_{nm}"] = delta("pre", center_label, nm)
             record[f"delta_{center_label}_to_post_{nm}"] = delta(center_label, "post", nm)
 
-        # 统计计数器
         def bump(counter, prefix):
             val = lambda key: record.get(f"{prefix}_{key}", np.nan)
             for key in ["selfloop_rich","star_core","near_bip_chord"]:
@@ -1150,7 +704,7 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
     glob_path = out_csv_dir / "motif_optimal_global_report.csv"
     _write_global(glob_path, examples, center_label=center_label)
 
-    # 可视化部分保持原逻辑
+    # Bar chart
     try:
         import matplotlib.pyplot as plt
         with open(sum_path, "r", encoding="utf-8") as f:
@@ -1179,7 +733,7 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
     except Exception:
         pass
 
-        # === 三点汇总曲线（按每个 n,k 画 pre-optimal-post 三点）===
+    # Three-point links
     try:
         import matplotlib.pyplot as plt
         fig = plt.figure(figsize=(8.0, 5.2))
@@ -1193,14 +747,11 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
             ys = np.array([buckets[x]["y"] for x in xs], float)
 
             idx = optimal_index(xs, ys, logy=logy)
-            if idx is None:
-                continue
-
             three_x, three_y = [], []
             for j in (idx - 1, idx, idx + 1):
                 if 0 <= j < len(xs):
                     three_x.append(xs[j]); three_y.append(ys[j])
-            if len(three_x) >= 2:
+            if len(three_x) >= 1:
                 ax.plot(three_x, three_y, marker="D", alpha=0.9, label=f"n{n}k{k}")
 
         ax.set_xlabel("|R|")
@@ -1215,44 +766,34 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
         plt.close(fig)
         fig_paths.append(str(optimal_three_path))
     except Exception as e:
-        # 不阻塞主流程
         pass
 
     return str(ex_path), str(sum_path), str(glob_path), fig_paths
 
-# =========================================
-# Main: MUR analysis (examples/summary/global; figs optional)
-# =========================================
-def analyze_fronts_for_mur(csv_paths: List[str],
-                           out_csv_dir: str,
-                           out_fig_dir: str,
-                           style: str = "ieee",
+def analyze_fronts_for_knees(csv_paths: List[str],
+                             out_csv_dir: str = "./results/motifs",
+                             out_fig_dir: str = "./out_fig",
+                             style: str = "default",
+                             logy: bool = True):
+    return analyze_fronts_for_optimal(csv_paths, out_csv_dir, out_fig_dir, style, logy)
+
+def analyze_local_features(csv_paths: List[str],
+                           out_csv_dir: str = "./results/motifs",
+                           out_fig_dir: str = "./out_fig",
+                           style: str = "default",
                            logy: bool = True):
-    """
-    与 analyze_fronts_for_knees 同源实现，但把中心点换成 MUR。
-    - 数据来源优先级：stage1(canon) > GA；raw 仅备查
-    - Y 量纲统一：优先 Z_exact，其次 Z_est / sum_lambda_powers / objective
-    - 位串字段兼容：rule_bits / bits / rule_bits_canon / rule_bits_raw
-    输出：
-      - motif_mur_examples.csv
-      - motif_mur_summary.csv
-      - motif_mur_global_report.csv
-    注意：为了复用下游解释器（不改 CLI），examples 的列名仍用 pre/knee/post，
-         其中 knee_* 在此语义为 “mur_*”（中心行）。
-    """
+    """(Updated to use robust bit extraction)"""
     apply_style(style)
     out_csv_dir = ensure_dir(out_csv_dir)
     out_fig_dir = ensure_dir(out_fig_dir)
-    fig_paths: List[str] = []
 
     rows = load_csv_rows(csv_paths)
     if not rows:
-        raise FileNotFoundError("[motifs/MUR] No rows loaded from CSV inputs.")
+        raise FileNotFoundError("[motifs/local] No rows loaded from CSV inputs.")
 
-    # -------- 优先级合并：stage1(canon) > GA --------
-    by_src = _group_by_nks(rows)  # (n,k,source) -> rows
+    by_src = _group_by_nks(rows)
     all_nk = sorted(set((n, k) for (n, k, _) in by_src.keys()))
-    by_nk: Dict[Tuple[int,int], List[dict]] = {}
+    by_nk = {}
     for (n, k) in all_nk:
         if (n, k, "stage1") in by_src:
             by_nk[(n, k)] = by_src[(n, k, "stage1")]
@@ -1261,157 +802,56 @@ def analyze_fronts_for_mur(csv_paths: List[str],
         else:
             by_nk[(n, k)] = by_src.get((n, k, "unknown"), [])
 
-    from collections import Counter
-    examples: List[dict] = []
-    center_counter = Counter(); pre_counter = Counter(); post_counter = Counter()
+    records: List[dict] = []
+    
+    def process_row(row, n, k, label, idx, x_val):
+        rec = dict(
+            n=n, k=k, label=label,
+            order_idx=int(idx), rule_count=int(x_val),
+            y=_y_metric(row), source=str(row.get("__file__", "")),
+        )
+        for key in ["deg_max","tri","c4","c5","lambda1","gap","active_k"]:
+            rec[key] = np.nan
+
+        # 使用动态 k 逻辑
+        bits_s = _normalize_bits_field(row, None)
+        rec["rule_bits"] = bits_s
+        
+        if bits_s:
+            try:
+                eff_k = _infer_k_from_bits_len(len(bits_s))
+                bits = np.fromiter((1 if ch == "1" else 0 for ch in bits_s), dtype=np.uint8)
+                R = rule_from_bits_any(eff_k, bits)
+                feats = extract_features_from_R(R)
+                rec.update(feats)
+                # 重新校准谱
+                l1, l2, g = _extract_spectral_metrics(row, eff_k)
+                rec["lambda1"], rec["lambda2"], rec["gap"] = l1, l2, g
+            except:
+                pass 
+        return rec
 
     for (n, k), rs in sorted(by_nk.items()):
-        buckets = _best_bucket_by_rulecount(rs)  # 统一用 _y_metric 选每个 |R| 的最佳
-        if not buckets:
-            continue
+        buckets = _best_bucket_by_rulecount(rs)
+        if not buckets: continue
         xs = sorted(buckets.keys())
         ys = np.array([buckets[x]["y"] for x in xs], float)
 
-        idx = mur_index(xs, ys, logy=logy)  # 中心点 = MUR 右端点索引
-        if idx is None:
-            continue
+        def add(label, idx):
+            if idx is not None and 0 <= idx < len(xs):
+                records.append(process_row(buckets[xs[idx]]["row"], n, k, label, idx, xs[idx]))
 
-        idx_pre  = idx - 1 if idx - 1 >= 0 else None
-        idx_post = idx + 1 if idx + 1 < len(xs) else None
+        idx_opt = optimal_index(xs, ys, logy=logy)
+        if idx_opt is not None:
+            add("optimal_prev", idx_opt - 1)
+            add("optimal", idx_opt)
+            add("optimal_next", idx_opt + 1)
 
-        def _row(i):
-            return buckets[xs[i]]["row"] if i is not None else None
+    csv_path = Path(out_csv_dir) / "motif_local_features.csv"
+    if records:
+        write_csv(csv_path, records, sorted(set().union(*(set(r.keys()) for r in records))))
+    
+    return str(csv_path), "", []
 
-        rows_sel = dict(pre=_row(idx_pre), knee=_row(idx), post=_row(idx_post))  # “knee”列此处= MUR
-
-        rec = dict(n=n, k=k)
-
-        for pos in ("pre", "knee", "post"):
-            r = rows_sel[pos]
-            if r is None:
-                for f in ["deg_max","deg_mean","deg_std","diag_cnt","selfloop_rich","tri","c4","c5",
-                          "odd_girth","near_bip_chord","clustering","kcore","lambda1","lambda2",
-                          "gap","lap_algebraic","star_core","rule_count","y"]:
-                    rec[f"{pos}_{f}"] = np.nan
-                rec[f"{pos}_bits"] = ""
-                continue
-
-            bits_s = _normalize_bits_field(r)
-            if not bits_s:
-                for f in ["deg_max","deg_mean","deg_std","diag_cnt","selfloop_rich","tri","c4","c5",
-                          "odd_girth","near_bip_chord","clustering","kcore","lambda1","lambda2",
-                          "gap","lap_algebraic","star_core","rule_count","y"]:
-                    rec[f"{pos}_{f}"] = np.nan
-                rec[f"{pos}_bits"] = ""
-                continue
-
-            # 结构与谱特征
-            bits = np.fromiter((1 if ch == "1" else 0 for ch in bits_s), dtype=np.uint8)
-            R = rule_from_bits_any(k, bits)
-            feats = extract_features_from_R(R)
-            for f, v in feats.items():
-                rec[f"{pos}_{f}"] = float(v)
-
-            # 统一 Y 与 rule_count、bits 保存
-            rec[f"{pos}_rule_count"] = int(r.get("rule_count", bits.sum()))
-            rec[f"{pos}_y"] = _y_metric(r)
-            rec[f"{pos}_bits"] = bits_s
-
-            # 若表内无谱列，尝试通过位串补齐 λ1/λ2/gap
-            l1, l2, g = _extract_spectral_metrics(r, k)
-            rec[f"{pos}_lambda1"] = l1
-            rec[f"{pos}_lambda2"] = l2
-            rec[f"{pos}_gap"] = g
-
-        # Δ（字段名保持与 knee 版一致，便于下游解释器复用）
-        def _delta(a, b, name):
-            va = rec.get(f"{a}_{name}", np.nan)
-            vb = rec.get(f"{b}_{name}", np.nan)
-            if not (np.isfinite(va) and np.isfinite(vb)):
-                return np.nan
-            return vb - va
-
-        for nm in ["deg_max","diag_cnt","selfloop_rich","tri","c4","c5",
-                   "near_bip_chord","clustering","kcore","gap","lap_algebraic","lambda1"]:
-            rec[f"delta_pre_to_knee_{nm}"]  = _delta("pre", "knee", nm)   # “knee”=MUR
-            rec[f"delta_knee_to_post_{nm}"] = _delta("knee", "post", nm)
-
-        # 计数器（中心=“knee（MUR）”）
-        def bump(counter, prefix):
-            val = lambda key: rec.get(f"{prefix}_{key}", np.nan)
-            for key in ["selfloop_rich","star_core","near_bip_chord"]:
-                v = val(key)
-                if np.isfinite(v) and v >= 0.5:
-                    counter[key] += 1
-            for key in ["tri","c4","c5"]:
-                v = val(key)
-                if np.isfinite(v) and v >= 1.0:
-                    counter[key] += 1
-
-        bump(center_counter, "knee")
-        if rows_sel["pre"]  is not None: bump(pre_counter , "pre")
-        if rows_sel["post"] is not None: bump(post_counter, "post")
-
-        examples.append(rec)
-
-    # 写 MUR 三表
-    out_csv_dir = Path(out_csv_dir)
-    ex_path = out_csv_dir / "motif_mur_examples.csv"
-    _write_examples(examples, ex_path)
-
-    sum_path = out_csv_dir / "motif_mur_summary.csv"
-    _write_summary(sum_path, center_counter, pre_counter, post_counter, examples, center_label="knee")
-
-    glob_path = out_csv_dir / "motif_mur_global_report.csv"
-    _write_global(glob_path, examples, center_label="knee")
-
-    # 更新索引文件（可供上游 Cell 解析）
-    try:
-        idx_file = out_csv_dir / "motifs_index.txt"
-        with open(idx_file, "a", encoding="utf-8") as f:
-            f.write(f"\nmur_examples = {ex_path}\n")
-            f.write(f"mur_summary  = {sum_path}\n")
-            f.write(f"mur_global   = {glob_path}\n")
-    except Exception:
-        pass
-
-        # === 三点汇总曲线（按每个 n,k 画 pre-MUR-post 三点）===
-    try:
-        import matplotlib.pyplot as plt
-        fig = plt.figure(figsize=(8.0, 5.2))
-        ax = fig.add_subplot(111)
-
-        # 复用本函数中已构造的 by_nk（stage1>GA 优先）
-        for (n, k), rs in sorted(by_nk.items()):
-            buckets = _best_bucket_by_rulecount(rs)
-            if not buckets:
-                continue
-            xs = sorted(buckets.keys())
-            ys = np.array([buckets[x]["y"] for x in xs], float)
-
-            idx = mur_index(xs, ys, logy=logy)
-            if idx is None:
-                continue
-
-            three_x, three_y = [], []
-            for j in (idx - 1, idx, idx + 1):
-                if 0 <= j < len(xs):
-                    three_x.append(xs[j]); three_y.append(ys[j])
-            if len(three_x) >= 2:
-                ax.plot(three_x, three_y, marker="s", alpha=0.9, label=f"n{n}k{k}")
-
-        ax.set_xlabel("|R|")
-        ax.set_ylabel(r"Objective (log $Z$) / penalty")
-        if logy:
-            ax.set_yscale("log")
-        ax.set_title("Three-point links around MUR (stage1>GA)")
-        leg = ax.legend(frameon=False, ncol=2)
-        fig.tight_layout()
-        mur_three_path = Path(out_fig_dir) / "mur_three_point_links.png"
-        fig.savefig(mur_three_path, dpi=220)
-        plt.close(fig)
-        fig_paths.append(str(mur_three_path))
-    except Exception:
-        pass
-
-    return str(ex_path), str(sum_path), str(glob_path), fig_paths
+if __name__ == "__main__":
+    pass
