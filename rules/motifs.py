@@ -112,6 +112,51 @@ def mur_index(xs, ys, logy=True)->Optional[int]:
     j = int(np.argmax(slope))
     return j + 1
 
+def optimal_index(xs, ys, logy: bool = True) -> int:
+    """
+    Select an “optimal” point balancing gain and cost.
+    Baseline = global max; allow knee/MUR (and MUR+1) to replace max
+    if the remaining gain to max has a shallow slope compared to the
+    candidate’s own efficiency.
+    """
+    xs = np.asarray(xs, float); ys = np.asarray(ys, float)
+    m = np.isfinite(xs) & np.isfinite(ys)
+    if not m.any():
+        return 0
+    xs = xs[m]; ys = ys[m]
+    Y = np.log(np.maximum(ys, 1e-300)) if logy else ys
+    try:
+        i_max = int(np.nanargmax(Y))
+    except Exception:
+        return 0
+    best_idx = i_max
+
+    i_knee = robust_knee(xs, ys, logy=logy)
+    i_mur = mur_index(xs, ys, logy=logy)
+
+    cand_set = set()
+    if i_knee is not None:
+        cand_set.add(i_knee)
+    if i_mur is not None:
+        cand_set.add(i_mur)
+        if i_mur + 1 < len(xs):
+            cand_set.add(i_mur + 1)
+
+    def _qualifies(idx: int) -> bool:
+        if idx == i_max:
+            return False
+        dx = max(xs[i_max] - xs[idx], 1e-12)
+        slope_to_max = (Y[i_max] - Y[idx]) / dx
+        slope_from_origin = Y[idx] / max(xs[idx], 1e-12)
+        return slope_to_max <= 0.1 * slope_from_origin
+
+    qualified = [i for i in cand_set if 0 <= i < len(xs) and _qualifies(i)]
+    if qualified:
+        qualified.sort(key=lambda i: (Y[i], xs[i]), reverse=True)
+        best_idx = qualified[0]
+
+    return int(best_idx)
+
 # =========================================
 # Structural feature extractors
 # =========================================
@@ -465,9 +510,19 @@ def _write_summary(sum_path: Path,
         or_pre  = ((cn+0.5)/(total_center+1)) / (((pr+0.5)/(total_pre+1)) if total_pre>0 else 1.0)
         or_post = ((cn+0.5)/(total_center+1)) / (((po+0.5)/(total_post+1)) if total_post>0 else 1.0)
         summ_rows.append(dict(feature=feat,
-                              knee_count=cn, knee_total=total_center, knee_ratio=cn_p,
-                              pre_count=pr, pre_total=total_pre, pre_ratio=pr_p, OR_knee_vs_pre=or_pre,
-                              post_count=po, post_total=total_post, post_ratio=po_p, OR_knee_vs_post=or_post))
+                              **{
+                                  f"{center_label}_count": cn,
+                                  f"{center_label}_total": total_center,
+                                  f"{center_label}_ratio": cn_p,
+                                  "pre_count": pr,
+                                  "pre_total": total_pre,
+                                  "pre_ratio": pr_p,
+                                  f"OR_{center_label}_vs_pre": or_pre,
+                                  "post_count": po,
+                                  "post_total": total_post,
+                                  "post_ratio": po_p,
+                                  f"OR_{center_label}_vs_post": or_post,
+                              }))
     sum_path.parent.mkdir(parents=True, exist_ok=True)
     if summ_rows:
         with open(sum_path, "w", newline="", encoding="utf-8") as f:
@@ -475,7 +530,7 @@ def _write_summary(sum_path: Path,
             w.writeheader(); w.writerows(summ_rows)
     else:
         with open(sum_path, "w", encoding="utf-8") as f:
-            f.write("feature,knee_count,knee_total,knee_ratio,pre_count,pre_total,pre_ratio,OR_knee_vs_pre,post_count,post_total,post_ratio,OR_knee_vs_post\n")
+            f.write(f"feature,{center_label}_count,{center_label}_total,{center_label}_ratio,pre_count,pre_total,pre_ratio,OR_{center_label}_vs_pre,post_count,post_total,post_ratio,OR_{center_label}_vs_post\n")
 
 def _write_global(glob_path: Path, examples: List[dict], center_label: str = "knee") -> None:
     def agg(vals):
@@ -511,6 +566,8 @@ def _label_group(label: str) -> str:
         return "knee"
     if label.startswith("mur"):
         return "mur"
+    if label.startswith("optimal"):
+        return "optimal"
     if "ymax" in label:
         return "ymax"
     if "ymin" in label:
@@ -770,6 +827,7 @@ def analyze_fronts_for_knees(csv_paths: List[str],
     apply_style(style)
     out_csv_dir = ensure_dir(out_csv_dir)
     out_fig_dir = ensure_dir(out_fig_dir)
+    fig_paths: List[str] = []
 
     rows = load_csv_rows(csv_paths)
     if not rows:
@@ -910,8 +968,10 @@ def analyze_fronts_for_knees(csv_paths: List[str],
             plt.title("Knee-driving motif prevalence")
             plt.legend(frameon=False)
             plt.tight_layout()
-            plt.savefig(out_fig_dir / "knee_motif_bar.png", dpi=200)
+            bar_path = Path(out_fig_dir) / "knee_motif_bar.png"
+            plt.savefig(bar_path, dpi=200)
             plt.close()
+            fig_paths.append(str(bar_path))
     except Exception:
         pass
 
@@ -941,19 +1001,224 @@ def analyze_fronts_for_knees(csv_paths: List[str],
                 ax.plot(three_x, three_y, marker="o", alpha=0.9, label=f"n{n}k{k}")
 
         ax.set_xlabel("|R|")
-        ax.set_ylabel("Y (Z or its estimate)")
-        ax.set_yscale("log")
+        ax.set_ylabel(r"Objective (log $Z$) / penalty")
+        if logy:
+            ax.set_yscale("log")
         ax.set_title("Three-point links around knee (stage1>GA)")
         # 图例多时自动分列
         leg = ax.legend(frameon=False, ncol=2)
         fig.tight_layout()
-        fig.savefig(Path(out_fig_dir) / "knee_three_point_links.png", dpi=220)
+        knee_three_path = Path(out_fig_dir) / "knee_three_point_links.png"
+        fig.savefig(knee_three_path, dpi=220)
         plt.close(fig)
+        fig_paths.append(str(knee_three_path))
     except Exception as e:
         # 不阻塞主流程
         pass
 
-    return str(ex_path), str(sum_path), str(glob_path), []
+    return str(ex_path), str(sum_path), str(glob_path), fig_paths
+
+# =========================================
+# Main: Optimal-point analysis (max vs knee/MUR efficiency)
+# =========================================
+def analyze_fronts_for_optimal(csv_paths: List[str],
+                               out_csv_dir: str = "./results/motifs",
+                               out_fig_dir: str = "./out_fig",
+                               style: str = "default",
+                               logy: bool = True):
+    """Identify an optimal point that trades off max gain and cost via knee/MUR efficiency."""
+    apply_style(style)
+    out_csv_dir = ensure_dir(out_csv_dir)
+    out_fig_dir = ensure_dir(out_fig_dir)
+    fig_paths: List[str] = []
+
+    rows = load_csv_rows(csv_paths)
+    if not rows:
+        raise FileNotFoundError("[motifs] No rows loaded from CSV inputs.")
+
+    # -------- 优先级：stage1(canon) > GA --------
+    by_src = _group_by_nks(rows)
+    all_nk = sorted(set((n, k) for (n, k, _) in by_src.keys()))
+    by_nk = {}
+    for (n, k) in all_nk:
+        if (n, k, "stage1") in by_src:
+            by_nk[(n, k)] = by_src[(n, k, "stage1")]
+        elif (n, k, "ga") in by_src:
+            by_nk[(n, k)] = by_src[(n, k, "ga")]
+        else:
+            by_nk[(n, k)] = by_src.get((n, k, "unknown"), [])
+
+    examples: List[dict] = []
+    from collections import Counter
+    optimal_feat_counter = Counter(); pre_feat_counter = Counter(); post_feat_counter = Counter()
+
+    center_label = "optimal"
+
+    for (n, k), rs in sorted(by_nk.items()):
+        buckets = _best_bucket_by_rulecount(rs)
+        if not buckets:
+            continue
+        xs = sorted(buckets.keys())
+        ys = np.array([buckets[x]["y"] for x in xs], float)
+
+        idx_opt = optimal_index(xs, ys, logy=logy)
+        if idx_opt is None:
+            continue
+
+        idx_pre = idx_opt - 1 if idx_opt - 1 >= 0 else None
+        idx_post = idx_opt + 1 if idx_opt + 1 < len(xs) else None
+
+        def row_of(idx): return buckets[xs[idx]]["row"] if idx is not None else None
+        rows_sel = dict(pre=row_of(idx_pre), optimal=row_of(idx_opt), post=row_of(idx_post))
+
+        record = dict(n=n, k=k)
+        for pos in ("pre", center_label, "post"):
+            r = rows_sel[pos]
+            if r is None:
+                for f in ["deg_max","deg_mean","deg_std","diag_cnt","selfloop_rich",
+                          "tri","c4","c5","odd_girth","near_bip_chord","clustering",
+                          "kcore","lambda1","lambda2","gap","lap_algebraic","star_core",
+                          "rule_count","y"]:
+                    record[f"{pos}_{f}"] = np.nan
+                record[f"{pos}_bits"] = ""
+                continue
+
+            bits_s = _normalize_bits_field(r)
+            if not bits_s:
+                for f in ["deg_max","deg_mean","deg_std","diag_cnt","selfloop_rich",
+                          "tri","c4","c5","odd_girth","near_bip_chord","clustering",
+                          "kcore","lambda1","lambda2","gap","lap_algebraic","star_core",
+                          "rule_count","y"]:
+                    record[f"{pos}_{f}"] = np.nan
+                record[f"{pos}_bits"] = ""
+                continue
+
+            bits = np.fromiter((1 if ch == "1" else 0 for ch in bits_s), dtype=np.uint8)
+            R = rule_from_bits_any(k, bits)
+            feats = extract_features_from_R(R)
+            for f, v in feats.items():
+                record[f"{pos}_{f}"] = v
+            record[f"{pos}_bits"] = bits_s
+            record[f"{pos}_rule_count"] = int(r.get("rule_count", bits.sum()))
+            record[f"{pos}_y"] = _y_metric(r)
+
+            l1, l2, g = _extract_spectral_metrics(r, k)
+            record[f"{pos}_lambda1"] = l1
+            record[f"{pos}_lambda2"] = l2
+            record[f"{pos}_gap"] = g
+
+            if pos == center_label:
+                edges = edge_criticality_scores(R)[:min(8, k*(k-1)//2)]
+                record[f"{center_label}_key_edges"] = ";".join([f"{e[0]}|{e[1]:.2f}|tri{e[2]['tri']}" for e in edges])
+
+        # 计算 Δ
+        def delta(a, b, name):
+            va = record.get(f"{a}_{name}", np.nan)
+            vb = record.get(f"{b}_{name}", np.nan)
+            if not (np.isfinite(va) and np.isfinite(vb)):
+                return np.nan
+            return vb - va
+
+        for nm in ["deg_max","diag_cnt","selfloop_rich","tri","c4","c5",
+                   "near_bip_chord","clustering","kcore","gap","lap_algebraic","lambda1"]:
+            record[f"delta_pre_to_{center_label}_{nm}"] = delta("pre", center_label, nm)
+            record[f"delta_{center_label}_to_post_{nm}"] = delta(center_label, "post", nm)
+
+        # 统计计数器
+        def bump(counter, prefix):
+            val = lambda key: record.get(f"{prefix}_{key}", np.nan)
+            for key in ["selfloop_rich","star_core","near_bip_chord"]:
+                v = val(key)
+                if np.isfinite(v) and v >= 0.5:
+                    counter[key] += 1
+            for key in ["tri","c4","c5"]:
+                v = val(key)
+                if np.isfinite(v) and v >= 1.0:
+                    counter[key] += 1
+
+        bump(optimal_feat_counter, center_label)
+        if rows_sel["pre"] is not None: bump(pre_feat_counter, "pre")
+        if rows_sel["post"] is not None: bump(post_feat_counter, "post")
+        examples.append(record)
+
+    # 输出表格
+    out_csv_dir = Path(out_csv_dir)
+    ex_path = out_csv_dir / "motif_optimal_examples.csv"
+    _write_examples(examples, ex_path)
+    sum_path = out_csv_dir / "motif_optimal_summary.csv"
+    _write_summary(sum_path, optimal_feat_counter, pre_feat_counter, post_feat_counter, examples, center_label=center_label)
+    glob_path = out_csv_dir / "motif_optimal_global_report.csv"
+    _write_global(glob_path, examples, center_label=center_label)
+
+    # 可视化部分保持原逻辑
+    try:
+        import matplotlib.pyplot as plt
+        with open(sum_path, "r", encoding="utf-8") as f:
+            rd = csv.DictReader(f)
+            summ_rows = list(rd)
+        labels = [r["feature"] for r in summ_rows] if summ_rows else []
+        if labels:
+            opt_ratio = [float(r.get(f"{center_label}_ratio", 0.0)) for r in summ_rows]
+            pre_ratio  = [float(r["pre_ratio"]) for r in summ_rows]
+            post_ratio = [float(r["post_ratio"]) for r in summ_rows]
+            x = np.arange(len(labels))
+            plt.figure(figsize=(8.8,5.2))
+            width=0.28
+            plt.bar(x- width, pre_ratio, width, label="pre")
+            plt.bar(x, opt_ratio, width, label=center_label)
+            plt.bar(x+ width, post_ratio, width, label="post")
+            plt.xticks(x, labels, rotation=15)
+            plt.ylabel("ratio")
+            plt.title("Optimal-driving motif prevalence")
+            plt.legend(frameon=False)
+            plt.tight_layout()
+            bar_path = Path(out_fig_dir) / "optimal_motif_bar.png"
+            plt.savefig(bar_path, dpi=200)
+            plt.close()
+            fig_paths.append(str(bar_path))
+    except Exception:
+        pass
+
+        # === 三点汇总曲线（按每个 n,k 画 pre-optimal-post 三点）===
+    try:
+        import matplotlib.pyplot as plt
+        fig = plt.figure(figsize=(8.0, 5.2))
+        ax = fig.add_subplot(111)
+
+        for (n, k), rs in sorted(by_nk.items()):
+            buckets = _best_bucket_by_rulecount(rs)
+            if not buckets:
+                continue
+            xs = sorted(buckets.keys())
+            ys = np.array([buckets[x]["y"] for x in xs], float)
+
+            idx = optimal_index(xs, ys, logy=logy)
+            if idx is None:
+                continue
+
+            three_x, three_y = [], []
+            for j in (idx - 1, idx, idx + 1):
+                if 0 <= j < len(xs):
+                    three_x.append(xs[j]); three_y.append(ys[j])
+            if len(three_x) >= 2:
+                ax.plot(three_x, three_y, marker="D", alpha=0.9, label=f"n{n}k{k}")
+
+        ax.set_xlabel("|R|")
+        ax.set_ylabel(r"Objective (log $Z$) / penalty")
+        if logy:
+            ax.set_yscale("log")
+        ax.set_title("Three-point links around optimal (stage1>GA)")
+        leg = ax.legend(frameon=False, ncol=2)
+        fig.tight_layout()
+        optimal_three_path = Path(out_fig_dir) / "optimal_three_point_links.png"
+        fig.savefig(optimal_three_path, dpi=220)
+        plt.close(fig)
+        fig_paths.append(str(optimal_three_path))
+    except Exception as e:
+        # 不阻塞主流程
+        pass
+
+    return str(ex_path), str(sum_path), str(glob_path), fig_paths
 
 # =========================================
 # Main: MUR analysis (examples/summary/global; figs optional)
@@ -978,6 +1243,7 @@ def analyze_fronts_for_mur(csv_paths: List[str],
     apply_style(style)
     out_csv_dir = ensure_dir(out_csv_dir)
     out_fig_dir = ensure_dir(out_fig_dir)
+    fig_paths: List[str] = []
 
     rows = load_csv_rows(csv_paths)
     if not rows:
@@ -1135,14 +1401,17 @@ def analyze_fronts_for_mur(csv_paths: List[str],
                 ax.plot(three_x, three_y, marker="s", alpha=0.9, label=f"n{n}k{k}")
 
         ax.set_xlabel("|R|")
-        ax.set_ylabel("Y (Z or its estimate)")
-        ax.set_yscale("log")
+        ax.set_ylabel(r"Objective (log $Z$) / penalty")
+        if logy:
+            ax.set_yscale("log")
         ax.set_title("Three-point links around MUR (stage1>GA)")
         leg = ax.legend(frameon=False, ncol=2)
         fig.tight_layout()
-        fig.savefig(Path(out_fig_dir) / "mur_three_point_links.png", dpi=220)
+        mur_three_path = Path(out_fig_dir) / "mur_three_point_links.png"
+        fig.savefig(mur_three_path, dpi=220)
         plt.close(fig)
+        fig_paths.append(str(mur_three_path))
     except Exception:
         pass
 
-    return str(ex_path), str(sum_path), str(glob_path), []
+    return str(ex_path), str(sum_path), str(glob_path), fig_paths
