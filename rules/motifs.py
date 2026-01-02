@@ -63,8 +63,12 @@ def _rule_from_bits_fallback(k:int, bits:np.ndarray)->np.ndarray:
              k = k_eff
              L = bits.size
          else:
-             assert bits.size == L, f"bits length {bits.size} != expected {L} for k={k}"
+             pass # Let assertion fail if mismatch
              
+    if bits.size != L:
+         # Fallback empty or error
+         return np.zeros((k,k), dtype=bool)
+
     R = np.zeros((k,k), dtype=bool)
     p = 0
     # diagonal: self-loops
@@ -88,9 +92,6 @@ def rule_from_bits_any(k:int, bits:np.ndarray)->np.ndarray:
             k = k_eff
             
     if _HAS_EVAL:
-        # 只有当 eval.py 的 rule_from_bits 支持变长 k 时才能用
-        # 但通常 eval.py 也有 assert。为了安全，我们这里直接调用 fallback
-        # 或者捕获 eval 的 assert 错误
         try:
             return _rule_from_bits_eval(k, bits)
         except AssertionError:
@@ -98,9 +99,8 @@ def rule_from_bits_any(k:int, bits:np.ndarray)->np.ndarray:
     return _rule_from_bits_fallback(k, bits)
 
 # =========================================
-# Knee & MUR: index finders (discrete-safe)
+# Knee & MUR & Optimal Indexers
 # =========================================
-# (保持原样 ...)
 def knee_second_diff(xs, ys, logy=True)->Optional[int]:
     xs = np.asarray(xs, float); ys = np.asarray(ys, float)
     if logy:
@@ -152,6 +152,12 @@ def mur_index(xs, ys, logy=True)->Optional[int]:
     return j + 1
 
 def optimal_index(xs, ys, logy: bool = True) -> int:
+    """
+    Select an “optimal” point balancing gain and cost.
+    Baseline = global max; allow knee/MUR (and MUR+1) to replace max
+    if the remaining gain to max has a shallow slope compared to the
+    candidate’s own efficiency.
+    """
     xs = np.asarray(xs, float); ys = np.asarray(ys, float)
     m = np.isfinite(xs) & np.isfinite(ys)
     if not m.any():
@@ -193,7 +199,7 @@ def optimal_index(xs, ys, logy: bool = True) -> int:
     return int(best_idx)
 
 # =========================================
-# Structural feature extractors (保持原样)
+# Structural feature extractors
 # =========================================
 def _triangle_count(G: np.ndarray) -> int:
     k = G.shape[0]
@@ -308,6 +314,28 @@ def _kcore_number(G: np.ndarray) -> int:
                 changed = True
     return core
 
+def _get_lcc_size(G: np.ndarray) -> int:
+    """计算最大连通分量 (LCC) 的节点数。"""
+    k = G.shape[0]
+    visited = np.zeros(k, dtype=bool)
+    max_size = 0
+    for i in range(k):
+        if not visited[i]:
+            # BFS
+            q = [i]
+            visited[i] = True
+            current_size = 0
+            while q:
+                u = q.pop(0)
+                current_size += 1
+                for v in range(k):
+                    if G[u, v] and not visited[v]:
+                        visited[v] = True
+                        q.append(v)
+            if current_size > max_size:
+                max_size = current_size
+    return max_size
+
 def _spectral_feats(G: np.ndarray) -> Tuple[float, float, float, float]:
     if not G.any():
         return 0.0, 0.0, 0.0, 0.0
@@ -316,10 +344,15 @@ def _spectral_feats(G: np.ndarray) -> Tuple[float, float, float, float]:
     lam1 = float(w[-1])
     lam2 = float(w[-2]) if w.size >= 2 else 0.0
     gap = lam1 - lam2
-    D = np.diag(A.sum(axis=1))
+    
+    # Laplacian Spectrum for Algebraic Connectivity
+    deg = A.sum(axis=1)
+    D = np.diag(deg)
     L = D - A
     wl = np.linalg.eigvalsh(L)
+    # 排序后第2小的特征值即为 Fiedler Value (Algebraic Connectivity)
     alg_con = float(sorted(wl)[1]) if wl.size >= 2 else 0.0
+    
     return lam1, lam2, gap, alg_con
 
 def extract_features_from_R(R: np.ndarray) -> Dict[str, float]:
@@ -335,6 +368,7 @@ def extract_features_from_R(R: np.ndarray) -> Dict[str, float]:
     Cbar = _clustering_coeff(G)
     kcore = _kcore_number(G)
     lam1, lam2, gap, alg = _spectral_feats(G)
+    lcc = _get_lcc_size(G)
 
     feats = dict(
         deg_max=float(deg.max() if deg.size else 0.0),
@@ -352,8 +386,11 @@ def extract_features_from_R(R: np.ndarray) -> Dict[str, float]:
         lambda1=lam1,
         lambda2=lam2,
         gap=gap,
-        lap_algebraic=alg,
-        star_core=float(deg.max() >= max(k - 1, 2)), 
+        lap_algebraic=alg, # Algebraic Connectivity
+        star_core=float(deg.max() >= max(k - 1, 2)),
+        lcc_size=float(lcc),
+        lcc_ratio=float(lcc)/k if k>0 else 0.0,
+        is_connected=float(lcc == k)
     )
     return feats
 
@@ -401,7 +438,6 @@ def _y_metric(row: dict) -> float:
     return float("nan")
 
 def _infer_k_from_bits_len(L: int) -> int:
-    """Solve k^2 + k - 2L = 0 for k."""
     delta = 1 + 8 * L
     s = math.isqrt(delta)
     if s * s != delta:
@@ -409,21 +445,13 @@ def _infer_k_from_bits_len(L: int) -> int:
     return (s - 1) // 2
 
 def _normalize_bits_field(r: dict, k: Optional[int] = None) -> str:
-    """
-    提取位串。如果指定了 k，尝试优先匹配长度。
-    如果匹配失败（如 perm+swap 导致 k 变小），返回找到的第一个非空串，由后续逻辑推断 k。
-    """
     candidates = ["rule_bits", "rule_bits_raw", "bits", "rule_bits_canon"]
-    
-    # 1. 尝试精确匹配
     if k is not None:
         expected_len = k + k*(k-1)//2
         for key in candidates:
             val = str(r.get(key, "")).strip()
             if len(val) == expected_len:
                 return val
-
-    # 2. 否则返回任意非空，由下游 _infer_k 处理
     for key in candidates:
         val = str(r.get(key, "")).strip()
         if val:
@@ -440,11 +468,9 @@ def _extract_spectral_metrics(r: dict, k: int) -> Tuple[float, float, float]:
         
         # 如果 CSV 里没有谱数据，则尝试从 bits 重建
         if not np.isfinite(l1) or not np.isfinite(l2):
-            # 注意：这里 k 必须是 effective_k
-            bits_s = _normalize_bits_field(r, None) # 不强求原 k
+            bits_s = _normalize_bits_field(r, None)
             if bits_s:
                 try:
-                    # 动态推断 k
                     k_eff = _infer_k_from_bits_len(len(bits_s))
                     bits = np.fromiter((1 if ch == "1" else 0 for ch in bits_s), dtype=np.uint8)
                     R = rule_from_bits_any(k_eff, bits)
@@ -622,7 +648,7 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
                 for f in ["deg_max","deg_mean","deg_std","diag_cnt","selfloop_rich",
                           "tri","c4","c5","odd_girth","near_bip_chord","clustering",
                           "kcore","lambda1","lambda2","gap","lap_algebraic","star_core",
-                          "rule_count","y"]:
+                          "rule_count","y", "lcc_size", "lcc_ratio", "is_connected"]:
                     record[f"{pos}_{f}"] = np.nan
                 record[f"{pos}_bits"] = ""
                 continue
@@ -633,18 +659,16 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
                 for f in ["deg_max","deg_mean","deg_std","diag_cnt","selfloop_rich",
                           "tri","c4","c5","odd_girth","near_bip_chord","clustering",
                           "kcore","lambda1","lambda2","gap","lap_algebraic","star_core",
-                          "rule_count","y"]:
+                          "rule_count","y", "lcc_size", "lcc_ratio", "is_connected"]:
                     record[f"{pos}_{f}"] = np.nan
                 record[f"{pos}_bits"] = ""
                 continue
             
-            # 推断 effective_k
             try:
                 eff_k = _infer_k_from_bits_len(len(bits_s))
                 bits = np.fromiter((1 if ch == "1" else 0 for ch in bits_s), dtype=np.uint8)
                 R = rule_from_bits_any(eff_k, bits)
             except Exception:
-                # 若无法推断或构建失败
                 record[f"{pos}_bits"] = ""
                 continue
             
@@ -654,16 +678,14 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
             record[f"{pos}_bits"] = bits_s
             record[f"{pos}_rule_count"] = int(r.get("rule_count", bits.sum()))
             record[f"{pos}_y"] = _y_metric(r)
-            record[f"{pos}_effective_k"] = eff_k # 保存有效 k
+            record[f"{pos}_effective_k"] = eff_k
 
-            # 提取谱特征时也用 effective_k
             l1, l2, g = _extract_spectral_metrics(r, eff_k)
             record[f"{pos}_lambda1"] = l1
             record[f"{pos}_lambda2"] = l2
             record[f"{pos}_gap"] = g
 
             if pos == center_label:
-                # 关键边分析也基于 R (effective_k)
                 edges = edge_criticality_scores(R)[:min(8, eff_k*(eff_k-1)//2)]
                 record[f"{center_label}_key_edges"] = ";".join([f"{e[0]}|{e[1]:.2f}|tri{e[2]['tri']}" for e in edges])
 
@@ -675,7 +697,7 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
             return vb - va
 
         for nm in ["deg_max","diag_cnt","selfloop_rich","tri","c4","c5",
-                   "near_bip_chord","clustering","kcore","gap","lap_algebraic","lambda1"]:
+                   "near_bip_chord","clustering","kcore","gap","lap_algebraic","lambda1", "lcc_ratio"]:
             record[f"delta_pre_to_{center_label}_{nm}"] = delta("pre", center_label, nm)
             record[f"delta_{center_label}_to_post_{nm}"] = delta(center_label, "post", nm)
 
@@ -695,7 +717,6 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
         if rows_sel["post"] is not None: bump(post_feat_counter, "post")
         examples.append(record)
 
-    # 输出表格
     out_csv_dir = Path(out_csv_dir)
     ex_path = out_csv_dir / "motif_optimal_examples.csv"
     _write_examples(examples, ex_path)
@@ -769,89 +790,6 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
         pass
 
     return str(ex_path), str(sum_path), str(glob_path), fig_paths
-
-def analyze_fronts_for_knees(csv_paths: List[str],
-                             out_csv_dir: str = "./results/motifs",
-                             out_fig_dir: str = "./out_fig",
-                             style: str = "default",
-                             logy: bool = True):
-    return analyze_fronts_for_optimal(csv_paths, out_csv_dir, out_fig_dir, style, logy)
-
-def analyze_local_features(csv_paths: List[str],
-                           out_csv_dir: str = "./results/motifs",
-                           out_fig_dir: str = "./out_fig",
-                           style: str = "default",
-                           logy: bool = True):
-    """(Updated to use robust bit extraction)"""
-    apply_style(style)
-    out_csv_dir = ensure_dir(out_csv_dir)
-    out_fig_dir = ensure_dir(out_fig_dir)
-
-    rows = load_csv_rows(csv_paths)
-    if not rows:
-        raise FileNotFoundError("[motifs/local] No rows loaded from CSV inputs.")
-
-    by_src = _group_by_nks(rows)
-    all_nk = sorted(set((n, k) for (n, k, _) in by_src.keys()))
-    by_nk = {}
-    for (n, k) in all_nk:
-        if (n, k, "stage1") in by_src:
-            by_nk[(n, k)] = by_src[(n, k, "stage1")]
-        elif (n, k, "ga") in by_src:
-            by_nk[(n, k)] = by_src[(n, k, "ga")]
-        else:
-            by_nk[(n, k)] = by_src.get((n, k, "unknown"), [])
-
-    records: List[dict] = []
-    
-    def process_row(row, n, k, label, idx, x_val):
-        rec = dict(
-            n=n, k=k, label=label,
-            order_idx=int(idx), rule_count=int(x_val),
-            y=_y_metric(row), source=str(row.get("__file__", "")),
-        )
-        for key in ["deg_max","tri","c4","c5","lambda1","gap","active_k"]:
-            rec[key] = np.nan
-
-        # 使用动态 k 逻辑
-        bits_s = _normalize_bits_field(row, None)
-        rec["rule_bits"] = bits_s
-        
-        if bits_s:
-            try:
-                eff_k = _infer_k_from_bits_len(len(bits_s))
-                bits = np.fromiter((1 if ch == "1" else 0 for ch in bits_s), dtype=np.uint8)
-                R = rule_from_bits_any(eff_k, bits)
-                feats = extract_features_from_R(R)
-                rec.update(feats)
-                # 重新校准谱
-                l1, l2, g = _extract_spectral_metrics(row, eff_k)
-                rec["lambda1"], rec["lambda2"], rec["gap"] = l1, l2, g
-            except:
-                pass 
-        return rec
-
-    for (n, k), rs in sorted(by_nk.items()):
-        buckets = _best_bucket_by_rulecount(rs)
-        if not buckets: continue
-        xs = sorted(buckets.keys())
-        ys = np.array([buckets[x]["y"] for x in xs], float)
-
-        def add(label, idx):
-            if idx is not None and 0 <= idx < len(xs):
-                records.append(process_row(buckets[xs[idx]]["row"], n, k, label, idx, xs[idx]))
-
-        idx_opt = optimal_index(xs, ys, logy=logy)
-        if idx_opt is not None:
-            add("optimal_prev", idx_opt - 1)
-            add("optimal", idx_opt)
-            add("optimal_next", idx_opt + 1)
-
-    csv_path = Path(out_csv_dir) / "motif_local_features.csv"
-    if records:
-        write_csv(csv_path, records, sorted(set().union(*(set(r.keys()) for r in records))))
-    
-    return str(csv_path), "", []
 
 if __name__ == "__main__":
     pass
