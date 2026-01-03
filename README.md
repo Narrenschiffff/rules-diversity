@@ -54,6 +54,7 @@
 | 谱估计开关 | `--spectral / --no-spectral` | `use_spectral` | 启用/关闭 Hutch/Hutch++ 迹估计与 Lanczos 顶值估计。 |
 | 阈值联动 | `--exact-rows-cap` | `exact_rows_cap` | 行数超过阈值即跳过精确计算，以谱估计为主。 |
 | 缓存 | `--cache-dir / --no-cache` | `cache_dir` | 规则位串 + 有效状态数 + 边界 + 对称模式 + `n` 共同构成缓存键；命中后直接复用计算结果。若早期缓存缺少 archetype 字段，可用 `--refresh-cache` 触发重算并补写。 |
+| rule_count 覆盖 | `--strict-rulecount-cover / --no-strict-rulecount-cover` | `strict_rulecount_cover` | 默认开启：每代前沿输出会为每个 `|R|≤L`（可用 `rulecount_cover_max` 上限截断）补齐至少一条 `is_front0=1` 记录；关闭可提高搜索效率但可能出现缺失桶。 |
 | 设备选择 | `--device cpu|cuda` | `device` | `rules.eval.TransferOp` 支持 CPU/GPU，默认自动检测。 |
 
 > 若使用 Python API，可直接向 `evaluate_rules_batch` 传入上述同名参数；`scripts/run_pipeline.py` 将 CLI/配置映射到同一接口。

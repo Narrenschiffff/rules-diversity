@@ -178,6 +178,15 @@ def _pad_to_len(bits: np.ndarray, L: int) -> np.ndarray:
     out[:min(L, bits.size)] = bits[:min(L, bits.size)]
     return out
 
+def _make_bits_for_rule_count(k: int, rule_count: int) -> np.ndarray:
+    """Construct a feasible-looking rule bitstring with exactly the requested rule_count (clamped to bit-length)."""
+    L = _L_from_k(k)
+    rc = max(0, min(rule_count, L))
+    bits = np.zeros(L, dtype=np.uint8)
+    if rc > 0:
+        bits[:rc] = 1
+    return canonical_bits(bits, k)
+
 def _canonical_auto(bits: np.ndarray) -> np.ndarray:
     """Canonicalize using k inferred from bit-length."""
     k_use = _infer_k_from_bits(bits)
@@ -340,6 +349,8 @@ class GAConfig:
                  objective_use_penalty: bool = config.OBJECTIVE_USE_PENALTY,
                  use_penalized_objective: bool = True,
                  penalty_mode: str = config.PENALTY_MODE,
+                 strict_rulecount_cover: bool = True,
+                 rulecount_cover_max: Optional[int] = None,
                  resume: bool = True,
                  seed: Optional[int] = None,
                  log_level: str = "INFO",
@@ -374,6 +385,8 @@ class GAConfig:
         self.objective_use_penalty = objective_use_penalty
         self.use_penalized_objective = use_penalized_objective
         self.penalty_mode = penalty_mode
+        self.strict_rulecount_cover = strict_rulecount_cover
+        self.rulecount_cover_max = rulecount_cover_max
         self.resume = resume
         self.seed = seed
         self.log_level = log_level
@@ -483,6 +496,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
     objective_mode = obj_cfg["objective_mode"]
     objective_use_penalty = obj_cfg["objective_use_penalty"]
     objective_key = obj_cfg["objective_field"]
+    strict_rulecount_cover = _bool_or(getattr(ga_conf, "strict_rulecount_cover", True), True)
+    rulecount_cover_max = getattr(ga_conf, "rulecount_cover_max", None)
 
     if fast_eval or device=="cpu":
         r_vals = min(r_vals, 2); power_iters = min(power_iters, 16); hutch_s = min(hutch_s, 8)
@@ -594,6 +609,11 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
         eval_enable_spectral = enable_spectral
         eval_enable_exact = enable_exact
         eval_refresh_cache = _bool_or(getattr(ga_conf, "refresh_cache", False), False)
+        L_bits = _L_from_k(k)
+        cover_targets = []
+        if strict_rulecount_cover:
+            cover_upper = L_bits if rulecount_cover_max is None else min(L_bits, int(rulecount_cover_max))
+            cover_targets = list(range(0, cover_upper + 1))
 
         if boundary_mode == "open" and not open_path_logged:
             logger.info(
@@ -809,12 +829,62 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
                 cache[key] = fit_norm; results[pos] = fit_norm
         results = [_normalize_fit_fields(r) for r in results]
 
+        coverage_rows: List[Tuple[np.ndarray, Dict]] = []
+        if strict_rulecount_cover and cover_targets:
+            observed_rc = set()
+            for ft in results:
+                try:
+                    observed_rc.add(int(ft.get("rule_count", -1)))
+                except Exception:
+                    continue
+            missing_rc = [rc for rc in cover_targets if rc not in observed_rc]
+            if missing_rc:
+                cover_bits = [_make_bits_for_rule_count(k, rc) for rc in missing_rc]
+                try:
+                    cover_fits = evaluate_rules_batch(
+                        n, k, cover_bits,
+                        sym_mode=sym_mode,
+                        boundary=eval_boundary,
+                        device=eval_device, use_lanczos=use_lanczos,
+                        r_vals=r_vals, power_iters=power_iters,
+                        trace_mode=trace_mode, hutch_s=hutch_s,
+                        lru_rows=rows_lru, max_streams=max_streams,
+                        enable_exact=eval_enable_exact,
+                        enable_spectral=eval_enable_spectral,
+                        exact_threshold=exact_threshold,
+                        objective_mode=objective_mode,
+                        penalty_mode=penalty_mode,
+                        use_penalty=objective_use_penalty,
+                        cache_dir=str(cache_dir),
+                        use_cache=use_cache,
+                        refresh_cache=eval_refresh_cache)
+                except Exception:
+                    cover_fits = evaluate_rules_batch(
+                        n, k, cover_bits,
+                        sym_mode=sym_mode,
+                        boundary=eval_boundary,
+                        device="cpu", use_lanczos=use_lanczos,
+                        r_vals=r_vals, power_iters=power_iters,
+                        trace_mode=trace_mode, hutch_s=hutch_s,
+                        lru_rows=rows_lru, max_streams=max_streams,
+                        enable_exact=eval_enable_exact,
+                        enable_spectral=eval_enable_spectral,
+                        exact_threshold=exact_threshold,
+                        objective_mode=objective_mode,
+                        penalty_mode=penalty_mode,
+                        use_penalty=objective_use_penalty,
+                        cache_dir=str(cache_dir),
+                        use_cache=use_cache,
+                        refresh_cache=eval_refresh_cache)
+                for b, f in zip(cover_bits, cover_fits):
+                    coverage_rows.append((b, _normalize_fit_fields(f)))
+
         if enable_exact and enable_spectral:
             try:
                 summarize_trace_comparison([r for r in results if isinstance(r, dict)], logger=logger)
             except Exception:
                 logger.debug("compare summary failed", exc_info=True)
-        return results, normed
+        return results, normed, coverage_rows
 
     ctx.heartbeat(f"start gen={start_gen}")
     last_completed_gen = start_gen - 1
@@ -822,7 +892,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
     # generations
     for gen in range(start_gen, generations):
         t0 = time.time()
-        fits, pop = eval_batch(pop)
+        fits, pop, coverage_rows = eval_batch(pop)
         fronts = nondominated_sort(fits, obj_key=objective_key)
         front0 = fronts[0] if fronts else []
 
@@ -843,6 +913,8 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
         for idx, _ in best_by_rc.values():
             front0_aug.add(idx)
         front0_aug_list = sorted(front0_aug)
+        # coverage rows（填补缺失 rule_count）也标记为 front0
+        coverage_front_indices = [len(pop) + i for i in range(len(coverage_rows))]
 
         dists  = crowding_distance(front0, fits, obj_key=objective_key)
 
@@ -852,11 +924,14 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
         best_R = best_points[0][0] if best_points else None
         best_sum = best_points[0][1] if best_points else None
         with open(csv_gen, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([tag, n, k, gen, len(front0_aug_list), best_R, best_sum, pop_size, device, trace_mode, sym_mode, objective_key, objective_mode])
+            csv.writer(f).writerow([tag, n, k, gen, len(front0_aug_list) + len(coverage_front_indices), best_R, best_sum, pop_size, device, trace_mode, sym_mode, objective_key, objective_mode])
         last_completed_gen = gen
 
         # append this generation to front csv
-        _append_front_rows_csv(csv_front, tag, n, k, gen, pop_bits=pop, fits=fits, front0_idx=front0_aug_list)
+        combined_bits = pop + [b for b, _ in coverage_rows]
+        combined_fits = fits + [f for _, f in coverage_rows]
+        combined_front = front0_aug_list + coverage_front_indices
+        _append_front_rows_csv(csv_front, tag, n, k, gen, pop_bits=combined_bits, fits=combined_fits, front0_idx=combined_front)
 
         ctx.save_checkpoint({
             "type": "ga",
@@ -915,7 +990,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
         pop = new_pop[:pop_size]
 
     # final eval
-    fits, pop = eval_batch(pop)
+    fits, pop, coverage_rows = eval_batch(pop)
     fronts = nondominated_sort(fits, obj_key=objective_key)
     pareto_idx = fronts[0] if fronts else []
     pareto = [(pop[i], fits[i]) for i in pareto_idx]
