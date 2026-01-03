@@ -792,7 +792,7 @@ def evaluate_rules_batch(n: int,
     """
     批量评估规则个体，输出：
       - rows_m, lambda_max, lambda_top2, spectral_gap, sum_lambda_powers
-      - active_k（压缩后）、active_k_raw（压缩前）、k_sym/k_raw、sym_mode
+      - active_k（压缩后）、active_k_raw（压缩前）、k_sym/k_raw、sym_mode、rule_count / rule_count_sym
       - lower_bound / upper_bound（raw 与惩罚后）
       - 结构上界：upper_bound_raw_gersh / upper_bound_raw_maxdeg
       - 目标字段：sum_lambda_powers_raw / sum_lambda_powers_penalized、objective_raw / objective_penalized、penalty_factor、objective_mode
@@ -813,7 +813,13 @@ def evaluate_rules_batch(n: int,
     boundary = config.normalize_boundary(boundary)
     penalty_mode = config.normalize_penalty_mode(penalty_mode)
 
-    def _align_objective_fields(fit: Dict, rows_m: int, rule_count_val: int, penalty_mode_val: str) -> Dict:
+    def _align_objective_fields(
+        fit: Dict,
+        rows_m: int,
+        rule_count_val: int,
+        penalty_mode_val: str,
+        rule_count_sym: Optional[int] = None,
+    ) -> Dict:
         f = dict(fit) if fit is not None else {}
         rows_m_val = rows_m
         try:
@@ -822,9 +828,15 @@ def evaluate_rules_batch(n: int,
             pass
         rc_val = rule_count_val
         try:
-            rc_val = int(f.get("rule_count", rc_val))
+            rc_val = int(rule_count_val)
         except Exception:
             pass
+        f["rule_count"] = rc_val
+        if rule_count_sym is not None:
+            try:
+                f["rule_count_sym"] = int(rule_count_sym)
+            except Exception:
+                f["rule_count_sym"] = rule_count_sym
         penalty_factor = config.penalty_factor_from_shape(n, rows_m_val, rc_val, penalty_mode_val)
         try:
             raw = float(f.get("sum_lambda_powers_raw", f.get("trace_estimate_raw", f.get("sum_lambda_powers", -1e300))))
@@ -940,11 +952,14 @@ def evaluate_rules_batch(n: int,
         outs: List[Dict] = []
         for idx, bits in enumerate(bits_list):
             bits_sym, k_sym, raw_to_class, class_sizes = apply_rule_symmetry(bits, k, sym_mode)
-            R = rule_from_bits(k_sym, bits_sym)
-            deg, comps = _graph_degrees_and_components(R)
-            graph_stats = _graph_spectral_metrics(R)
+            bits_perm = canonical_bits(bits, k)
+            R_sym = rule_from_bits(k_sym, bits_sym)
+            R_perm = rule_from_bits(k, bits_perm)
+            R_stats = R_perm if ("swap" in sym_mode) else R_sym
+            deg, comps = _graph_degrees_and_components(R_stats)
+            graph_stats = _graph_spectral_metrics(R_stats)
 
-            rows = enumerate_ring_rows_fast(n, k_sym, R, boundary=boundary)
+            rows = enumerate_ring_rows_fast(n, k_sym, R_sym, boundary=boundary)
             m = int(rows.shape[0])
             exact_allowed, exact_reason = _should_use_exact(enable_exact, exact_threshold, n, k_sym, m)
             spectral_allowed = enable_spectral and (m > 0)
@@ -976,7 +991,15 @@ def evaluate_rules_batch(n: int,
                             "apply_penalty": apply_penalty,
                         },
                     )
-                    outs.append(_align_objective_fields(cached, int(cached.get("rows_m", m)), int(bits.sum()), penalty_mode))
+                    aligned_cached = _align_objective_fields(
+                        cached,
+                        int(cached.get("rows_m", m)),
+                        int(bits.sum()),
+                        penalty_mode,
+                        rule_count_sym=int(bits_sym.sum()),
+                    )
+                    aligned_cached.update(_graph_spectral_metrics(R_stats))
+                    outs.append(aligned_cached)
                     continue
 
             trace_exact: Optional[float] = None
@@ -991,9 +1014,10 @@ def evaluate_rules_batch(n: int,
 
             if m == 0:
                 # 上界也为 0
-                ub_rhos = _upper_bound_raw(R, n)
+                ub_rhos = _upper_bound_raw(R_sym, n)
                 fit = {
                     "rule_count": int(bits.sum()),
+                    "rule_count_sym": int(bits_sym.sum()),
                     "lambda_max": 0.0,
                     "lambda_top2": (0.0, 0.0),
                     "spectral_gap": 0.0,
@@ -1051,7 +1075,7 @@ def evaluate_rules_batch(n: int,
             if spectral_allowed:
                 op = TransferOp(
                     rows,
-                    R,
+                    R_sym,
                     device="cpu",
                     dtype=torch.float64,
                     block_size_j=2048,
@@ -1100,7 +1124,7 @@ def evaluate_rules_batch(n: int,
                     ub = ub_raw / penalty_factor if apply_penalty else ub_raw
 
             # 结构上界（与 m 结合）
-            ub_rhos = _upper_bound_raw(R, n)
+            ub_rhos = _upper_bound_raw(R_sym, n)
             ub_raw_gersh = float(m) * (ub_rhos["rho_gersh"] ** n)
             ub_raw_maxdeg = float(m) * (ub_rhos["rho_maxdeg"] ** n)
 
@@ -1113,7 +1137,7 @@ def evaluate_rules_batch(n: int,
 
             if exact_allowed:
                 try:
-                    trace_exact = float(count_patterns_transfer_matrix(n, k_sym, R, boundary=boundary, return_rows=False))
+                    trace_exact = float(count_patterns_transfer_matrix(n, k_sym, R_sym, boundary=boundary, return_rows=False))
                 except Exception as exc:
                     exact_reason = f"exact failed: {exc.__class__.__name__}"
                     eval_notes.append(f"exact:{exact_reason}")
@@ -1142,6 +1166,7 @@ def evaluate_rules_batch(n: int,
 
             fit = {
                 "rule_count": int(bits.sum()),
+                "rule_count_sym": int(bits_sym.sum()),
                 "lambda_max": lambda1,
                 "lambda_top2": (lambda1, lambda2),
                 "spectral_gap": spectral_gap,
@@ -1205,14 +1230,17 @@ def evaluate_rules_batch(n: int,
 
     for idx, bits in enumerate(bits_list):
         bits_sym, k_sym, raw_to_class, class_sizes = apply_rule_symmetry(bits, k, sym_mode)
+        bits_perm = canonical_bits(bits, k)
         key = f"{sym_mode}|{boundary}|n={n}|".encode("utf-8") + bits_sym.tobytes()
-        R = rule_from_bits(k_sym, bits_sym)
-        deg, comps = _graph_degrees_and_components(R)
-        graph_stats = _graph_spectral_metrics(R)
+        R_sym = rule_from_bits(k_sym, bits_sym)
+        R_perm = rule_from_bits(k, bits_perm)
+        R_stats = R_perm if ("swap" in sym_mode) else R_sym
+        deg, comps = _graph_degrees_and_components(R_stats)
+        graph_stats = _graph_spectral_metrics(R_stats)
 
         rows = rows_lru.get(key)
         if rows is None:
-            rows = enumerate_ring_rows_fast(n, k_sym, R, boundary=boundary)
+            rows = enumerate_ring_rows_fast(n, k_sym, R_sym, boundary=boundary)
             if rows.shape[0] > 0 and rows.shape[0] <= 1_000_000:
                 rows_lru.put(key, rows)
 
@@ -1247,7 +1275,15 @@ def evaluate_rules_batch(n: int,
                         "apply_penalty": apply_penalty,
                     },
                 )
-                outputs[idx] = _align_objective_fields(cached, int(cached.get("rows_m", m)), int(bits.sum()), penalty_mode)
+                aligned_cached = _align_objective_fields(
+                    cached,
+                    int(cached.get("rows_m", m)),
+                    int(bits.sum()),
+                    penalty_mode,
+                    rule_count_sym=int(bits_sym.sum()),
+                )
+                aligned_cached.update(_graph_spectral_metrics(R_stats))
+                outputs[idx] = aligned_cached
                 continue
 
         trace_exact: Optional[float] = None
@@ -1261,9 +1297,10 @@ def evaluate_rules_batch(n: int,
             eval_notes.append(f"exact:{exact_reason}")
 
         if m == 0:
-            ub_rhos = _upper_bound_raw(R, n)
+            ub_rhos = _upper_bound_raw(R_sym, n)
             outputs[idx] = {
                 "rule_count": int(bits.sum()),
+                "rule_count_sym": int(bits_sym.sum()),
                 "lambda_max": 0.0,
                 "lambda_top2": (0.0, 0.0),
                 "spectral_gap": 0.0,
@@ -1324,7 +1361,7 @@ def evaluate_rules_batch(n: int,
             with torch.cuda.stream(st):
                 op = TransferOp(
                     rows,
-                    R,
+                    R_sym,
                     device=device,
                     dtype=torch.float64,
                     block_size_j=4096,
@@ -1372,7 +1409,7 @@ def evaluate_rules_batch(n: int,
                 lb = lb_raw / penalty_factor if apply_penalty else lb_raw
                 ub = ub_raw / penalty_factor if apply_penalty else ub_raw
 
-        ub_rhos = _upper_bound_raw(R, n)
+        ub_rhos = _upper_bound_raw(R_sym, n)
         ub_raw_gersh = float(m) * (ub_rhos["rho_gersh"] ** n)
         ub_raw_maxdeg = float(m) * (ub_rhos["rho_maxdeg"] ** n)
 
@@ -1384,7 +1421,7 @@ def evaluate_rules_batch(n: int,
 
         if exact_allowed:
             try:
-                trace_exact = float(count_patterns_transfer_matrix(n, k_sym, R, boundary=boundary, return_rows=False))
+                trace_exact = float(count_patterns_transfer_matrix(n, k_sym, R_sym, boundary=boundary, return_rows=False))
             except Exception as exc:
                 exact_reason = f"exact failed: {exc.__class__.__name__}"
                 eval_notes.append(f"exact:{exact_reason}")
@@ -1412,6 +1449,7 @@ def evaluate_rules_batch(n: int,
 
         fit = {
             "rule_count": int(bits.sum()),
+            "rule_count_sym": int(bits_sym.sum()),
             "lambda_max": lambda1,
             "lambda_top2": (lambda1, lambda2),
             "spectral_gap": spectral_gap,

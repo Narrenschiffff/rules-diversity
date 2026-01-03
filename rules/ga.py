@@ -403,6 +403,7 @@ def _append_front_rows_csv(csv_path_front: str, tag: str, n: int, k: int, genera
                 tag, n, k, generation,
                 "".join(map(str, bits.tolist())),
                 int(fit.get("rule_count", 0)),
+                int(fit.get("rule_count_sym", fit.get("rule_count", 0))),
                 int(fit.get("rows_m", 0)),
                 f"{float(fit.get('lambda_max', 0.0)):.6e}",
                 lam_top2_str,
@@ -534,7 +535,7 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
     if not resume_state:
         with open(csv_front, "w", newline="", encoding="utf-8") as f:
             w=csv.writer(f)
-            w.writerow(["run_tag","n","k","generation","rule_bits","rule_count","rows_m",
+            w.writerow(["run_tag","n","k","generation","rule_bits","rule_count","rule_count_sym","rows_m",
                         "lambda_max","lambda_top2","spectral_gap",
                         "sum_lambda_powers","sum_lambda_powers_raw","sum_lambda_powers_penalized",
                         "objective_raw","objective_penalized","objective_mode","penalty_factor","penalty_mode",
@@ -824,19 +825,38 @@ def ga_search_with_batch(n: int, k: int, ga_conf: GAConfig, out_csv_dir: str="./
         fits, pop = eval_batch(pop)
         fronts = nondominated_sort(fits, obj_key=objective_key)
         front0 = fronts[0] if fronts else []
+
+        # 保障：每个 rule_count 至少有一个 is_front0（即便被支配），以便后续分析在所有 |R| 桶上都有代表点。
+        best_by_rc = {}
+        for i, ft in enumerate(fits):
+            try:
+                rc = int(ft.get("rule_count", -1))
+            except Exception:
+                rc = -1
+            if rc < 0:
+                continue
+            val = _objective_value_from_fit(ft, objective_key)
+            cur = best_by_rc.get(rc)
+            if cur is None or val > cur[1]:
+                best_by_rc[rc] = (i, val)
+        front0_aug = set(front0)
+        for idx, _ in best_by_rc.values():
+            front0_aug.add(idx)
+        front0_aug_list = sorted(front0_aug)
+
         dists  = crowding_distance(front0, fits, obj_key=objective_key)
 
         # gen summary
-        best_points = [(fits[i]["rule_count"], _objective_value_from_fit(fits[i], objective_key)) for i in front0] if front0 else []
+        best_points = [(fits[i]["rule_count"], _objective_value_from_fit(fits[i], objective_key)) for i in front0_aug_list] if front0_aug_list else []
         best_points.sort(key=lambda x: (x[0], -x[1]))
         best_R = best_points[0][0] if best_points else None
         best_sum = best_points[0][1] if best_points else None
         with open(csv_gen, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([tag, n, k, gen, len(front0), best_R, best_sum, pop_size, device, trace_mode, sym_mode, objective_key, objective_mode])
+            csv.writer(f).writerow([tag, n, k, gen, len(front0_aug_list), best_R, best_sum, pop_size, device, trace_mode, sym_mode, objective_key, objective_mode])
         last_completed_gen = gen
 
         # append this generation to front csv
-        _append_front_rows_csv(csv_front, tag, n, k, gen, pop_bits=pop, fits=fits, front0_idx=front0)
+        _append_front_rows_csv(csv_front, tag, n, k, gen, pop_bits=pop, fits=fits, front0_idx=front0_aug_list)
 
         ctx.save_checkpoint({
             "type": "ga",
