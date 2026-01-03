@@ -43,7 +43,7 @@
 - **上/下界**：`rules.eval._upper_bound_raw` 结合 Gershgorin、最大行和与谱信息；下界来自最大特征值 $\lambda_1$ 及其 $n$ 次幂。
 
 - **对称化**：`rules.eval.canonical_bits` 对位串进行置换同构规范化，$k\le 8$ 时枚举全排列，大规模时采用度数与自环启发式。
-- **谱-结构剖析**：`evaluate_rules_batch` 在构造规则图后会额外输出度矩阵、无向/归一化拉普拉斯、邻接谱间隙、代数连通度与平均聚类系数，便于后续结构对齐与解释。
+- **谱-结构剖析**：`evaluate_rules_batch` 在构造规则图后会额外输出度矩阵、无向/归一化拉普拉斯、邻接谱间隙、代数连通度与平均聚类系数，便于后续结构对齐与解释；在 `perm+swap` 模式下，这些结构特征基于“仅 perm”规范化后的规则图计算，以保持与未合并数据的可比性（行枚举仍使用合并后的图以保证速度）。
 
 ### 功能开关总览（CLI 与 API 通用）
 | 需求 | CLI 入口 | 配置字段 | 说明 |
@@ -129,6 +129,7 @@
   - `sum_lambda_powers` / `lambda_max` / `adj_spectral_gap`：谱估计核心指标。
   - `lower_bound` / `upper_bound`：估计上下界；`upper_bound_note` 说明使用的上界类型。
   - `cache_key`：包含规则、边界、对称、规模的缓存键，便于快速定位缓存命中情况。
+  - `rule_count_sym`：在 `perm+swap` 合并后的 |R|，并行保留 `rule_count`（合并前）以保证与仅 `perm` 路径的桶划分一致；GA front CSV 现保证每个 `rule_count` 至少有一条 `is_front0=1` 记录，避免按 |R| 聚合时出现空桶。
 - **JSONL 摘要**（流水线）
   - 行内包含与 CSV 相同的字段，便于流式处理。
   - 若启用 exact/spectral 双开关，JSONL 中会包含两种模式的对照（精确值为 baseline）。
