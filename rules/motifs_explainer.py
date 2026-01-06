@@ -3,10 +3,10 @@
 motifs_explainer.py — 结构Δ→谱Δ→增长 的解释与可视化（稳健均值 + 统一口径）
 支持 KNEE / MUR / OPTIMAL 分析。
 
-集成优化版 (v2.2):
-1. 修复 NameError: '_layered_bar_heat_generic' not defined.
-2. 恢复并优化缺失的 '_boxplot_deltas_generic' 和 '_scatter_gap_vs_structure_generic' 可视化。
-3. 保持 v2.1 的所有修复 (joint table, seaborn warnings)。
+集成优化版 (Final Fix):
+1. 确保所有可视化函数 (_layered_bar_heat_generic, _boxplot_deltas_generic, _scatter_gap_vs_structure_generic) 均已定义。
+2. 确保 _make_joint_table_generic 已定义。
+3. 修复 seaborn 调色板警告。
 """
 
 from __future__ import annotations
@@ -268,7 +268,7 @@ def _spectral_connectivity_plot(df_ex: pd.DataFrame, prefix: str, out_png: Path)
 # ================= 优化：结构-功能相关性热图 =================
 def _correlation_heatmap_delta(df_ex: pd.DataFrame, prefix: str, out_png: Path):
     struct_feats = ["tri", "star_core", "selfloop_rich", "near_bip_chord", "c4", "c5"]
-    func_feats = ["lambda1", "gap", "y", "lap_algebraic"]
+    func_feats = ["lambda1", "gap", "y", "lap_algebraic"] # Added lap_algebraic
     
     data = {}
     p1 = f"delta_pre_to_{prefix}_"
@@ -308,9 +308,11 @@ def _efficiency_trajectory_plot(df_ex: pd.DataFrame, prefix: str, out_png: Path)
     for idx, row in df_ex.iterrows():
         row_vals = []
         for s in stages:
+            # 直接使用 y 值，它已经是 log(Z)/penalty
             y = pd.to_numeric(row.get(f"{s}_y"), errors="coerce")
             row_vals.append(y)
         
+        # 归一化：以 Optimal 点为基准
         if pd.notna(row_vals[1]) and row_vals[1] != 0:
             norm_vals = [v / row_vals[1] for v in row_vals]
             for i, s in enumerate(stages):
@@ -341,6 +343,7 @@ def _fit_logreg_importance(prefix, X, y, names, seed, out_csv, out_png):
     df = pd.DataFrame({"feature": names, "abs_coef": coefs}).sort_values("abs_coef", ascending=False)
     df.to_csv(out_csv, index=False)
     fig, ax = plt.subplots(figsize=(9.0, 5.2))
+    # FIX: Assign y to hue to avoid warning, set legend=False
     sns.barplot(x="abs_coef", y="feature", hue="feature", data=df.head(15), ax=ax, palette="viridis", legend=False)
     ax.set_xlabel("|coef|")
     ax.set_title(f"{_title_head(prefix)} Logistic Regression Feature Influence (Top 15)")
@@ -354,6 +357,7 @@ def _fit_tree_importance(prefix, X, y, names, depth, min_leaf, seed, out_csv, ou
     df = pd.DataFrame({"feature": names, "gini_importance": imp}).sort_values("gini_importance", ascending=False)
     df.to_csv(out_csv, index=False)
     fig, ax = plt.subplots(figsize=(9.0, 5.2))
+    # FIX: Assign y to hue to avoid warning
     sns.barplot(x="gini_importance", y="feature", hue="feature", data=df.head(15), ax=ax, palette="magma", legend=False)
     ax.set_xlabel("Gini importance")
     ax.set_title(f"{_title_head(prefix)} Decision Tree Importance (Top 15)")

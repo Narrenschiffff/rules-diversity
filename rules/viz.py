@@ -625,9 +625,27 @@ def _extract_key_points(rule_counts: np.ndarray,
     if not m.any():
         return []
     xs = xs[m]; ys = ys[m]; ns = ns[m]
-    # 只返回唯一最佳点
+    key_points: List[KeyPoint] = []
+
+    # 全局最大值
+    try:
+        idx_max = int(np.nanargmax(ys))
+        key_points.append(KeyPoint("max", ns[idx_max], xs[idx_max], ys[idx_max], f"max |R|={int(xs[idx_max])}"))
+    except Exception:
+        idx_max = None
+
+    # 二阶差分膝点（若失败再退回 L-curve），命名与现有图表一致
+    idx_knee = _knee_second(xs, ys, logy=True)
+    if idx_knee is None:
+        idx_knee = _knee_l(xs, ys, logxy=True)
+    if idx_knee is not None and 0 <= idx_knee < len(xs) and np.isfinite(ys[idx_knee]):
+        key_points.append(KeyPoint("knee-2Δ", ns[idx_knee], xs[idx_knee], ys[idx_knee], f"knee |R|={int(xs[idx_knee])}"))
+
+    # 最优折中（可能等同 max，但这里保留显式标记便于下游展示）
     opt_idx = _get_optimal_idx(xs, ys, logy=True)
-    return [KeyPoint("Optimal", ns[opt_idx], xs[opt_idx], ys[opt_idx], f"Optimal |R|={int(xs[opt_idx])}")]
+    key_points.append(KeyPoint("Optimal", ns[opt_idx], xs[opt_idx], ys[opt_idx], f"Optimal |R|={int(xs[opt_idx])}"))
+
+    return key_points
 
 
 def _monotone_idx_with_max(xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
@@ -940,11 +958,11 @@ def plot_frontier_surfaces(front_csvs: Iterable[str],
                         opt_ns, opt_rcs, _ = zip(*d.optimal_curve)
                         ax.plot(opt_ns, opt_rcs, color="red", linewidth=2.0, linestyle="-", label=f"k={d.k} optimal path")
                         
-                    kp_sorted = sorted(d.key_points, key=lambda p: p.rule_count)
+                    # Only project the Optimal point to avoid clutter
+                    kp_sorted = [p for p in d.key_points if p.kind.lower() == "optimal"]
                     if kp_sorted:
-                        # Draw only Optimal if filtered, or all if not
                         xs = [p.n for p in kp_sorted]; ys = [p.rule_count for p in kp_sorted]
-                        ax.scatter(xs, ys, color="red", marker="*", s=80, zorder=10) 
+                        ax.scatter(xs, ys, color="red", marker="*", s=80, zorder=10)
                         for p in kp_sorted:
                             ax.text(p.n, p.rule_count, f"{p.kind}\n{p.metric:.2g}", color="black", fontsize=8,
                                     ha="left", va="bottom")
