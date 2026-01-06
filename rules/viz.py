@@ -958,11 +958,11 @@ def plot_frontier_surfaces(front_csvs: Iterable[str],
                         opt_ns, opt_rcs, _ = zip(*d.optimal_curve)
                         ax.plot(opt_ns, opt_rcs, color="red", linewidth=2.0, linestyle="-", label=f"k={d.k} optimal path")
                         
-                    kp_sorted = sorted(d.key_points, key=lambda p: p.rule_count)
+                    # Only project the Optimal point to avoid clutter
+                    kp_sorted = [p for p in d.key_points if p.kind.lower() == "optimal"]
                     if kp_sorted:
-                        # Draw only Optimal if filtered, or all if not
                         xs = [p.n for p in kp_sorted]; ys = [p.rule_count for p in kp_sorted]
-                        ax.scatter(xs, ys, color="red", marker="*", s=80, zorder=10) 
+                        ax.scatter(xs, ys, color="red", marker="*", s=80, zorder=10)
                         for p in kp_sorted:
                             ax.text(p.n, p.rule_count, f"{p.kind}\n{p.metric:.2g}", color="black", fontsize=8,
                                     ha="left", va="bottom")
