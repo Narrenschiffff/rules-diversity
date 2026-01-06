@@ -883,7 +883,7 @@ def plot_frontier_surfaces(front_csvs: Iterable[str],
                             style: str = "default",
                             contour_levels: int = 10,
                             wireframe_stride: int = 1,
-                            max_series_per_fig: int = 8) -> Tuple[List[str], List[FrontierSurfaceData]]:
+                            max_series_per_fig: int = 1) -> Tuple[List[str], List[FrontierSurfaceData]]:
     """绘制 (n, |R|, 目标值) 的前沿曲面/等高线，并标注最佳点路径。
 
     返回：(输出图片路径列表, 对每个 k 的关键点数据)。

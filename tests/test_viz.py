@@ -245,8 +245,9 @@ def test_frontier_surface_keypoints_and_contour(tmp_path: Path):
         style="default",
         contour_levels=4,
     )
-    assert len(figs) == 1
-    assert Path(figs[0]).exists()
+    assert len(figs) == 2
+    for f in figs:
+        assert Path(f).exists()
 
     by_k = {d.k: d for d in data}
     assert set(by_k.keys()) == {2, 3}
