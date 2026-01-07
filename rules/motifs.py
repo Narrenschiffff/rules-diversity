@@ -395,6 +395,15 @@ def _group_by_nks(rows):
         by.setdefault((n, k, src), []).append(r)
     return by
 
+def _summarize_field(rows, field: str, default: str = "unknown") -> str:
+    vals = set()
+    for r in rows:
+        v = str(r.get(field, "")).strip()
+        if v: vals.add(v)
+    if not vals: return default
+    if len(vals) == 1: return vals.pop()
+    return "mixed"
+
 def _best_bucket_by_rulecount(rs, logy: bool = True):
     buckets = {}
     for r in rs:
@@ -575,6 +584,10 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
     # Three-point links - FIX: Remove silent try-except
     import matplotlib.pyplot as plt
     try:
+        penalty_mode = _summarize_field(rows, "penalty_mode")
+        boundary = _summarize_field(rows, "boundary", default="torus")
+        sym_mode = _summarize_field(rows, "sym_mode", default="perm")
+
         fig = plt.figure(figsize=(8.0, 5.2)); ax = fig.add_subplot(111)
         valid_plots = 0
         for (n, k), rs in sorted(by_nk.items()):
@@ -591,12 +604,14 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
                 if 0 <= j < len(xs): three_x.append(xs[j]); three_y.append(ys[j])
             
             if len(three_x) >= 1:
-                ax.plot(three_x, three_y, marker="D", alpha=0.9, label=f"n{n}k{k}")
+                ax.plot(three_x, three_y, marker="D", alpha=0.9, label=f"n={n}, k={k}")
                 valid_plots += 1
 
         ax.set_xlabel("|R|"); ax.set_ylabel(r"Objective (log $Z$) / penalty")
         if logy: ax.set_yscale("log")
-        ax.set_title("Three-point links around optimal")
+        ax.set_title(f"Three-point links around optimal — penalty={penalty_mode}, boundary={boundary}, sym={sym_mode}")
+        if valid_plots:
+            ax.legend(loc="best", frameon=False)
         fig.tight_layout()
         otp = Path(out_fig_dir) / "optimal_three_point_links.png"
         fig.savefig(otp, dpi=200); plt.close(fig)
