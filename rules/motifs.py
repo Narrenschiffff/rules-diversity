@@ -310,13 +310,39 @@ def edge_criticality_scores(R):
 # =========================================
 # Utils
 # =========================================
-def _y_metric(row):
-    for key in ("Z_exact", "Z_est", "objective_penalized", "objective_raw", "sum_lambda_powers", "objective", "y"):
-        val = row.get(key, "")
-        if val not in ("", None, "nan", "NaN"):
-            try: return float(val)
-            except: pass
-    return float("nan")
+def _y_metric(row: dict, logy: bool = True) -> float:
+    def _to_float(v):
+        try: return float(v)
+        except: return float("nan")
+
+    pf = _to_float(row.get("penalty_factor", 1.0))
+    if not np.isfinite(pf) or pf <= 0: pf = 1.0
+
+    raw_candidates = ("objective_raw", "sum_lambda_powers_raw", "trace_estimate_raw", "Z_exact", "Z_est", "objective")
+    pen_candidates = ("objective_penalized", "sum_lambda_powers_penalized", "sum_lambda_powers", "trace_estimate", "y")
+
+    def _first_valid(keys):
+        for key in keys:
+            val = row.get(key, "")
+            if val in ("", None, "nan", "NaN"): continue
+            f = _to_float(val)
+            if np.isfinite(f): return f
+        return float("nan")
+
+    raw = _first_valid(raw_candidates)
+    pen = _first_valid(pen_candidates)
+
+    if (not np.isfinite(pen) or pen <= -1e200) and np.isfinite(raw):
+        pen = raw / pf
+    if (not np.isfinite(raw) or raw <= -1e200) and np.isfinite(pen):
+        raw = pen * pf
+
+    y = pen if (np.isfinite(pen) and pen > -1e200) else raw
+    if not np.isfinite(y) or y <= -1e200:
+        return float("nan")
+    if logy and y <= 0:
+        return float("nan")
+    return float(y)
 
 def _infer_k_from_bits_len(L):
     delta = 1 + 8 * L; s = math.isqrt(delta)
@@ -369,12 +395,21 @@ def _group_by_nks(rows):
         by.setdefault((n, k, src), []).append(r)
     return by
 
-def _best_bucket_by_rulecount(rs):
+def _summarize_field(rows, field: str, default: str = "unknown") -> str:
+    vals = set()
+    for r in rows:
+        v = str(r.get(field, "")).strip()
+        if v: vals.add(v)
+    if not vals: return default
+    if len(vals) == 1: return vals.pop()
+    return "mixed"
+
+def _best_bucket_by_rulecount(rs, logy: bool = True):
     buckets = {}
     for r in rs:
         # === FIX 2: Handle rule_count carefully ===
         rc = to_int(r.get("rule_count"))
-        y = _y_metric(r)
+        y = _y_metric(r, logy=logy)
         if rc is None or not np.isfinite(y): continue
         
         cur = buckets.get(rc)
@@ -454,7 +489,7 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
     center_label = "optimal"
 
     for (n, k), rs in sorted(by_nk.items()):
-        buckets = _best_bucket_by_rulecount(rs)
+        buckets = _best_bucket_by_rulecount(rs, logy=logy)
         if not buckets: continue
         xs = sorted(buckets.keys())
         ys = np.array([buckets[x]["y"] for x in xs], float)
@@ -486,7 +521,7 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
             for f, v in feats.items(): record[f"{pos}_{f}"] = v
             record[f"{pos}_bits"] = bits_s
             record[f"{pos}_rule_count"] = int(r.get("rule_count", bits.sum()))
-            record[f"{pos}_y"] = _y_metric(r)
+            record[f"{pos}_y"] = _y_metric(r, logy=logy)
             record[f"{pos}_effective_k"] = eff_k
             l1, l2, g = _extract_spectral_metrics(r, eff_k)
             record[f"{pos}_lambda1"] = l1; record[f"{pos}_lambda2"] = l2; record[f"{pos}_gap"] = g
@@ -549,10 +584,14 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
     # Three-point links - FIX: Remove silent try-except
     import matplotlib.pyplot as plt
     try:
+        penalty_mode = _summarize_field(rows, "penalty_mode")
+        boundary = _summarize_field(rows, "boundary", default="torus")
+        sym_mode = _summarize_field(rows, "sym_mode", default="perm")
+
         fig = plt.figure(figsize=(8.0, 5.2)); ax = fig.add_subplot(111)
         valid_plots = 0
         for (n, k), rs in sorted(by_nk.items()):
-            buckets = _best_bucket_by_rulecount(rs)
+            buckets = _best_bucket_by_rulecount(rs, logy=logy)
             if not buckets: continue
             xs = sorted(buckets.keys())
             ys = np.array([buckets[x]["y"] for x in xs], float)
@@ -565,12 +604,14 @@ def analyze_fronts_for_optimal(csv_paths: List[str],
                 if 0 <= j < len(xs): three_x.append(xs[j]); three_y.append(ys[j])
             
             if len(three_x) >= 1:
-                ax.plot(three_x, three_y, marker="D", alpha=0.9, label=f"n{n}k{k}")
+                ax.plot(three_x, three_y, marker="D", alpha=0.9, label=f"n={n}, k={k}")
                 valid_plots += 1
 
         ax.set_xlabel("|R|"); ax.set_ylabel(r"Objective (log $Z$) / penalty")
         if logy: ax.set_yscale("log")
-        ax.set_title("Three-point links around optimal")
+        ax.set_title(f"Three-point links around optimal — penalty={penalty_mode}, boundary={boundary}, sym={sym_mode}")
+        if valid_plots:
+            ax.legend(loc="best", frameon=False)
         fig.tight_layout()
         otp = Path(out_fig_dir) / "optimal_three_point_links.png"
         fig.savefig(otp, dpi=200); plt.close(fig)
